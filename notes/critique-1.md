@@ -1,0 +1,249 @@
+# Critique 1 — ztex render review
+
+- **Formula**: `\int_0^1 x\,dx + \sum_{i=1}^{n} \frac{1}{i^2}`
+- **Size**: 20.0 pt, background: `white`
+- **Rendered**: 2026-08-13 03:00:31 UTC
+- **SVG**: notes/artifacts/critique-1/render.svg (180.44 × 91.06 pt)
+- **PNG**: notes/artifacts/critique-1/render.png (1400 × 703 px)
+- **Render cmd**: `zig-out/bin/ztex -i \int_0^1 x\,dx + \sum_{i=1}^{n} \frac{1}{i^2} -o notes/artifacts/critique-1/render.svg -s 20.0 -b white`
+- **Convert cmd**: `/nix/store/yc4ffvi450g4hsg9lp8p0nq4v2xi1y3p-resvg-0.48.0/bin/resvg --width 1400 notes/artifacts/critique-1/render.svg notes/artifacts/critique-1/render.png`
+- **Vision model**: qwen/qwen-2.5-vl-72b-instruct
+- **Verdict**: **FAIL** — The rendering has a major issue with clipping of the 'n' in the upper limit of the summation, causing it to be partially cut off. Otherwise, the layout and positioning appear accurate.
+
+## Vision critique
+
+### Parsed verdict
+
+```json
+{
+  "verdict": "FAIL",
+  "clipping": {
+    "top_pct": 0,
+    "bottom_pct": 0,
+    "left_pct": 0,
+    "right_pct": 0.05,
+    "ink_bbox": [
+      0.12,
+      0.88,
+      0.15,
+      0.85
+    ],
+    "note": "The 'n' in the upper limit of the summation is partially cut off on the right side."
+  },
+  "bigop_limits": [
+    {
+      "operator": "\\int",
+      "cx_op": 0.15,
+      "cx_limit": 0.15,
+      "offset_pct": 0.0,
+      "visible": true,
+      "note": ""
+    },
+    {
+      "operator": "\\sum",
+      "cx_op": 0.85,
+      "cx_limit": 0.85,
+      "offset_pct": 0.0,
+      "visible": true,
+      "note": ""
+    }
+  ],
+  "overlaps": [],
+  "glyphs": [
+    {
+      "glyph": "n",
+      "complete": false,
+      "note": "The 'n' in the upper limit of the summation is partially cut off."
+    }
+  ],
+  "scripts": [
+    {
+      "script": "0",
+      "x": 0.15,
+      "y": 0.65,
+      "visible": true,
+      "placement_ok": true,
+      "note": ""
+    },
+    {
+      "script": "1",
+      "x": 0.15,
+      "y": 0.35,
+      "visible": true,
+      "placement_ok": true,
+      "note": ""
+    },
+    {
+      "script": "i=1",
+      "x": 0.85,
+      "y": 0.65,
+      "visible": true,
+      "placement_ok": true,
+      "note": ""
+    },
+    {
+      "script": "n",
+      "x": 0.85,
+      "y": 0.35,
+      "visible": false,
+      "placement_ok": false,
+      "note": "Partially cut off."
+    }
+  ],
+  "latex_likeness": {
+    "score": 8,
+    "top_deviations": [
+      {
+        "issue": "Clipping of the 'n' in the upper limit of the summation.",
+        "severity": "major"
+      }
+    ]
+  },
+  "summary": "The rendering has a major issue with clipping of the 'n' in the upper limit of the summation, causing it to be partially cut off. Otherwise, the layout and positioning appear accurate."
+}
+```
+
+### Raw response
+
+```text
+```json
+{
+  "verdict": "FAIL",
+  "clipping": {
+    "top_pct": 0,
+    "bottom_pct": 0,
+    "left_pct": 0,
+    "right_pct": 0.05,
+    "ink_bbox": [0.12, 0.88, 0.15, 0.85],
+    "note": "The 'n' in the upper limit of the summation is partially cut off on the right side."
+  },
+  "bigop_limits": [
+    {
+      "operator": "\\int",
+      "cx_op": 0.15,
+      "cx_limit": 0.15,
+      "offset_pct": 0.0,
+      "visible": true,
+      "note": ""
+    },
+    {
+      "operator": "\\sum",
+      "cx_op": 0.85,
+      "cx_limit": 0.85,
+      "offset_pct": 0.0,
+      "visible": true,
+      "note": ""
+    }
+  ],
+  "overlaps": [],
+  "glyphs": [
+    {
+      "glyph": "n",
+      "complete": false,
+      "note": "The 'n' in the upper limit of the summation is partially cut off."
+    }
+  ],
+  "scripts": [
+    {
+      "script": "0",
+      "x": 0.15,
+      "y": 0.65,
+      "visible": true,
+      "placement_ok": true,
+      "note": ""
+    },
+    {
+      "script": "1",
+      "x": 0.15,
+      "y": 0.35,
+      "visible": true,
+      "placement_ok": true,
+      "note": ""
+    },
+    {
+      "script": "i=1",
+      "x": 0.85,
+      "y": 0.65,
+      "visible": true,
+      "placement_ok": true,
+      "note": ""
+    },
+    {
+      "script": "n",
+      "x": 0.85,
+      "y": 0.35,
+      "visible": false,
+      "placement_ok": false,
+      "note": "Partially cut off."
+    }
+  ],
+  "latex_likeness": {
+    "score": 8,
+    "top_deviations": [
+      {
+        "issue": "Clipping of the 'n' in the upper limit of the summation.",
+        "severity": "major"
+      }
+    ]
+  },
+  "summary": "The rendering has a major issue with clipping of the 'n' in the upper limit of the summation, causing it to be partially cut off. Otherwise, the layout and positioning appear accurate."
+}
+```
+```
+
+## Prompt used
+
+```text
+\
+You are an adversarial critic for a LaTeX math renderer (ztex). Your job is to HUNT FOR DEFECTS in the rendered formula image. Assume defects exist. Inspect the image carefully; do not rubber-stamp.
+
+GROUND TRUTH FORMULA: `\int_0^1 x\,dx + \sum_{i=1}^{n} \frac{1}{i^2}`
+
+The image is a PNG, 1400x703 pixels. Report all positions as FRACTIONS of image width/height (0.0 = left/top edge, 1.0 = right/bottom edge), to 2-3 decimal places. If a measurement is ambiguous, say so and give your best estimate.
+
+Check EVERY item below; missing a check is a failure of this critique.
+
+1. EDGE CLIPPING — is any ink cut off at an image border?
+   - For each edge (top, bottom, left, right) estimate the percentage of the cut glyph that is missing (0 = no clipping).
+   - Estimate the ink bounding box of the whole formula: [x_left, x_right, y_top, y_bottom] as fractions.
+   - A glyph touching the border is a FAIL even if only a sliver is missing.
+
+2. BIG-OP LIMIT CENTERING — for every operator with limits (\sum, \prod, \int, \bigcup, ...):
+   - Estimate the horizontal center of the operator glyph: cx_op.
+   - Estimate the horizontal center of each attached limit (numerator/limit above or below, or the endpoint limits of an \int): cx_limit.
+   - Report |cx_op - cx_limit| as a fraction of image width. > 0.01 (1% of width) is a FAIL.
+   - Also check each limit is fully visible and not merged with the operator glyph.
+
+3. ADJACENT-TERM OVERLAP — do neighboring symbols or lines overlap or touch?
+   - For each suspicious pair, name both glyphs, estimate the overlapped fraction of the smaller glyph, and give the location.
+   - Overlap > 2% of the smaller glyph is a FAIL. Flag lines that punch through fraction bars or strike through other glyphs.
+
+4. COMPLETE GLYPHS — is every glyph complete (no stubs, no missing strokes, no shorn serifs)?
+   - Pay special attention to large operators (\int, \sum, \sqrt, tall parentheses) and wide accents.
+   - A truncated glyph is a FAIL even if the cut is at the canvas edge (also report it under clipping).
+
+5. SUBSCRIPTS & LIMITS — for every sub/superscript and every limit:
+   - Is it visible (not blank, not fused into the base glyph)?
+   - Is its placement correct relative to the base (subscript below/right, superscript above/right, limits above/below the operator)?
+   - Report each script's center as (x, y) fractions and whether placement is OK.
+
+6. LATEX-LIKENESS — does this look like a professional LaTeX render of the given formula?
+   - Score 0-10 (10 = indistinguishable from LaTeX).
+   - List the top visual deviations, each with severity minor/major.
+
+ANSWER FORMAT — output ONLY one JSON object, no prose before or after:
+
+{
+  "verdict": "PASS" or "FAIL",
+  "clipping": {"top_pct": 0, "bottom_pct": 0, "left_pct": 0, "right_pct": 0, "ink_bbox": [0, 0, 0, 0], "note": ""},
+  "bigop_limits": [{"operator": "", "cx_op": 0.0, "cx_limit": 0.0, "offset_pct": 0.0, "visible": true, "note": ""}],
+  "overlaps": [{"pair": "", "overlap_pct": 0.0, "location": "", "note": ""}],
+  "glyphs": [{"glyph": "", "complete": true, "note": ""}],
+  "scripts": [{"script": "", "x": 0.0, "y": 0.0, "visible": true, "placement_ok": true, "note": ""}],
+  "latex_likeness": {"score": 0, "top_deviations": [{"issue": "", "severity": ""}]},
+  "summary": "one or two sentences"
+}
+
+Set "verdict" to "FAIL" if ANY check above fails. Empty arrays mean no problems found in that category. Do not invent problems that are not visible; but hunt for real ones.
+
+```

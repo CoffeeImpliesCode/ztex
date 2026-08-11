@@ -1,0 +1,4 @@
+\
+Three stacked panes of the same formula: `\genfrac{[}{]}{0pt}{}{a}{b}`. Top = ztex render (ours), middle = XeTeX reference, bottom = KaTeX reference (web LaTeX).
+
+Compare OURS against BOTH references. List EVERY visual nit in OURS vs either reference: inter-term spacing, glyph sizes, superscript/subscript positions, big-op limit centering, baseline alignment, overlaps, anything that differs. Be specific with regions ('the gap after the integral is too wide', 'the upper limit n sits 2px left of center'). Do NOT nit about overall scale (the panes are scaled to the same width). If an element matches the references, say so. Output JSON: {"nits": [{"region": str, "description": str, "severity": "minor|major", "reference": "XeTeX|KaTeX"}], "verdict": "PASS|FAIL"}.

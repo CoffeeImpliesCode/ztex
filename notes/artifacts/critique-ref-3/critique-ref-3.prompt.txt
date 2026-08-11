@@ -1,0 +1,4 @@
+\
+Left half = ztex render, right half = XeTeX reference of the same formula: `\sum_{i=1}^{n} \frac{x_i}{n} + \int_0^1 x\,dx`.
+
+List EVERY visual nit in the LEFT (ztex) half compared to the reference: inter-term spacing, glyph sizes, superscript/subscript positions, big-op limit centering, baseline alignment, overlaps, anything that differs. Be specific with regions ('the gap after the integral is too wide', 'the upper limit n sits 2px left of center'). Do NOT nit about overall scale (the halves are scaled to the same height). If an element matches the reference, say so. Output JSON: {"nits": [{"region": str, "description": str, "severity": "minor|major"}], "verdict": "PASS|FAIL"}.
