@@ -52,6 +52,15 @@ pub const BigOpForm = enum(u8) {
 };
 
 /// A flat, fixed-size laid-out box.
+///
+/// Box carries only the SHARED layout header (kind, dimensions, child run,
+/// source span). Everything char-only — codepoint, style, size, and the
+/// layout flags that ride along to flatten/SVG (synthetic, big-op form,
+/// display-variant advance/ic, radical form, fixed-delimiter req) — lives
+/// in the BoxList `chars` side table, indexed by box index and populated
+/// only for `.char` boxes; rule/glue/strut/hbox/vbox/script boxes pay no
+/// storage for it. Read/write char state through BoxList.charData /
+/// charDataPtr, never directly on a Box.
 pub const Box = struct {
     kind: Kind,
     width: f32,
@@ -62,43 +71,49 @@ pub const Box = struct {
     /// NEVER `first_child == 0` — index 0 is a valid ChildRef slot.
     first_child: u32,
     num_children: u16,
-    /// char: the glyph codepoint
-    cp: u21,
-    /// char: effective font style
-    style: atom.CharStyle,
-    /// char: font size in points
-    size: f32,
     // provenance: byte span into the source this box came from
     src_start: u32,
     src_end: u32,
-    /// char: true when the glyph is synthesized by layout (big operators,
+};
+
+/// Char-only state of a glyph box, held in the BoxList side table
+/// (BoxList.chars), not in Box. Every box index has an entry — `.char`
+/// boxes get their real values in `create`, all other kinds the default.
+pub const CharData = struct {
+    /// the glyph codepoint
+    cp: u21 = 0,
+    /// effective font style
+    style: atom.CharStyle = .italic,
+    /// font size in points
+    size: f32 = 0,
+    /// true when the glyph is synthesized by layout (big operators,
     /// e.g. \sum → ∑) and has no matching source bytes to alias; false for
     /// every other box, meaning the drawn glyph equals the source span.
     /// Set true only in layout.layoutOp; layoutChar/layoutText boxes take the
     /// default false.
     synthetic: bool = false,
-    /// char: display big-ops (MATH .v1 variant) vs the base form. Default
+    /// display big-ops (MATH .v1 variant) vs the base form. Default
     /// `.base`; set to `.variant` only in layout.layoutOp for display ops.
     bigop_form: BigOpForm = .base,
-    /// char: hmtx advance of the DISPLAY variant in em (∫/∮ .v1: 0.999;
+    /// hmtx advance of the DISPLAY variant in em (∫/∮ .v1: 0.999;
     /// the limits ops' variants equal their base advance, e.g. ∑ 1.444).
     /// Set in layout.layoutOp for display ops; layoutOpLimits boxes a
     /// display limits-op vbox by it — XeTeX boxes the display ∫/∮ by the
     /// .v1 advance, not the base 0.665em. 0 for every other box.
     disp_advance: f32 = 0,
-    /// char: MathItalicsCorrection of the DRAWN form, pt at the 10pt base
+    /// MathItalicsCorrection of the DRAWN form, pt at the 10pt base
     /// (∫/∮: 3.32 base, 5.91 .v1). layoutOpLimits skews the limits by
     /// ±delta/2 with delta = this value for display ops (the .v1 ic — XeTeX
     /// measured) and the base glyph ic for text/script ops. 0 otherwise.
     disp_ic: f32 = 0,
-    /// char: radical MATH-table variant index (0 = base √, 1–4 = radical.v1–v4).
+    /// radical MATH-table variant index (0 = base √, 1–4 = radical.v1–v4).
     /// Set in layoutSqrt when a vertical variant is selected (the surd's ink
     /// height must cover the radicand; the base glyph is used when it suffices).
     /// svg.zig emits data-radical="v1" so the rasterizer resolves the variant
     /// glyph — the declared font-size alone cannot tell base from variant since
     /// both draw at the current math size. 0 for every other box.
     radical_form: u8 = 0,
-    /// char: amsmath FIXED-rule delimiter (`\binom`/`\genfrac-with-delims`)
+    /// amsmath FIXED-rule delimiter (`\binom`/`\genfrac-with-delims`)
     /// req_em used to box this delimiter (binomialDelimReqEm(style) — e.g.
     /// 2.392 at display → parenleft.v6, ~1.09 at text → the base paren).
     /// 0 = a content-`\left` fence. Set in layout.layoutLeftRight for
@@ -112,13 +127,18 @@ pub const Box = struct {
 
 /// The flat box pool.
 ///
-/// Do NOT copy a BoxList by value: it owns the `boxes`, `childrefs`, and
-/// `scratch` arrays and deinits them exactly once. `init`/`deinit` must be
-/// paired 1:1; after `deinit` the list is unusable.
+/// Do NOT copy a BoxList by value: it owns the `boxes`, `childrefs`,
+/// `chars`, and `scratch` arrays and deinits them exactly once.
+/// `init`/`deinit` must be paired 1:1; after `deinit` the list is unusable.
 pub const BoxList = struct {
     gpa: std.mem.Allocator,
     boxes: std.ArrayList(Box) = .empty,
     childrefs: std.ArrayList(ChildRef) = .empty,
+    /// Char-only box state, parallel to `boxes` (indexed by box index).
+    /// `.char` boxes carry their codepoint/style/size and layout flags;
+    /// every other kind keeps the default entry. Rule/glue/strut/hbox/vbox/
+    /// script boxes pay no storage for char state.
+    chars: std.ArrayList(CharData) = .empty,
     /// Reusable per-parent placement buffer. Layout fns save `items.len`,
     /// append their placements, hand the run to `create` (which copies it
     /// into `childrefs`), then restore `items.len` — so recursive reuse
@@ -132,6 +152,7 @@ pub const BoxList = struct {
     pub fn deinit(self: *BoxList) void {
         self.boxes.deinit(self.gpa);
         self.childrefs.deinit(self.gpa);
+        self.chars.deinit(self.gpa);
         self.scratch.deinit(self.gpa);
         self.* = undefined;
     }
@@ -139,6 +160,20 @@ pub const BoxList = struct {
     pub fn get(self: *const BoxList, idx: u32) Box {
         std.debug.assert(idx < self.boxes.items.len);
         return self.boxes.items[idx];
+    }
+
+    /// Char-only state of a box (codepoint, style, size, layout flags).
+    /// Every box index has an entry; non-char boxes return the default.
+    pub fn charData(self: *const BoxList, idx: u32) CharData {
+        std.debug.assert(idx < self.chars.items.len);
+        return self.chars.items[idx];
+    }
+
+    /// Mutable char-state slot, for post-create flagging (synthetic, big-op
+    /// form, display advance/ic, radical form, fixed-delimiter req).
+    pub fn charDataPtr(self: *BoxList, idx: u32) *CharData {
+        std.debug.assert(idx < self.chars.items.len);
+        return &self.chars.items[idx];
     }
 
     /// ChildRef run of a box (empty for leaves).
@@ -157,6 +192,9 @@ pub const BoxList = struct {
     }
 
     /// Append a box with a contiguous run of child placements; returns index.
+    /// Char-only state (cp/style/size) goes into the `chars` side table,
+    /// populated only for `.char` boxes — every other kind keeps the
+    /// default entry and pays no storage for it.
     pub fn create(
         self: *BoxList,
         kind: Kind,
@@ -179,12 +217,13 @@ pub const BoxList = struct {
             .depth = depth,
             .first_child = first,
             .num_children = @intCast(placements.len),
-            .cp = cp,
-            .style = style,
-            .size = size,
             .src_start = span.start,
             .src_end = span.end,
         });
+        try self.chars.append(self.gpa, if (kind == .char)
+            .{ .cp = cp, .style = style, .size = size }
+        else
+            .{});
         return idx;
     }
 

@@ -623,7 +623,7 @@ fn layoutChar(
         size_pt,
         span,
     );
-    if (n.data != 0 or mcp != cp) list.boxes.items[box_idx].synthetic = true;
+    if (n.data != 0 or mcp != cp) list.charDataPtr(box_idx).synthetic = true;
     return box_idx;
 }
 
@@ -698,7 +698,7 @@ fn layoutAccent(
     );
     // The mark's utf-8 (the combining char) does not match the source span
     // ("\dot"), so flatten must dupe it into the arena instead of aliasing.
-    list.boxes.items[mark].synthetic = true;
+    list.charDataPtr(mark).synthetic = true;
 
     // Horizontal: XeTeX+unicode-math places the mark's attachment point (the
     // combining marks draw their ink at −0.264em from the glyph origin — its
@@ -726,7 +726,7 @@ fn layoutAccent(
         while (true) {
             const b = list.get(cur);
             if (b.kind == .char) {
-                attach_cp = b.cp;
+                attach_cp = list.charData(cur).cp;
                 char_x = xoff;
                 break;
             }
@@ -850,7 +850,7 @@ fn layoutNot(
     );
     // The slash's utf-8 (U+0338) does not match the source span ("\not"),
     // so flatten must dupe it into the arena instead of aliasing.
-    list.boxes.items[slash].synthetic = true;
+    list.charDataPtr(slash).synthetic = true;
 
     // XeTeX anchors the overlay to the FIRST character of the base box
     // (measured above). Descend hboxes to that char, accumulating the
@@ -868,7 +868,7 @@ fn layoutNot(
         while (true) {
             const b = list.get(cur);
             if (b.kind == .char) {
-                attach_cp = b.cp;
+                attach_cp = list.charData(cur).cp;
                 char_x = xoff;
                 char_w = b.width;
                 char_h = b.height;
@@ -1111,7 +1111,7 @@ fn layoutRow(
             const ph = try list.create(.char, 0, 0, 0, &.{}, mcp, cstyle, size_pt, span);
             // The delimiter glyph does not match the "\middle..." source
             // bytes, so flatten must dupe it into the arena, not alias.
-            list.boxes.items[ph].synthetic = true;
+            list.charDataPtr(ph).synthetic = true;
             break :blk ph;
         } else try layoutInner(
             list,
@@ -2209,7 +2209,7 @@ fn layoutLeftRight(
         // Mark a FIXED-rule fence (\binom/\genfrac-with-delims) with the
         // req_em the layout boxed it by, so the rasterizer resolves the same
         // variant instead of reconstructing it from the (short) enclosed ink.
-        if (binom_fixed) list.boxes.items[ob].delim_fixed = req_em;
+        if (binom_fixed) list.charDataPtr(ob).delim_fixed = req_em;
         const shift = (b.height - b.depth) / 2 - axis;
         try list.scratch.append(list.gpa, .{ .idx = ob, .x_shift = x, .shift = shift });
         x += b.width;
@@ -2238,7 +2238,7 @@ fn layoutLeftRight(
         else
             try layoutDelimChar(list, ast, c, fm, req_em, size_pt, cstyle);
         const b = list.get(cb);
-        if (binom_fixed) list.boxes.items[cb].delim_fixed = req_em;
+        if (binom_fixed) list.charDataPtr(cb).delim_fixed = req_em;
         const shift = (b.height - b.depth) / 2 - axis;
         try list.scratch.append(list.gpa, .{ .idx = cb, .x_shift = x, .shift = shift });
         x += b.width;
@@ -2287,7 +2287,7 @@ fn layoutDelimChar(
             size_pt,
             span,
         );
-        if (n.data != 0) list.boxes.items[box_idx].synthetic = true;
+        if (n.data != 0) list.charDataPtr(box_idx).synthetic = true;
         return box_idx;
     }
     // No variant ladder: continuous scaled base glyph (previous behavior;
@@ -2366,7 +2366,7 @@ fn layoutScaledChar(
         glyph_size,
         span,
     );
-    if (n.data != 0) list.boxes.items[box_idx].synthetic = true;
+    if (n.data != 0) list.charDataPtr(box_idx).synthetic = true;
     return box_idx;
 }
 
@@ -2404,7 +2404,7 @@ fn layoutDelimLevel(
             size_pt,
             span,
         );
-        if (n.data != 0) list.boxes.items[box_idx].synthetic = true;
+        if (n.data != 0) list.charDataPtr(box_idx).synthetic = true;
         return box_idx;
     }
     // No variant ladder: scaled base glyph whose ink reaches the level's
@@ -2436,9 +2436,10 @@ fn sizeMiddleDelims(
 ) !struct { asc_pt: f32, desc_pt: f32 } {
     const b = &list.boxes.items[idx];
     if (b.kind == .char) {
+        const cd = list.charDataPtr(idx);
         // A \middle placeholder: zero-width AND zero-height, delimiter cp.
-        if (b.width == 0 and b.height == 0 and b.depth == 0 and b.cp != 0) {
-            if (metrics.delimVariants(b.cp)) |ladder| {
+        if (b.width == 0 and b.height == 0 and b.depth == 0 and cd.cp != 0) {
+            if (metrics.delimVariants(cd.cp)) |ladder| {
                 var best = ladder[ladder.len - 1];
                 for (ladder) |v| {
                     if (v.asc + v.desc >= req_em) {
@@ -2449,19 +2450,19 @@ fn sizeMiddleDelims(
                 b.width = best.adv * size_pt;
                 b.height = best.asc * size_pt;
                 b.depth = best.desc * size_pt;
-                b.size = size_pt;
+                cd.size = size_pt;
             } else {
                 // No ladder: continuous scaled base (layoutDelimChar's
                 // no-ladder fallback, with the same extent floor).
-                const ink = metrics.glyphInk(b.cp);
+                const ink = metrics.glyphInk(cd.cp);
                 const half = (ink.asc + ink.desc) / 2;
                 const gs = @max(size_pt, req_em * size_pt / (2 * half));
-                const g = metrics.glyphAt(fm, b.cp, b.style, gs) orelse
-                    metrics.glyphEstimate(fm, b.cp, b.style);
+                const g = metrics.glyphAt(fm, cd.cp, cd.style, gs) orelse
+                    metrics.glyphEstimate(fm, cd.cp, cd.style);
                 b.width = s(g.width, gs);
                 b.height = ink.asc * gs;
                 b.depth = ink.desc * gs;
-                b.size = gs;
+                cd.size = gs;
             }
             return .{ .asc_pt = b.height, .desc_pt = b.depth };
         }
@@ -2569,8 +2570,8 @@ fn layoutSqrt(
     // √ is synthesized from \sqrt (source data = codepoint, not text bytes),
     // so mark synthetic so flatten dupes the glyph into the arena.
     const sn = ast.node(surd_leaf);
-    if (sn.data != 0) list.boxes.items[surd].synthetic = true;
-    list.boxes.items[surd].radical_form = @intCast(vi);
+    if (sn.data != 0) list.charDataPtr(surd).synthetic = true;
+    list.charDataPtr(surd).radical_form = @intCast(vi);
 
     // Anchor: glyph ink top (asc·size_pt above its baseline) at vinculum top;
     // shift = glyph baseline's height above the row baseline (neg. = up).
@@ -2778,8 +2779,9 @@ fn layoutScript(
             // correction (measured x^2 sup at 5.719pt = box 5.28 + 0.44).
             // Our box keeps the raw advance, so the sup gap approximates
             // the slant with the table italic correction.
-            const g = metrics.glyphAt(fm, bb.cp, bb.style, size_pt) orelse
-                metrics.glyphEstimate(fm, bb.cp, bb.style);
+            const base_cd = list.charData(base);
+            const g = metrics.glyphAt(fm, base_cd.cp, base_cd.style, size_pt) orelse
+                metrics.glyphEstimate(fm, base_cd.cp, base_cd.style);
             sup_ic = s(g.italic_correction, size_pt);
         }
     }
@@ -2971,6 +2973,7 @@ fn layoutOpLimits(
     cramped: bool,
 ) !u32 {
     const bb = list.get(base);
+    const bcd = list.charData(base);
     const gl = metrics.glue(fm);
     // The big-op spacing params are the OpenType MATH-table constants of the
     // math font (UpperLimitGapMin 0.20em, LowerLimitGapMin 0.167em,
@@ -2997,10 +3000,10 @@ fn layoutOpLimits(
     // 0.05pt).
     const axis = s(gl.axis_height, size_pt);
     const bigop5 = gl.bigop_spacing5;
-    const variant = bb.bigop_form == .variant;
+    const variant = bcd.bigop_form == .variant;
     const delta = if (variant)
-        s(bb.disp_ic, size_pt)
-    else if (metrics.displayOp(bb.cp)) |dop| s(dop.ic, size_pt) else 0;
+        s(bcd.disp_ic, size_pt)
+    else if (metrics.displayOp(bcd.cp)) |dop| s(dop.ic, size_pt) else 0;
 
     // A big-operator GLYPH is centered on the axis (MicroTeX
     // SymbolAtom::createBox big-op branch: y-down shift = (h−d)/2 − axis; the
@@ -3053,7 +3056,7 @@ fn layoutOpLimits(
     // CENTERS the variant-advance box (measured on
     // \sum_{i=1}^{100000} at 30pt: the ∑ box shifts (62.765−43.158)/2).
     // Text/script ops keep the base-advance box and the same centering.
-    const op_w = if (variant) bb.disp_advance * size_pt else bb.width;
+    const op_w = if (variant) bcd.disp_advance * size_pt else bb.width;
     const vbox_w = @max(op_w, @max(sup_w, sub_w));
 
     const saved_len = list.scratch.items.len;
@@ -3319,17 +3322,17 @@ fn layoutOp(
     );
     // The glyph is synthesized: its utf-8 does not match the source span
     // (e.g. \sum → ∑), so flatten must dupe it instead of aliasing src.
-    list.boxes.items[box_idx].synthetic = true;
+    list.charDataPtr(box_idx).synthetic = true;
     // Display ops draw the MATH .v1 variant; text/script ops the base glyph.
     if (display) {
-        list.boxes.items[box_idx].bigop_form = .variant;
+        list.charDataPtr(box_idx).bigop_form = .variant;
         // The drawn variant's geometry rides along for the limits layout:
         // layoutOpLimits boxes a display limits-op vbox by the VARIANT
         // advance (XeTeX boxes the display ∫/∮ by 0.999em, not the base
         // 0.665em) and skews the limits by the variant's italic
         // correction (measured: display-∫ limits stagger ±0.2955em).
-        list.boxes.items[box_idx].disp_advance = ink.disp_advance;
-        list.boxes.items[box_idx].disp_ic = ink.ic;
+        list.charDataPtr(box_idx).disp_advance = ink.disp_advance;
+        list.charDataPtr(box_idx).disp_ic = ink.ic;
     }
     return box_idx;
 }
@@ -4164,7 +4167,7 @@ fn textEmitChar(
     var buf: [4]u8 = undefined;
     const n = std.unicode.utf8Encode(mcp, &buf) catch 0;
     if (mcp != cp or n == 0 or !std.mem.eql(u8, buf[0..n], src[gs..ge]))
-        list.boxes.items[cbox].synthetic = true;
+        list.charDataPtr(cbox).synthetic = true;
     try list.scratch.append(list.gpa, .{ .idx = cbox, .x_shift = x.*, .shift = 0 });
     x.* += w;
     height.* = @max(height.*, ink.asc * size_pt);
@@ -4199,7 +4202,7 @@ fn textEmitMark(
         size_pt,
         .{ .start = gs, .end = ge },
     );
-    list.boxes.items[cbox].synthetic = true;
+    list.charDataPtr(cbox).synthetic = true;
     try list.scratch.append(list.gpa, .{ .idx = cbox, .x_shift = x.*, .shift = 0 });
     height.* = @max(height.*, ink.asc * size_pt);
     depth.* = @max(depth.*, ink.desc * size_pt);
@@ -4503,7 +4506,7 @@ test "layout: styled wraps a char with the declared style" {
     const b = try layout(&list, &a, st, &fm_default, .text, 10, .italic);
     const cb = list.get(b);
     try testing.expectEqual(.char, cb.kind);
-    try testing.expectEqual(atom.CharStyle.roman, cb.style);
+    try testing.expectEqual(atom.CharStyle.roman, list.charData(b).style);
 }
 
 test "layout: atop fraction is a vbox with no rule child" {
@@ -4556,7 +4559,7 @@ test "layout: dfrac in a script context renders at display size (text-size parts
     const nb = list.get(ch[0].idx);
     try testing.expectEqual(.char, nb.kind);
     // part at 10pt (text size), NOT the plain-fraction 7×0.5 = 3.5pt
-    try testing.expectApproxEqAbs(@as(f32, 10.0), nb.size, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 10.0), list.charData(ch[0].idx).size, 0.01);
     // the rule sits on the axis at the effective (10pt) scale
     try testing.expectApproxEqAbs(@as(f32, -2.5), ch[1].shift, 0.01);
     // display fraction at 10pt: num1 (6.765) above the axis, denom1 (6.8595) below
@@ -4579,7 +4582,7 @@ test "layout: tfrac in display keeps text gaps and script-size parts" {
     const ch = list.children(b);
     try testing.expectEqual(@as(usize, 3), ch.len);
     // \tfrac parts are script-size (7pt), not the display \frac's 10pt
-    try testing.expectApproxEqAbs(@as(f32, 7.0), list.get(ch[0].idx).size, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 7.0), list.charData(ch[0].idx).size, 0.01);
     // text gaps: num2 (3.9373) not num1 (6.765)
     try testing.expectApproxEqAbs(@as(f32, 3.9373 + list.get(ch[0].idx).height), fb.height, 0.01);
 }
@@ -4598,7 +4601,7 @@ test "layout: cfrac sets both parts in display style (uncramped, display gaps)" 
     const ch = list.children(b);
     // parts in DISPLAY style: same text size but the box carries display
     // style semantics (uncramped; gap params num1/denom1 like display)
-    try testing.expectApproxEqAbs(@as(f32, 10.0), list.get(ch[0].idx).size, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 10.0), list.charData(ch[0].idx).size, 0.01);
     try testing.expectApproxEqAbs(@as(f32, 6.765 + list.get(ch[0].idx).height), list.get(b).height, 0.01);
 }
 
@@ -4612,11 +4615,11 @@ test "layout: mathstyle wrapper forces style and rescales size" {
     // \scriptstyle in display context: content shrinks to script size (7pt)
     const ms1 = try a.createNode(.mathstyle, 0, 1, &.{a.node(c)}, @intFromEnum(atom.MathStyle.script));
     const b1 = try layout(&list, &a, ms1, &fm_default, .display, 10, .italic);
-    try testing.expectApproxEqAbs(@as(f32, 7.0), list.get(b1).size, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 7.0), list.charData(b1).size, 0.01);
     // \displaystyle in a script context: content grows back to text size (10pt)
     const ms2 = try a.createNode(.mathstyle, 0, 1, &.{a.node(c)}, @intFromEnum(atom.MathStyle.display));
     const b2 = try layout(&list, &a, ms2, &fm_default, .script, 7, .italic);
-    try testing.expectApproxEqAbs(@as(f32, 10.0), list.get(b2).size, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 10.0), list.charData(b2).size, 0.01);
 }
 
 test "layout: unknown codepoint falls back to glyph estimate" {
@@ -4651,14 +4654,14 @@ test "layout: math-italic maps against the static table (Latin yes, Greek no)" {
     try a1.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
     const c1 = try a1.createLeaf(.char, 0, 1, 0);
     const b1 = try layout(&list, &a1, c1, &fm_default, .text, 10, .italic);
-    try testing.expectEqual(@as(u21, 0x1D465), list.get(b1).cp);
+    try testing.expectEqual(@as(u21, 0x1D465), list.charData(b1).cp);
 
     var a2 = atom.Ast.init(testing.allocator, "α"); // U+03B1, like \alpha
     defer a2.deinit();
     try a2.pushToken(.{ .tag = .char, .start = 0, .end = 2 });
     const c2 = try a2.createLeaf(.char, 0, 1, 0x03B1);
     const b2 = try layout(&list, &a2, c2, &fm_default, .text, 10, .italic);
-    try testing.expectEqual(@as(u21, 0x03B1), list.get(b2).cp);
+    try testing.expectEqual(@as(u21, 0x03B1), list.charData(b2).cp);
 }
 
 test "layout: substack stacks two lines at script size with the subarray gap" {
@@ -4695,8 +4698,8 @@ test "layout: substack stacks two lines at script size with the subarray gap" {
     // the hbox itself has size 0)
     const l1b = list.get(ch[0].idx);
     const l2b = list.get(ch[1].idx);
-    try testing.expectApproxEqAbs(@as(f32, 7.0), list.get(list.children(ch[0].idx)[0].idx).size, 0.01);
-    try testing.expectApproxEqAbs(@as(f32, 7.0), list.get(list.children(ch[1].idx)[0].idx).size, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 7.0), list.charData(list.children(ch[0].idx)[0].idx).size, 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 7.0), list.charData(list.children(ch[1].idx)[0].idx).size, 0.01);
     // baseline separation: d1 + h2 + 0.120·7 (the lines beat the nominal
     // 0.789·7 baselineskip — digit-height lines, like the 36pt reference)
     const sep = ch[1].shift - ch[0].shift;

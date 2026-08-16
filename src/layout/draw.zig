@@ -148,9 +148,10 @@ pub fn flatten(
             // big operator like \sum → ∑) has no matching source bytes, so
             // its glyph is duped into the glyph arena. Synthetic is the sole
             // non-alias case — no byte comparison needed.
+            const ch = list.charData(root);
             var buf: [4]u8 = undefined;
-            const n = std.unicode.utf8Encode(b.cp, &buf) catch 0;
-            const bytes = if (b.synthetic)
+            const n = std.unicode.utf8Encode(ch.cp, &buf) catch 0;
+            const bytes = if (ch.synthetic)
                 try out.glyph_arena.allocator().dupe(u8, buf[0..n])
             else
                 src[b.src_start..b.src_end];
@@ -158,13 +159,13 @@ pub fn flatten(
                 .bytes = bytes,
                 .x = x,
                 .y = y,
-                .size = b.size,
-                .style = b.style,
+                .size = ch.size,
+                .style = ch.style,
                 .color = black,
-                .synthetic = b.synthetic,
-                .bigop_form = b.bigop_form,
-                .radical_form = b.radical_form,
-                .delim_fixed = b.delim_fixed,
+                .synthetic = ch.synthetic,
+                .bigop_form = ch.bigop_form,
+                .radical_form = ch.radical_form,
+                .delim_fixed = ch.delim_fixed,
                 .src_start = b.src_start,
                 .src_end = b.src_end,
             } });
@@ -205,8 +206,8 @@ test "flatten: char emits text with provenance" {
     const src = "x+1";
     const c = try list.createLeaf(.char, 4.0, 3.0, 0.5, .{ .start = 0, .end = 1 });
     // tag the char box's cp/size so flatten can build a text primitive
-    list.boxes.items[c].size = 10.0;
-    list.boxes.items[c].cp = 'x';
+    list.charDataPtr(c).size = 10.0;
+    list.charDataPtr(c).cp = 'x';
     try flatten(&list, c, src, 0, 10, &out);
     try testing.expectEqual(@as(usize, 1), out.len());
     const t = out.items.items[0].text;
@@ -243,10 +244,10 @@ test "flatten: hbox walks children in order" {
     const src = "ab";
     const a = try list.createLeaf(.char, 4.0, 3.0, 0.5, .{ .start = 0, .end = 1 });
     const b = try list.createLeaf(.char, 4.0, 3.0, 0.5, .{ .start = 1, .end = 2 });
-    list.boxes.items[a].size = 10.0;
-    list.boxes.items[b].size = 10.0;
-    list.boxes.items[a].cp = 'a';
-    list.boxes.items[b].cp = 'b';
+    list.charDataPtr(a).size = 10.0;
+    list.charDataPtr(b).size = 10.0;
+    list.charDataPtr(a).cp = 'a';
+    list.charDataPtr(b).cp = 'b';
     const children = [_]box.ChildRef{
         .{ .idx = a, .x_shift = 0, .shift = 0 },
         .{ .idx = b, .x_shift = 4.0, .shift = 0 },
@@ -267,10 +268,10 @@ test "flatten: vbox recurses into children" {
     const src = "ab";
     const a = try list.createLeaf(.char, 4.0, 3.0, 0.5, .{ .start = 0, .end = 1 });
     const b = try list.createLeaf(.char, 4.0, 3.0, 0.5, .{ .start = 1, .end = 2 });
-    list.boxes.items[a].size = 10.0;
-    list.boxes.items[b].size = 10.0;
-    list.boxes.items[a].cp = 'a';
-    list.boxes.items[b].cp = 'b';
+    list.charDataPtr(a).size = 10.0;
+    list.charDataPtr(b).size = 10.0;
+    list.charDataPtr(a).cp = 'a';
+    list.charDataPtr(b).cp = 'b';
     const children = [_]box.ChildRef{
         .{ .idx = a, .x_shift = 1.0, .shift = -2.0 },
         .{ .idx = b, .x_shift = 5.0, .shift = 3.0 },
@@ -296,10 +297,10 @@ test "flatten: script box recurses into base and superscript" {
     const src = "x2";
     const base = try list.createLeaf(.char, 4.0, 3.0, 0.5, .{ .start = 0, .end = 1 });
     const sup = try list.createLeaf(.char, 4.0, 3.0, 0.5, .{ .start = 1, .end = 2 });
-    list.boxes.items[base].size = 10.0;
-    list.boxes.items[sup].size = 10.0;
-    list.boxes.items[base].cp = 'x';
-    list.boxes.items[sup].cp = '2';
+    list.charDataPtr(base).size = 10.0;
+    list.charDataPtr(sup).size = 10.0;
+    list.charDataPtr(base).cp = 'x';
+    list.charDataPtr(sup).cp = '2';
     const children = [_]box.ChildRef{
         .{ .idx = base, .x_shift = 0, .shift = 0 },
         .{ .idx = sup, .x_shift = 4.0, .shift = -3.0 },
