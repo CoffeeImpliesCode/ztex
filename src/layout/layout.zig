@@ -2500,11 +2500,18 @@ fn sizeMiddleDelims(
 ///     shallow radicands. Variants keep the width slim (∼1em advance,
 ///     ∼0.91em ink) while the height grows — the old code scaled the base
 ///     glyph to H+D+clr+θ, fattening it to ∼2em-wide ink.
+///   · make_radical's clearance adjustment: the glyph box depth is replaced
+///     by total−θ (the rule occupies the top θ of the ink); delta =
+///     (total−θ) − (H + D + clr), and half the excess goes into the
+///     clearance. Tall variants add ~0.2em here, floating the vinculum
+///     clear of the radicand and centering the radicand on the radical.
+///   · the construction box: height = H + clr + 2θ (the empty kern above
+///     the vinculum), depth = max(D, total − (H + clr + θ)).
 ///   · \sqrt[n]{x}: the degree is set at 0.5×size (measured XeTeX), its
-///     bottom raised to rule_top − 0.4·rad_ink_height
-///     (RadicalDegreeBottomRaisePercent = 60 of the radical's ink height),
-///     its left edge 0.278em (RadicalKernBeforeDegree of the degree size)
-///     right of the radical bar.
+///     bottom raised by 0.6·(height − depth) of the construction (amsmath
+///     \r@@t's \raise .6\dimen@\copy\rootbox), its left edge 0.278em
+///     (RadicalKernBeforeDegree of the degree size) right of the radical
+///     bar.
 fn layoutSqrt(
     list: *box.BoxList,
     ast: *const atom.Ast,
@@ -2546,13 +2553,24 @@ fn layoutSqrt(
     const rv = metrics.radical_variants[vi];
     const rad_ink_height = (rv.asc + rv.desc) * size_pt;
 
-    // TeX make_radical's clearance adjustment: when the radical glyph's ink
-    // depth exceeds the radicand's extent below the rule, half the excess is
-    // added to the clearance, raising the vinculum. Uses the variant's ink
-    // descent (0.96em for base, 0.95em for .v3, etc.).
-    const delta = @max(0.0, rv.desc * size_pt - (H + D + clr));
+    // TeX make_radical's clearance adjustment (xetex.web): the radical glyph
+    // box's depth is REPLACED by (total ink − rule_thickness) — the vinculum
+    // rule occupies the top rt of the glyph's ink — then
+    //   delta = depth(y) − (H + D + clr)
+    // and half the excess (the glyph's ink hanging below the radicand's
+    // extent) is added to the clearance, raising the vinculum. The base
+    // glyph's descent (0.96em) equals total−rt only because its ascent is
+    // exactly rt; tall variants (.v1–.v4, desc 0.35–1.25em) under-count by
+    // asc−rt (1.41em for .v3), leaving the vinculum ~0.2em too low and the
+    // radicand riding high in the surd (measured \sqrt[3]{\frac{a}{b}}:
+    // numerator 'a' 24.6pt above the √ baseline vs XeTeX's 18.6pt).
+    const delta = @max(0.0, ((rv.asc + rv.desc) * size_pt - rt) - (H + D + clr));
     const clr2 = clr + delta / 2;
     const rule_top = H + clr2 + rt;
+    // The construction's depth (XeTeX hpack extents, measured \sqrt{x}:
+    // 5.715 = total 30 − rule_top 24.285; \sqrt[3]{\frac{a}{b}}: 26.85 =
+    // 72 − 45.15): the glyph's ink bottom when it out-hangs the radicand.
+    const hbox_depth = @max(D, rad_ink_height - rule_top);
 
     // Create the surd char box at size_pt (the current math size) with the
     // variant's advance/ink — NOT layoutScaledChar, which would use the base
@@ -2591,27 +2609,34 @@ fn layoutSqrt(
     // radicand's left edge to its right edge; the hook connects it to the bar).
     const rule = try list.createLeaf(.rule, rb.width, rt / 2, rt / 2, span);
     try list.scratch.append(list.gpa, .{ .idx = rule, .x_shift = radicand_x, .shift = -(H + clr2 + rt / 2) });
-    var height = rule_top;
+    // The construction's height = vinculum top + rt: XeTeX's overbar is
+    // [kern rt, rule rt, kern clr2, radicand], the empty kern above the rule
+    // part of the box extent (measured \sqrt{x}: 25.485 = 13.26 + 9.825 +
+    // 2·1.2). The degree raise (amsmath \r@@t) reads this height.
+    var height = rule_top + rt;
     var width = radicand_x + rb.width;
     if (degree) |d| {
-        // Root index at scriptscript size (XeTeX measured), bottom raised
-        // to rule_top − 0.4·rad_ink_height (RadicalDegreeBottomRaisePercent
-        // = 60 of the radical's ink height), left edge 0.278·deg_size right
-        // of the bar.
+        // Root index at scriptscript size (XeTeX measured), left edge
+        // 0.278·deg_size right of the bar. Its BASELINE is raised by
+        // 0.6·(hbox height − depth) above the row baseline — amsmath's
+        // \r@@t: \raise .6\dimen@\copy\rootbox with \dimen@ = \ht−\dp of the
+        // radical box (measured \sqrt[3]{\frac{a}{b}}: degree baseline
+        // 11.7pt above the axis at 30pt; the old rule_top−0.4·ink_height
+        // anchor rode the degree up with the vinculum, ~5pt too high).
         const deg_size = size_pt * gl.scriptscriptfactor;
         const db = try layoutInner(list, ast, d, fm, .script_script, deg_size, cstyle, true);
         const gb = list.get(db);
         const deg_x = 0.073 * rad_ink_height + 0.278 * deg_size;
-        const bottom = rule_top - 0.4 * rad_ink_height;
-        try list.scratch.append(list.gpa, .{ .idx = db, .x_shift = deg_x, .shift = -(bottom + gb.depth) });
-        height = @max(height, bottom + gb.height + gb.depth);
+        const raise = 0.6 * (height - hbox_depth);
+        try list.scratch.append(list.gpa, .{ .idx = db, .x_shift = deg_x, .shift = -raise });
+        height = @max(height, raise + gb.height);
         width = @max(width, deg_x + gb.width);
     }
     return list.create(
         .hbox,
         width,
         height,
-        @max(D, rad_ink_height - rule_top),
+        hbox_depth,
         list.scratch.items[saved_len..],
         0,
         cstyle,
