@@ -18,3 +18,4 @@ node_modules/
 local:
 *.svg.tmp
 result-bin
+__pycache__/
