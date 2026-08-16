@@ -507,6 +507,66 @@ const delim_map = std.StaticStringMap(u21).initComptime(&[_]struct { []const u8,
     .{ "/", 0x2F },
 });
 
+/// The single answer to "what commands does this parser support": the union
+/// of the four dispatch tables' keys (cmd_map + mathstyle_map + symbol_map +
+/// delim_map), GENERATED comptime from the tables so it cannot drift from
+/// them. A command added to any table appears here automatically; a
+/// hand-written entry here without a backing table fails the coverage test
+/// below. The union is deduplicated and sorted for deterministic external
+/// enumeration: a name shared by two tables is listed ONCE (the intended
+/// reuse is delim_map ↔ symbol_map — see the collision test), so this is a
+/// true set, not a multiset.
+pub const supported_commands: []const []const u8 = blk: {
+    // The comptime pdq sort over ~230 names exceeds the default 1000-branch
+    // comptime eval budget.
+    @setEvalBranchQuota(200_000);
+    const tables = [_][]const []const u8{
+        cmd_map.keys(),
+        mathstyle_map.keys(),
+        symbol_map.keys(),
+        delim_map.keys(),
+    };
+    var total: usize = 0;
+    for (tables) |t| total += t.len;
+    var names: [total][]const u8 = undefined;
+    var n: usize = 0;
+    for (tables) |t| for (t) |k| {
+        names[n] = k;
+        n += 1;
+    };
+    std.mem.sort([]const u8, &names, {}, supportedLessThan);
+    // Count distinct names (the dedup tracks the LAST DISTINCT value, not a
+    // raw index — a raw `names[j-1]` can be a stale duplicate after earlier
+    // collapses), then materialize into a const array so the returned slice
+    // references comptime-constant memory (a slice into the `var names`
+    // buffer itself would be "a reference to comptime var").
+    var last: ?[]const u8 = null;
+    var m: usize = 0;
+    for (names) |k| {
+        if (last == null or !std.mem.eql(u8, last.?, k)) {
+            m += 1;
+            last = k;
+        }
+    }
+    const result: [m][]const u8 = result_blk: {
+        var out: [m][]const u8 = undefined;
+        var j: usize = 0;
+        for (names) |k| {
+            if (j == 0 or !std.mem.eql(u8, out[j - 1], k)) {
+                out[j] = k;
+                j += 1;
+            }
+        }
+        break :result_blk out;
+    };
+    break :blk &result;
+};
+
+/// Byte-wise less-than for `supported_commands`' deterministic sort.
+fn supportedLessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
 /// The `data` a \sqrt row node carries so layout routes it through
 /// layoutSqrt (stretchy radical + vinculum) instead of the ordinary row
 /// path. Ordinary parseRow rows always carry data 0, so this is unambiguous.
@@ -2778,4 +2838,157 @@ test "parser: & outside an environment is an ordinary char" {
     const root = ast.node(ast.root);
     try testing.expectEqual(@as(u16, 3), root.num_children);
     try testing.expectEqual(.char, ast.node(ast.child(ast.root, 1)).tag);
+}
+
+// ── supported_commands (audit L5) ──────────────
+
+/// Independent comptime recomputation of the DISTINCT command count across
+/// the four dispatch tables. `supported_commands` is built from these same
+/// tables, so this is the ground truth its length must equal — it keeps the
+/// coverage test from merely echoing the list's own length (a hand-added
+/// entry without a backing table would break the length match).
+const supported_distinct_count: usize = blk: {
+    // O(n²) byte-compare over ~230 names exceeds the default 1000-branch
+    // comptime eval budget.
+    @setEvalBranchQuota(400_000);
+    const tables = [_][]const []const u8{
+        cmd_map.keys(),
+        mathstyle_map.keys(),
+        symbol_map.keys(),
+        delim_map.keys(),
+    };
+    var total: usize = 0;
+    for (tables) |t| total += t.len;
+    var names: [total][]const u8 = undefined;
+    var n: usize = 0;
+    for (tables) |t| for (t) |k| {
+        names[n] = k;
+        n += 1;
+    };
+    var dups: usize = 0;
+    for (0..n) |i| {
+        var seen_before = false;
+        for (0..i) |j| {
+            if (std.mem.eql(u8, names[i], names[j])) {
+                seen_before = true;
+                break;
+            }
+        }
+        if (seen_before) dups += 1;
+    }
+    break :blk total - dups;
+};
+
+test "parser: supported_commands is exactly the union of the four tables" {
+    // 1. Every table key appears in the list — the tables are the source of
+    // truth, and dropping one from the union fails here.
+    inline for (.{ cmd_map, mathstyle_map, symbol_map, delim_map }) |m| {
+        for (m.keys()) |k| {
+            var found = false;
+            for (supported_commands) |s| {
+                if (std.mem.eql(u8, s, k)) {
+                    found = true;
+                    break;
+                }
+            }
+            try testing.expect(found);
+        }
+    }
+    // 2. Every list entry is backed by at least one table: a hand-written
+    // entry with no backing map fails here (the audit's coverage guard).
+    for (supported_commands) |s| {
+        try testing.expect(
+            cmd_map.has(s) or mathstyle_map.has(s) or symbol_map.has(s) or delim_map.has(s),
+        );
+    }
+    // 3. The list is a true SET: no name repeats (cross-table duplicates
+    // collapse to one entry).
+    for (supported_commands, 0..) |s, i| {
+        for (supported_commands[0..i]) |prev| {
+            try testing.expect(!std.mem.eql(u8, s, prev));
+        }
+    }
+    // 4. Independent count check: length == recomputed distinct union size.
+    try testing.expectEqual(@as(usize, supported_distinct_count), supported_commands.len);
+    // 4. Independent count check: length == recomputed distinct union size.
+    try testing.expectEqual(@as(usize, supported_distinct_count), supported_commands.len);
+}
+
+test "parser: command dispatch is unambiguous (collision test)" {
+    // The tables consulted when a command appears in ATOM position
+    // (parseRow → parseSingleAtom → parseCommand, plus the inline mathstyle
+    // interception in parseRow/parseScriptArg) must be pairwise disjoint: a
+    // name in two of them would be ambiguous dispatch. delim_map is
+    // consulted ONLY by parseDelimiter (after \left/\right/\big/\genfrac) —
+    // a separate context — so it may reuse symbol names, but it must not
+    // collide with the atom-position tables, and its symbol reuse is pinned
+    // to the documented set below.
+    for (cmd_map.keys()) |k| {
+        try testing.expect(!mathstyle_map.has(k));
+        try testing.expect(!symbol_map.has(k));
+        try testing.expect(!delim_map.has(k));
+    }
+    for (mathstyle_map.keys()) |k| {
+        try testing.expect(!symbol_map.has(k));
+        try testing.expect(!delim_map.has(k));
+    }
+    // symbol_map ↔ delim_map reuse is INTENTIONAL (delimiter words that are
+    // also standalone symbols, e.g. \langle); pin it so an accidental new
+    // overlap fails the test.
+    const intended_reuse = [_][]const u8{
+        "langle", "rangle", "lfloor", "rfloor", "lceil",     "rceil",
+        "lbrace", "rbrace", "vert",   "Vert",   "backslash",
+    };
+    var reused: usize = 0;
+    for (delim_map.keys()) |k| {
+        if (!symbol_map.has(k)) continue;
+        var found = false;
+        for (intended_reuse) |r| {
+            if (std.mem.eql(u8, k, r)) {
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found);
+        reused += 1;
+    }
+    try testing.expectEqual(@as(usize, intended_reuse.len), reused);
+}
+
+test "parser: every cmd_map command is reachable through dispatch" {
+    // For every command name in cmd_map, a minimal parse that routes through
+    // the command dispatcher must recognize it: the outcome is either a
+    // successful parse or a recognized parse error — never
+    // error.UnknownCommand (the unknown-command path). Argument-taking
+    // commands (\frac{}{}, \sqrt{}, \operatorname{}, \text{}, styles...)
+    // fail on their MISSING required argument when parsed bare, which is a
+    // recognized error and still PROVES the name reached the cmd_map
+    // dispatch (a name absent from cmd_map and symbol_map would be the
+    // UnknownCommand path). Success is the strongest assertion; a recognized
+    // non-unknown error is the documented weaker one for argument-taking
+    // commands — chosen to avoid reimplementing the grammar.
+    for (cmd_map.keys()) |k| {
+        var src_buf: [64]u8 = undefined;
+        const src = std.fmt.bufPrint(&src_buf, "\\{s}", .{k}) catch unreachable;
+        if (parseSrc(testing.allocator, src)) |ast| {
+            var owned = ast;
+            owned.deinit();
+        } else |err| {
+            try testing.expect(err != error.UnknownCommand);
+        }
+    }
+}
+
+test "parser: symbol and mathstyle tables are reachable too" {
+    // Light reachability check for the two tables that dispatch OUTSIDE
+    // cmd_map: a symbol name (\alpha) parses to a char leaf, and a style
+    // switch (\displaystyle) wraps the rest of the group rather than
+    // failing as unknown.
+    var ast = try parseSrc(testing.allocator, "\\alpha");
+    defer ast.deinit();
+    try testing.expectEqual(.char, ast.node(ast.child(ast.root, 0)).tag);
+
+    var ast2 = try parseSrc(testing.allocator, "\\displaystyle x");
+    defer ast2.deinit();
+    try testing.expectEqual(.mathstyle, ast2.node(ast2.child(ast2.root, 0)).tag);
 }

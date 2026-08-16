@@ -10,6 +10,11 @@ const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 pub const err = @import("error.zig");
 
+/// The complete set of command names the parser recognizes (see
+/// parser.supported_commands) — the single external answer to "what commands
+/// does this parser support".
+pub const supported_commands = parser.supported_commands;
+
 /// Parse-error context (kind + span + message); see `err.Info`.
 pub const Info = err.Info;
 /// The parse-error kinds; see `err.Kind`.
