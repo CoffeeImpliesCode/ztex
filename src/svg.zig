@@ -70,6 +70,7 @@ pub fn render(gpa: std.mem.Allocator, dl: *const draw.DrawList, opts: Options) !
     const w = dl.width + 2 * pad;
     const h = dl.height + dl.depth + 2 * pad + linegap;
     const base = dl.height + pad; // baseline offset so top lands at y = pad
+    try checkFinite(&.{ w, h });
 
     // All layout numbers are points. width/height carry explicit pt units so
     // the output renders at its declared physical size (bare user units would
@@ -88,11 +89,17 @@ pub fn render(gpa: std.mem.Allocator, dl: *const draw.DrawList, opts: Options) !
         switch (d) {
             .text => |t| {
                 const fs = fontSpec(t.style, &opts);
+                try checkFinite(&.{ t.x + pad, t.y + base, t.size });
                 try buf.print(
                     gpa,
-                    "<text x=\"{d}pt\" y=\"{d}pt\" font-size=\"{d}pt\" font-family=\"{s}\" font-style=\"{s}\"",
-                    .{ t.x + pad, t.y + base, t.size, fs.family, fs.style },
+                    "<text x=\"{d}pt\" y=\"{d}pt\" font-size=\"{d}pt\" font-family=\"",
+                    .{ t.x + pad, t.y + base, t.size },
                 );
+                // font_family/text_font_family are caller-supplied (Options),
+                // so escape them like text content: a `"` would otherwise
+                // break the attribute or allow attribute injection.
+                try escapeAppend(gpa, &buf, fs.family);
+                try buf.print(gpa, "\" font-style=\"{s}\"", .{fs.style});
                 if (t.bigop_form == .variant) {
                     // A DISPLAY big-op: the drawn glyph is the OpenType
                     // MATH-table .v1 variant (XeTeX's display form), not the
@@ -132,6 +139,7 @@ pub fn render(gpa: std.mem.Allocator, dl: *const draw.DrawList, opts: Options) !
                 try buf.appendSlice(gpa, "/text>\n");
             },
             .rect => |r| {
+                try checkFinite(&.{ r.x + pad, r.y + base, r.w, r.h });
                 try buf.print(
                     gpa,
                     "<rect x=\"{d}pt\" y=\"{d}pt\" width=\"{d}pt\" height=\"{d}pt\" fill=\"#{s}\"/>\n",
@@ -139,6 +147,7 @@ pub fn render(gpa: std.mem.Allocator, dl: *const draw.DrawList, opts: Options) !
                 );
             },
             .line => |l| {
+                try checkFinite(&.{ l.x0 + pad, l.y0 + base, l.x1 + pad, l.y1 + base, l.width });
                 try buf.print(
                     gpa,
                     "<line x1=\"{d}pt\" y1=\"{d}pt\" x2=\"{d}pt\" " ++
@@ -177,11 +186,14 @@ fn hexByte(v: u8, out: []u8) void {
 }
 
 /// Parse a color from a name (`white`, `black`, …) or hex (`#RRGGBB[AA]`).
-/// Returns null for `none`/`transparent` or anything unrecognized (no
-/// background).
-pub fn parseColor(s: []const u8) ?draw.Color {
+/// Returns null for the valid "no background" values `none`/`transparent`,
+/// a `draw.Color` for a recognized name/hex, and
+/// `error.UnrecognizedColor` for anything else — so callers can tell "no
+/// background" apart from a typo (e.g. `-b blak`). Prefer this over
+/// `parseColor`, which collapses the two cases into null.
+pub fn parseColorChecked(s: []const u8) !?draw.Color {
     if (std.mem.eql(u8, s, "none") or std.mem.eql(u8, s, "transparent")) return null;
-    if (s.len > 0 and s[0] == '#') return parseHex(s[1..]);
+    if (s.len > 0 and s[0] == '#') return parseHex(s[1..]) orelse error.UnrecognizedColor;
     const named = [_]struct { name: []const u8, c: draw.Color }{
         .{ .name = "white", .c = .{ .r = 255, .g = 255, .b = 255 } },
         .{ .name = "black", .c = .{ .r = 0, .g = 0, .b = 0 } },
@@ -198,7 +210,15 @@ pub fn parseColor(s: []const u8) ?draw.Color {
     for (named) |n| {
         if (std.mem.eql(u8, s, n.name)) return n.c;
     }
-    return null;
+    return error.UnrecognizedColor;
+}
+
+/// Legacy wrapper: same as `parseColorChecked`, but collapses an
+/// unrecognized input to null (no background). Kept so existing callers
+/// compile unchanged; new callers should use `parseColorChecked` so they
+/// can distinguish `none`/`transparent` from a typo.
+pub fn parseColor(s: []const u8) ?draw.Color {
+    return parseColorChecked(s) catch null;
 }
 
 fn parseHex(s: []const u8) ?draw.Color {
@@ -209,6 +229,15 @@ fn parseHex(s: []const u8) ?draw.Color {
     c.g = std.fmt.parseInt(u8, s[2..4], 16) catch return null;
     c.b = std.fmt.parseInt(u8, s[4..6], 16) catch return null;
     return c;
+}
+
+/// Fail loudly (error) rather than emit `nan`/`inf` into the SVG. A
+/// non-finite coordinate would otherwise be printed verbatim by `{d}` and
+/// produce a broken/invisible document.
+fn checkFinite(vals: []const f32) !void {
+    for (vals) |v| {
+        if (!std.math.isFinite(v)) return error.NonFiniteCoordinate;
+    }
 }
 
 /// XML-escape text content: `& < > "`.
@@ -350,4 +379,59 @@ test "svg: parseColor resolves names and hex" {
     try testing.expectEqual(@as(u8, 128), c.g);
     try testing.expectEqual(@as(u8, 0), c.b);
     try testing.expectEqual(@as(u8, 255), c.a);
+}
+
+test "svg: parseColorChecked tells none/transparent from unrecognized" {
+    // valid "no background" values stay null (no background)
+    try testing.expect((try parseColorChecked("none")) == null);
+    try testing.expect((try parseColorChecked("transparent")) == null);
+    // a valid color parses
+    try testing.expectEqual(@as(draw.Color, .{ .r = 255, .g = 0, .b = 0 }), (try parseColorChecked("red")).?);
+    try testing.expectEqual(@as(draw.Color, .{ .r = 255, .g = 128, .b = 0 }), (try parseColorChecked("#ff8000")).?);
+    // bad hex is rejected
+    try testing.expectError(error.UnrecognizedColor, parseColorChecked("#zz0000"));
+    // an unrecognized string errors (not silently treated as no background)
+    try testing.expectError(error.UnrecognizedColor, parseColorChecked("blak"));
+}
+
+test "svg: escapes quotes in the font-family attribute" {
+    var dl = draw.DrawList.init(testing.allocator);
+    defer dl.deinit();
+    _ = try dl.add(.{ .text = .{
+        .bytes = "x",
+        .x = 0,
+        .y = 0,
+        .size = 10,
+        .style = .italic,
+        .color = .{ .r = 0, .g = 0, .b = 0 },
+        .src_start = 0,
+        .src_end = 1,
+    } });
+    dl.width = 5;
+    dl.height = 8;
+    dl.depth = 2;
+    const svg = try render(testing.allocator, &dl, .{ .font_family = "Fake \"Injected\" Family" });
+    defer testing.allocator.free(svg);
+    try testing.expect(std.mem.indexOf(u8, svg, "font-family=\"Fake &quot;Injected&quot; Family\"") != null);
+    // the raw quote must not survive into the attribute
+    try testing.expect(std.mem.indexOf(u8, svg, "font-family=\"Fake \"Injected\" Family\"") == null);
+}
+
+test "svg: rejects non-finite coordinates" {
+    var dl = draw.DrawList.init(testing.allocator);
+    defer dl.deinit();
+    _ = try dl.add(.{ .text = .{
+        .bytes = "x",
+        .x = std.math.nan(f32),
+        .y = 0,
+        .size = 10,
+        .style = .italic,
+        .color = .{ .r = 0, .g = 0, .b = 0 },
+        .src_start = 0,
+        .src_end = 1,
+    } });
+    dl.width = 5;
+    dl.height = 8;
+    dl.depth = 2;
+    try testing.expectError(error.NonFiniteCoordinate, render(testing.allocator, &dl, .{}));
 }

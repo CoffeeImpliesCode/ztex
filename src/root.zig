@@ -22,6 +22,9 @@ pub const Context = context.Context;
 /// The returned `DrawList`'s `text` primitives alias `src`, so `src` must
 /// outlive the draw list. `size_pt` is the base font size in points. On a
 /// parse error, `err_info` (when non-null) is filled with the kind + span.
+/// Measures from the bundled static tables (`layout.metrics.default`);
+/// `Context.render` is the same single pipeline measured from the real
+/// fonts (SIM1/H1: one shared layout body, two metric sources).
 pub fn render(
     gpa: std.mem.Allocator,
     src: []const u8,
@@ -30,7 +33,7 @@ pub fn render(
 ) !draw.DrawList {
     var ast = try parse.parse(gpa, src, err_info);
     defer ast.deinit();
-    return layout.render(gpa, &ast, ast.root, size_pt);
+    return layout.render(gpa, &ast, ast.root, &layout.metrics.default, size_pt);
 }
 
 test {

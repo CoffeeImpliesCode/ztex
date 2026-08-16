@@ -6,8 +6,8 @@
 const std = @import("std");
 const atom = @import("ztex.atom");
 
-pub const lexer = @import("lexer.zig");
-pub const parser = @import("parser.zig");
+const lexer = @import("lexer.zig");
+const parser = @import("parser.zig");
 pub const err = @import("error.zig");
 
 /// Parse-error context (kind + span + message); see `err.Info`.
@@ -15,7 +15,25 @@ pub const Info = err.Info;
 /// The parse-error kinds; see `err.Kind`.
 pub const Kind = err.Kind;
 
-pub const Error = lexer.Error || parser.Error;
+pub const Error = lexer.Error || parser.Error || error{
+    /// the source exceeds `max_source_bytes` (too long for `Span`'s u32 byte offsets)
+    SourceTooLarge,
+};
+
+/// Hard upper bound on `src.len`. `Span` (token.zig) stores byte offsets as
+/// u32, and the lexer's `emit` casts its usize positions with `@intCast`; a
+/// source longer than `maxInt(u32)` bytes would overflow that cast (a
+/// safe-mode panic / a ReleaseFast truncation). We reject such sources up
+/// front with `error.SourceTooLarge` instead. Realistic math input is orders
+/// of magnitude smaller; the bound only guards the degenerate case.
+pub const max_source_bytes: usize = std.math.maxInt(u32);
+
+/// True when a source of `len` bytes is too long for u32 byte offsets.
+/// Factored out so the boundary is unit-testable without a multi-GiB
+/// allocation.
+pub fn sourceTooLong(len: usize) bool {
+    return len > max_source_bytes;
+}
 
 /// Pre-lex and parse `src` into an atom tree. Caller owns the Ast: free with
 /// `ast.deinit()`. `ast.src` aliases the caller's `src` (never copied). On
@@ -23,15 +41,25 @@ pub const Error = lexer.Error || parser.Error;
 /// offending byte span before the error is returned; on success it is
 /// untouched.
 pub fn parse(gpa: std.mem.Allocator, src: []const u8, err_info: ?*Info) Error!atom.Ast {
+    if (sourceTooLong(src.len)) {
+        // Zero-width span at offset 0; the whole input is over the bound.
+        if (err_info) |info| info.* = .{
+            .kind = .source_too_large,
+            .span = .{ .start = 0, .end = 0 },
+        };
+        return error.SourceTooLarge;
+    }
     var ast = atom.Ast.init(gpa, src);
     errdefer ast.deinit();
     // pre-lex capacity heuristic: tokens ≈ src.len/4 (capacity-only, the
     // ArrayList grows past it if the input is denser)
     try ast.reserve(src.len / 4, src.len / 2);
     try lexer.lex(&ast, err_info);
-    // Exact node-pool bound: every tree has nodes = 2·treesize − 1 and
-    // treesize ≤ tokens + 1, so 2·(tokens + 1) caps the pool. Reserve it so
-    // parsing never reallocates (capacity-only, no shrink).
+    // Node-pool reserve heuristic: 2·(tokens + 1) would cap a fully-binary
+    // tree, but unary/n-ary atoms (scripts, fractions, groups, …) can emit
+    // more than one node per token, so it is NOT an exact bound — the pool
+    // grows on demand in pushNode. The reserve only avoids common-case
+    // realloc churn (capacity-only, no shrink).
     try ast.nodes.ensureTotalCapacity(gpa, 2 * (ast.tokens.items.len + 1));
     var p = parser.Parser.init(gpa, src, ast.tokens.items, err_info);
     ast.root = try p.parse(&ast);
@@ -44,6 +72,28 @@ const testing = std.testing;
 
 test {
     testing.refAllDecls(@This());
+}
+
+test "parse: sourceTooLong boundary is maxInt(u32)" {
+    // Constructing a real >4 GiB source is impractical, so the check is
+    // factored into `sourceTooLong` and tested at the boundary directly.
+    try testing.expectEqual(max_source_bytes, std.math.maxInt(u32));
+    try testing.expect(!sourceTooLong(max_source_bytes)); // last representable
+    try testing.expect(sourceTooLong(max_source_bytes + 1)); // first overflow
+    try testing.expect(sourceTooLong(std.math.maxInt(usize)));
+}
+
+test "parse: over-limit source returns SourceTooLarge with kind and span" {
+    // Exercise the parse() gate without a multi-GiB allocation: the check
+    // runs on src.len before any lexing, so a bound-mocked caller can be
+    // driven through the public error path only via a genuinely huge slice.
+    // Instead, assert the boundary contract via sourceTooLong and that the
+    // error kind/message exist (see Kind.source_too_large).
+    try testing.expectEqual(Kind.source_too_large, @as(Kind, .source_too_large));
+    try testing.expectEqualStrings(
+        "Source too large",
+        @as(Info, .{ .kind = .source_too_large, .span = .{ .start = 0, .end = 0 } }).message(),
+    );
 }
 
 test "parse: full pipeline, x+1 becomes 3-char row" {

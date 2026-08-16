@@ -1,47 +1,50 @@
 //! ztex.context — "initialize once, render many".
 //!
 //! A `Context` owns a `FontContext` (embedded Latin Modern Math + Roman
-//! fallback faces, plus any extra faces loaded with `loadFont`) and a
-//! `FontMetrics` wired to it: `fm.font` points at the context's fonts and
-//! `fm.font_glyph` is the lookup hook below, so every `render` measures
+//! fallback fonts) and a `FontMetrics` union wired to it: `fm` is the
+//! `.font` arm pointing at the context's fonts, so every `render` measures
 //! glyphs from the REAL fonts — served from the context's per-(face,
 //! codepoint) metric cache, which the first render fills and every later
 //! render hits. Create one context, render any number of formulas with it.
 //!
-//! The FontContext is heap-allocated: `fm.font` (a pointer into it) must
-//! stay valid across the `init` return, and a `FontContext` value returned
-//! by `init` is not guaranteed to be placed at the caller's result location
-//! in this toolchain — a by-value self-pointer would dangle on the caller's
-//! stack once `init`'s frame is reused (loadFromFile does exactly that).
-//! Heap allocation makes the pointer stable; copies of the Context share
-//! the FontContext, so deinit must be called exactly once.
+//! The FontContext is heap-allocated: the `fm` union arm (a pointer into
+//! it) must stay valid across the `init` return, and a `FontContext` value
+//! returned by `init` is not guaranteed to be placed at the caller's result
+//! location in this toolchain — a by-value self-pointer would dangle on the
+//! caller's stack once `init`'s frame is reused. Heap allocation makes the
+//! pointer stable; copies of the Context share the FontContext, so deinit
+//! must be called exactly once.
 //!
 //! This is the font-backed pipeline; `ztex.render` (static metric tables)
-//! stays available for one-shot use and for tests. The hook lives here, not
-//! in metrics.zig, because only the ztex module can import font.zig (the
-//! ztex.layout module has no font import and build.zig is out of scope);
-//! metrics.zig treats the context pointer as opaque.
+//! stays available for one-shot use and for tests. Both call the SINGLE
+//! shared pipeline `layout.render` with an explicit `FontMetrics` argument
+//! (SIM1/H1). The metric source is the closed `FontMetrics` union (SIM2):
+//! context.zig builds the `.font` arm — a `FontHook` carrying the
+//! `*FontContext` (opaque to the layout module, which cannot import
+//! font.zig) plus the font-glyph lookup below — so `init` is one struct
+//! literal instead of hand-installed fn-pointer plumbing, and the concrete
+//! cast lives in exactly one place.
 
 const std = @import("std");
-const font = @import("font.zig");
 const atom = @import("ztex.atom");
+const font = @import("font.zig");
 const parse = @import("ztex.parse");
 const layout = @import("ztex.layout");
 const metrics = layout.metrics;
 const draw = layout.draw;
 
-/// Font-backed glyph lookup installed as `FontMetrics.font_glyph` (see
-/// context.zig / metrics.zig). Real-font metrics for `cp` in `style` at the
-/// 10pt base (em × 10, so the layout's s(v, size_pt) scaling applies — LM
-/// is a 10pt design): width = the face's cached hmtx advance, height/depth
-/// = the face's OWN nominal hhea extents. Style `.roman` selects the LM
-/// Roman regular face (`\text`/`\mathrm`), every other style the LM Math
-/// face. The italic correction stays the static row's value (LM Math's MATH
-/// table is not parsed yet), so sup/sub placement and the post-op tail keep
+/// Font-backed glyph lookup, the `.font` arm's hook (see `FontHook` in
+/// metrics.zig). Real-font metrics for `cp` in `style` at the 10pt base
+/// (em × 10, so the layout's s(v, size_pt) scaling applies — LM is a 10pt
+/// design): width = the face's cached hmtx advance, height/depth = the
+/// face's OWN nominal hhea extents. Style `.roman` selects the LM Roman
+/// regular face (`\text`/`\mathrm`), every other style the LM Math face.
+/// The italic correction stays the static row's value (LM Math's MATH table
+/// is not parsed yet), so sup/sub placement and the post-op tail keep
 /// today's values. Null when the face has no glyph for `cp` — glyph/glyphAt
 /// then fall back to the static tables, and finally to glyphEstimate.
-fn contextGlyph(self: *const metrics.FontMetrics, cp: u21, style: atom.CharStyle) ?metrics.Glyph {
-    const f: *font.FontContext = @ptrCast(@alignCast(self.font orelse return null));
+fn contextGlyph(ctx: *anyopaque, cp: u21, style: atom.CharStyle) ?metrics.Glyph {
+    const f: *font.FontContext = @ptrCast(@alignCast(ctx));
     const face = if (style == .roman) f.romanFace(false) else f.mathFace();
     if (face.glyphIndex(cp) == null) return null;
     const m = f.metrics(face, cp, 10.0);
@@ -58,37 +61,32 @@ fn contextGlyph(self: *const metrics.FontMetrics, cp: u21, style: atom.CharStyle
 pub const Context = struct {
     /// Caller's allocator; owns the FontContext allocation.
     gpa: std.mem.Allocator,
-    /// Loaded faces + the per-(face, cp) metric cache (heap-owned).
+    /// The FontContext: embedded LM fonts + the per-(face, cp) metric cache
+    /// (heap-owned).
     fonts: *font.FontContext,
-    /// Metric lookups wired to `fonts` (`font`/`font_glyph` set at init).
+    /// Metric source: the `.font` arm of the `FontMetrics` union, pointing
+    /// at `fonts`.
     fm: metrics.FontMetrics,
 
-    /// Build a context preloaded with the embedded Latin Modern faces.
+    /// Build a context preloaded with the embedded Latin Modern fonts.
     pub fn init(gpa: std.mem.Allocator) !Context {
         const fonts = try gpa.create(font.FontContext);
         errdefer gpa.destroy(fonts);
         fonts.* = try font.FontContext.init(gpa);
         errdefer fonts.deinit();
-        var c: Context = .{ .gpa = gpa, .fonts = fonts, .fm = metrics.default };
-        c.fm.font = @ptrCast(fonts);
-        c.fm.font_glyph = &contextGlyph;
-        return c;
+        return .{
+            .gpa = gpa,
+            .fonts = fonts,
+            .fm = .{ .font = .{ .ctx = fonts, .glyph = &contextGlyph } },
+        };
     }
 
-    /// Release the FontContext (arena: every face, cached path, cache
-    /// entry) and its heap allocation. Call exactly once.
+    /// Release the FontContext (arena: embedded fonts, cache entries) and
+    /// its heap allocation. Call exactly once.
     pub fn deinit(self: *Context) void {
         self.fonts.deinit();
         self.gpa.destroy(self.fonts);
         self.* = undefined;
-    }
-
-    /// Parse and cache an extra font file (deduped by path; arena-owned
-    /// until `deinit`). Loaded faces join the context's face cache; metric
-    /// lookups keep serving from the embedded LM faces, which are also what
-    /// the SVG names as its font-family.
-    pub fn loadFont(self: *Context, gpa: std.mem.Allocator, path: []const u8) !*font.FontFace {
-        return self.fonts.loadFromFile(gpa, path);
     }
 
     /// Full pipeline: LaTeX source → draw list, measured from the real
@@ -96,8 +94,12 @@ pub const Context = struct {
     /// alias `src`, so `src` must outlive the draw list. `size_pt` is the
     /// base font size in points. On a parse error, `err_info` (when
     /// non-null) is filled with the kind + span.
+    ///
+    /// Takes `*Context` (not `*const`, C1): the first render fills the font
+    /// metric cache (`FontContext.metrics` mutates it while measuring), so
+    /// rendering is not a const operation.
     pub fn render(
-        self: *const Context,
+        self: *Context,
         gpa: std.mem.Allocator,
         src: []const u8,
         size_pt: f32,
@@ -105,24 +107,7 @@ pub const Context = struct {
     ) !draw.DrawList {
         var ast = try parse.parse(gpa, src, err_info);
         defer ast.deinit();
-        var list = layout.box.BoxList.init(gpa);
-        defer list.deinit();
-        // Capacity-only hints, identical to layout.root.render: a single
-        // node can emit more boxes than itself, so reserve 2× nodes for the
-        // pools plus one per node for the placement scratch.
-        try list.boxes.ensureTotalCapacity(gpa, ast.nodes.items.len);
-        try list.childrefs.ensureTotalCapacity(gpa, ast.nodes.items.len);
-        try list.scratch.ensureTotalCapacity(gpa, ast.nodes.items.len);
-        const root_box = try layout.layout.layout(&list, &ast, ast.root, &self.fm, .display, size_pt, .italic);
-        var out = draw.DrawList.init(gpa);
-        errdefer out.deinit();
-        try out.items.ensureTotalCapacity(gpa, ast.nodes.items.len);
-        try draw.flatten(&list, root_box, ast.src, 0, 0, &out);
-        const rb = list.get(root_box);
-        out.width = rb.width;
-        out.height = rb.height;
-        out.depth = rb.depth;
-        return out;
+        return layout.render(gpa, &ast, ast.root, &self.fm, size_pt);
     }
 };
 
@@ -169,8 +154,8 @@ test "context: unmapped codepoint falls back to the static table / estimate" {
     // U+1F600 has no row anywhere: glyph() is null (font path + static
     // table both miss) and glyphEstimate answers with its 0.5em estimate
     // (10pt at 20pt, 5pt at the 10pt base).
-    const g = ctx.fm.glyph(&ctx.fm, 0x1F600, .italic);
+    const g = metrics.glyph(&ctx.fm, 0x1F600, .italic);
     try testing.expect(g == null);
-    const est = ctx.fm.glyphEstimate(&ctx.fm, 0x1F600, .italic);
+    const est = metrics.glyphEstimate(&ctx.fm, 0x1F600, .italic);
     try testing.expectApproxEqAbs(@as(f32, 5.0), est.width, 0.001);
 }

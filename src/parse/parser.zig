@@ -656,7 +656,10 @@ pub const Parser = struct {
             .unknown_environment => error.UnknownEnvironment,
             .mismatched_end => error.MismatchedEnd,
             .unclosed_environment => error.UnclosedEnvironment,
-            .dangling_escape, .invalid_utf8 => unreachable, // lexer-only kinds
+            // lexer-only kinds: never reach the parser (the size gate runs
+            // in parse.parse before lexing, and `fail` is only called with
+            // the parser kinds).
+            .dangling_escape, .invalid_utf8, .source_too_large => unreachable,
         };
     }
 

@@ -164,7 +164,7 @@ fn layoutInner(
         // escape from a denominator's cramped textstyle).
         .mathstyle => blk: {
             const ms: Style = @enumFromInt(n.data);
-            const gl = fm.glue(fm);
+            const gl = metrics.glue(fm);
             break :blk layoutInner(
                 list,
                 ast,
@@ -605,7 +605,7 @@ fn layoutChar(
     // rows, so the no-font path still works.
     const g = metrics.glyphAt(fm, mcp, cstyle, size_pt) orelse
         metrics.glyphAt(fm, cp, cstyle, size_pt) orelse
-        fm.glyphEstimate(fm, cp, cstyle);
+        metrics.glyphEstimate(fm, cp, cstyle);
     // Box height/depth by the DRAWN Latin-Modern-Math ink (em × drawn
     // size), not the cmr10/cmmi10 metric h/d: the metric box describes the
     // Computer-Modern design while the ink is what the SVG draws, and it
@@ -949,7 +949,7 @@ fn layoutOverUnder(
     const n = ast.node(idx);
     const span = ast.span(idx);
     const under = n.data != 0;
-    const gl = fm.glue(fm);
+    const gl = metrics.glue(fm);
     const rt = s(gl.rule_thickness, size_pt);
     // \overline lays its content out CRAMPED (tex.web make_over:
     // cramped_style(cur_style)); \underline keeps the current style
@@ -1048,7 +1048,7 @@ fn layoutRow(
     const span = ast.span(idx);
     const saved_len = list.scratch.items.len;
     defer list.scratch.items.len = saved_len;
-    const gl = fm.glue(fm);
+    const gl = metrics.glue(fm);
     var x: f32 = 0;
     var height: f32 = 0;
     var depth: f32 = 0;
@@ -1214,7 +1214,7 @@ fn layoutSubstack(
 ) !u32 {
     const n = ast.node(idx);
     const span = ast.span(idx);
-    const gl = fm.glue(fm);
+    const gl = metrics.glue(fm);
     // amsmath \subarray: every cell is $\m@th\scriptstyle##$ — the lines
     // are ALWAYS script style. The size follows the root-relative ladder:
     // display/text → script size (×0.7), script → unchanged (the limits
@@ -1700,7 +1700,7 @@ fn layoutEnv(
     const n = ast.node(idx);
     const span = ast.span(idx);
     const kind = atom.envKind(n.data);
-    const gl = fm.glue(fm);
+    const gl = metrics.glue(fm);
     const axis = s(gl.axis_height, size_pt);
 
     // Row/column geometry parameters (see the doc comment; values measured
@@ -2102,7 +2102,7 @@ fn layoutLeftRight(
 ) !u32 {
     const n = ast.node(idx);
     const span = ast.span(idx);
-    const gl = fm.glue(fm);
+    const gl = metrics.glue(fm);
     const axis = s(gl.axis_height, size_pt);
 
     // Children: [open?, inner, close?] — the delimiter leaves are `.char`,
@@ -2322,7 +2322,7 @@ fn layoutDelimScaled(
     cstyle: atom.CharStyle,
 ) !u32 {
     const cp = delimiterCp(ast, idx);
-    const axis = s(fm.glue(fm).axis_height, size_pt);
+    const axis = s(metrics.glue(fm).axis_height, size_pt);
     const ink = metrics.glyphInk(cp);
     const need = 2 * @max(h_pt - axis, d_pt + axis);
     const gs = @max(size_pt, need / (ink.asc + ink.desc));
@@ -2353,7 +2353,7 @@ fn layoutScaledChar(
     const span = ast.span(idx);
     const cp: u21 = if (n.data != 0) @truncate(n.data) else firstCodepoint(ast.src[span.start..span.end]);
     const g = metrics.glyphAt(fm, cp, cstyle, glyph_size) orelse
-        fm.glyphEstimate(fm, cp, cstyle);
+        metrics.glyphEstimate(fm, cp, cstyle);
     const ink = metrics.glyphInk(cp);
     const box_idx = try list.create(
         .char,
@@ -2457,7 +2457,7 @@ fn sizeMiddleDelims(
                 const half = (ink.asc + ink.desc) / 2;
                 const gs = @max(size_pt, req_em * size_pt / (2 * half));
                 const g = metrics.glyphAt(fm, b.cp, b.style, gs) orelse
-                    fm.glyphEstimate(fm, b.cp, b.style);
+                    metrics.glyphEstimate(fm, b.cp, b.style);
                 b.width = s(g.width, gs);
                 b.height = ink.asc * gs;
                 b.depth = ink.desc * gs;
@@ -2511,7 +2511,7 @@ fn layoutSqrt(
     cstyle: atom.CharStyle,
 ) !u32 {
     const span = ast.span(idx);
-    const gl = fm.glue(fm);
+    const gl = metrics.glue(fm);
     const rt = s(gl.rule_thickness, size_pt);
     const clr: f32 = if (style == .display or style == .text) 0.148 * size_pt else 0.05 * size_pt;
 
@@ -2710,7 +2710,7 @@ fn layoutScript(
 
     const base = try layoutInner(list, ast, base_idx, fm, style, size_pt, cstyle, cramped);
     const bb = list.get(base);
-    const gl = fm.glue(fm);
+    const gl = metrics.glue(fm);
 
     // Scripts are set one style level down (tex.web sup_style/sub_style).
     // The SIZES are root-relative, not multiplicative: 10pt → 7pt → 5pt
@@ -2779,7 +2779,7 @@ fn layoutScript(
             // Our box keeps the raw advance, so the sup gap approximates
             // the slant with the table italic correction.
             const g = metrics.glyphAt(fm, bb.cp, bb.style, size_pt) orelse
-                fm.glyphEstimate(fm, bb.cp, bb.style);
+                metrics.glyphEstimate(fm, bb.cp, bb.style);
             sup_ic = s(g.italic_correction, size_pt);
         }
     }
@@ -2971,7 +2971,7 @@ fn layoutOpLimits(
     cramped: bool,
 ) !u32 {
     const bb = list.get(base);
-    const gl = fm.glue(fm);
+    const gl = metrics.glue(fm);
     // The big-op spacing params are the OpenType MATH-table constants of the
     // math font (UpperLimitGapMin 0.20em, LowerLimitGapMin 0.167em,
     // UpperLimitBaselineRiseMin 0.111em, LowerLimitBaselineDropMax 0.60em,
@@ -3359,7 +3359,7 @@ fn layoutMathChoice(
 ) !u32 {
     const branch: Style = style; // branch i is set at style i
     const child = ast.child(idx, @intFromEnum(branch));
-    const gl = fm.glue(fm);
+    const gl = metrics.glue(fm);
     return layoutInner(
         list,
         ast,
@@ -3455,7 +3455,7 @@ fn layoutFraction(
     const n = ast.node(idx);
     const span = ast.span(idx);
     const line = atom.fracLine(n.data);
-    const gl = fm.glue(fm);
+    const gl = metrics.glue(fm);
 
     // Forced style (\dfrac \tfrac) and \cfrac's parts-at-display flag:
     //   \dfrac = \frac in DISPLAY style (amsmath \genfrac style 0),
@@ -3632,7 +3632,7 @@ fn layoutSpace(
     // \quad = 18mu). cmsy7's quad is 1.170641em, cmsy5's 1.472241em — a
     // thin space in a script is 3/18×1.170641×7 = 1.3657pt, not 1.1667
     // (measured via XeTeX \showbox on x^{a\,b}: glue 1.36574pt).
-    const em = atom.fixedToEm(n.data); // Q16.16 width in em
+    const em = atom.fixedToEm(n.data); // f32 em width (raw bits)
     const width = em * size_pt * quadEm(style);
     return list.createLeaf(.glue, width, 0, 0, span);
 }
@@ -4287,15 +4287,18 @@ test "layout: space becomes a glue box of em width" {
     var a = atom.Ast.init(testing.allocator, "\\,");
     defer a.deinit();
     try a.pushToken(.{ .tag = .command, .start = 0, .end = 2 });
-    const sp = try a.createLeaf(.space, 0, 0, f32ToFixed(0.166));
+    const sp = try a.createLeaf(.space, 0, 0, f32Bits(0.166));
     const b = try layout(&list, &a, sp, &fm_default, .text, 10, .italic);
     const bb = list.get(b);
     try testing.expectEqual(.glue, bb.kind);
     try testing.expectApproxEqAbs(@as(f32, 1.66), bb.width, 0.01);
 }
 
-fn f32ToFixed(v: f32) u32 {
-    return @bitCast(@as(i32, @intFromFloat(v * 65536.0)));
+// A space node's `data` stores the f32 em width as raw bits (ztex.atom's
+// `emToFixed`/`fixedToEm` are plain bitcasts — no Q16.16). Build the payload
+// the same way the parser does.
+fn f32Bits(v: f32) u32 {
+    return @bitCast(v);
 }
 
 test "layout: sub-only script places subscript below base (F1)" {

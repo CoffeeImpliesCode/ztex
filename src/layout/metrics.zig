@@ -12,7 +12,10 @@
 //! layout advance == render advance. Height/depth stay the LM Math ink
 //! (see `ink_table`); italic corrections and the TeX glue parameters stay
 //! the CM values (spacing facts, not render geometry).
-//! Self-contained: no external font files, fully deterministic lookups.
+//! The static tables are self-contained (no external font files, fully
+//! deterministic lookups); the `.font` arm of the `FontMetrics` union
+//! delegates glyph measurement to the embedded Latin Modern fonts via
+//! font.zig (see `FontMetrics`).
 //!
 //! Font selection still follows MicroTeX's "mathnormal" style mapping
 //! (tex_param.res.cpp): digits/operators/punctuation → cmr10, Latin letters
@@ -85,29 +88,63 @@ pub const GlueParams = struct {
     x_height: f32, // cmmi10 x-height, for script clearance floors
 };
 
-/// Metric lookup interface. The fields are function pointers so the bundled
-/// table can be swapped for a real font implementation at runtime.
-pub const FontMetrics = struct {
-    /// The `FontContext` this metrics is wired to, when the real font is the
-    /// metric source (see context.zig). Opaque here because the ztex.layout
-    /// module cannot import src/font.zig without a build.zig change (out of
-    /// scope); context.zig casts it back to `*font.FontContext`. Null →
-    /// the bundled static tables are the only source — exactly the previous
-    /// behavior. Non-const because the context's `metrics()` mutates its
-    /// cache.
-    font: ?*anyopaque = null,
-    /// Font-backed glyph lookup for `self.font`, installed by context.zig.
-    /// `glyph`/`glyphAt` consult it (when `font` is set) BEFORE the static
-    /// tables; it must return null for codepoints the face does not map so
-    /// the fallback chain (font → static table → glyphEstimate) proceeds.
-    /// Defaults to null = no font path.
-    font_glyph: ?*const fn (self: *const FontMetrics, cp: u21, style: atom.CharStyle) ?Glyph = null,
-    /// Exact per-glyph metrics for `cp` in `style`; null if not in the table.
-    glyph: *const fn (self: *const FontMetrics, cp: u21, style: atom.CharStyle) ?Glyph,
-    /// Deterministic fallback for any unknown glyph (em-based estimate).
-    glyphEstimate: *const fn (self: *const FontMetrics, cp: u21, style: atom.CharStyle) Glyph,
-    glue: *const fn (self: *const FontMetrics) GlueParams,
+/// The bundled static metric tables (Latin-Modern-Math advances, 10pt base)
+/// — the metric source of `ztex.render` and of the standalone layout module.
+pub const StaticTables = struct {};
+
+/// The real-font metric backend installed by `ztex.Context` (context.zig).
+/// Carries the `*FontContext` — opaque here because the ztex.layout module
+/// cannot import font.zig (Zig 0.16 rejects relative imports leaving the
+/// module directory, so `font.FontContext` is not nameable in this module;
+/// context.zig — the one file that imports font.zig — performs the concrete
+/// cast) — together with the lookup, so the arm is atomic: a `.font` arm
+/// always has both its context and its lookup, and the per-instance state
+/// of `FontMetrics` is just the union tag + this payload (SIM2). The
+/// lookup returns null for codepoints the face does not map, so
+/// `glyph`/`glyphAt` fall through to the static tables and finally to
+/// glyphEstimate.
+pub const FontHook = struct {
+    /// `*font.FontContext`: the embedded LM fonts + per-(face, cp) metric
+    /// cache (the pointer is non-const — `FontContext.metrics` mutates the
+    /// cache while measuring).
+    ctx: *anyopaque,
+    /// Font-backed glyph lookup for `ctx` at the 10pt base.
+    glyph: *const fn (ctx: *anyopaque, cp: u21, style: atom.CharStyle) ?Glyph,
 };
+
+/// Closed metric source for the layout: either the bundled static tables or
+/// a real font backend (SIM2). Replaces the previous four-fn-pointer +
+/// opaque `?*anyopaque` struct: the per-instance state is only the union
+/// arm; the lookup entry points below are comptime constants that dispatch
+/// on it.
+pub const FontMetrics = union(enum) {
+    /// Bundled static tables only (`ztex.render` / `metrics.default`).
+    static: StaticTables,
+    /// Real fonts via a `FontHook` (context.zig builds it in `Context.init`).
+    font: FontHook,
+
+    /// Exact per-glyph metrics for `cp` in `style` at the 10pt base; null
+    /// when neither the real font (`.font` arm) nor the static table has
+    /// the codepoint. Font path first, then the bundled tables — the
+    /// fallback chain layout relies on: font → static table →
+    /// glyphEstimate.
+    pub const glyph: *const fn (self: *const FontMetrics, cp: u21, style: atom.CharStyle) ?Glyph = glyphImpl;
+
+    /// Deterministic fallback for any unknown glyph (em-based estimate).
+    pub const glyphEstimate: *const fn (self: *const FontMetrics, cp: u21, style: atom.CharStyle) Glyph = glyphEstimateImpl;
+
+    /// TeX layout parameters at the 10pt base; shared by both arms
+    /// (spacing facts, not render geometry).
+    pub const glue: *const fn (self: *const FontMetrics) GlueParams = glueImpl;
+};
+
+/// File-level aliases of the `FontMetrics` entry points, so callers can
+/// write `metrics.glyph(fm, ...)` / `metrics.glue(fm)` (a union's decls are
+/// only reachable as `FontMetrics.glyph` otherwise, and layout.zig + the
+/// tests use the module names).
+pub const glyph = FontMetrics.glyph;
+pub const glyphEstimate = FontMetrics.glyphEstimate;
+pub const glue = FontMetrics.glue;
 
 /// One row of the static metric table: width, height, depth, italic
 /// correction, in points at 10pt (em × 10).
@@ -1856,11 +1893,11 @@ fn tableFor(cp: u21, style: atom.CharStyle, size_pt: f32) []const Entry {
 /// convention (em × 10), matching `glyph`/`lookupAscii`, so callers keep
 /// using `s(v, size_pt)`. Glyphs without a script-size font (ams fonts,
 /// cmex, composites) fall back to the 10pt table, i.e. linear scaling — the
-/// same behavior as before. When `fm.font` is set, the real font answers
-/// first (see `fontGlyph`) — EXCEPT in the LMRoman17 band (roman style,
-/// `size_pt >= 15`): there the real roman face (embedded lmroman10) does
-/// NOT match XeTeX, whose roman TEXT font optically swaps to the 17pt
-/// design, so `table_roman17` answers first (the embedded faces have no 17
+/// same behavior as before. When `fm` is the `.font` arm, the real font
+/// answers first (see `fontGlyph`) — EXCEPT in the LMRoman17 band (roman
+/// style, `size_pt >= 15`): there the real roman face (embedded lmroman10)
+/// does NOT match XeTeX, whose roman TEXT font optically swaps to the 17pt
+/// design, so `table_roman17` answers first (the embedded fonts have no 17
 /// variant). LM Math has no optical sizes, so the math path still scales
 /// linearly with size.
 pub fn glyphAt(fm: *const FontMetrics, cp: u21, style: atom.CharStyle, size_pt: f32) ?Glyph {
@@ -2380,35 +2417,31 @@ pub fn accentAttach(cp: u21) ?f32 {
 /// Em size at the base font size (10pt), used by `glyphEstimate`.
 const em: f32 = 10.0;
 
-/// Exact per-glyph metrics for `cp` in `style` at the 10pt base; null when
-/// neither the real font (if `self.font` is set) nor the static table has
-/// the codepoint. Font path first (see `fontGlyph`), then the bundled
-/// tables — the fallback chain layout relies on: font → static table →
-/// glyphEstimate.
-fn glyph(self: *const FontMetrics, cp: u21, style: atom.CharStyle) ?Glyph {
-    if (fontGlyph(self, cp, style)) |g| return g;
-    return staticGlyph(cp, style);
+/// Font-arm dispatch for the `glyph`/`glyphAt` fallback chain: the `.font`
+/// arm answers from the real font via its hook, `.static` has no font path
+/// (the static tables answer there).
+fn fontGlyph(fm: *const FontMetrics, cp: u21, style: atom.CharStyle) ?Glyph {
+    return switch (fm.*) {
+        .static => null,
+        .font => |hook| hook.glyph(hook.ctx, cp, style),
+    };
 }
 
-/// Font-backed metrics for `cp` in `style` at the 10pt base, via the
-/// `font_glyph` hook context.zig installs. The hook serves the face's
-/// cached hmtx advance (FontContext.metrics × 10pt) for width and the
-/// face's OWN nominal hhea extents for height/depth — real font data that
-/// bounds every glyph the face covers — and returns null for codepoints the
-/// face does not map, so `glyph`/`glyphAt` fall through to the static
-/// tables and finally to glyphEstimate. Null also when `font` is unset or
-/// the hook is missing (the bundled default metrics).
-fn fontGlyph(self: *const FontMetrics, cp: u21, style: atom.CharStyle) ?Glyph {
-    if (self.font == null) return null;
-    const fg = self.font_glyph orelse return null;
-    return fg(self, cp, style);
+/// Implementation of `FontMetrics.glyph`: exact per-glyph metrics for `cp`
+/// in `style` at the 10pt base; null when neither the real font (`.font`
+/// arm) nor the static table has the codepoint. Font path first, then the
+/// bundled tables — the fallback chain layout relies on: font → static
+/// table → glyphEstimate.
+fn glyphImpl(fm: *const FontMetrics, cp: u21, style: atom.CharStyle) ?Glyph {
+    if (fontGlyph(fm, cp, style)) |g| return g;
+    return staticGlyph(cp, style);
 }
 
 /// Static-table lookup at the 10pt base. Binary search over the table
 /// selected by `style` (see `tableFor`): roman-style letters come from
 /// `table_roman` (cmr10), everything else from `table` (cmmi10 letters,
-/// cmsy10/cmr10 symbols). Public so the font hook in context.zig can reuse
-/// the rows' italic corrections (LM Math's MATH table is not parsed yet).
+/// cmsy10/cmr10 symbols). Public so callers can reuse the rows' italic
+/// corrections (LM Math's MATH table is not parsed yet).
 pub fn staticGlyph(cp: u21, style: atom.CharStyle) ?Glyph {
     const tbl = tableFor(cp, style, 0);
     var lo: usize = 0;
@@ -2434,16 +2467,18 @@ pub fn staticGlyph(cp: u21, style: atom.CharStyle) ?Glyph {
 }
 
 /// True when the ACTIVE metric source carries a glyph for `cp` in `style`:
-/// a wired font's cmap when a font is wired (the `font_glyph` hook returns
-/// null for codepoints the face does not map), else the bundled static
-/// tables. Layout uses this to validate a mapped math-italic codepoint
-/// (U+1D4xx/U+1D6xx) before emitting it: when the source lacks the mapped
-/// form, the base codepoint is kept, so the SVG never names a glyph the
-/// renderer cannot draw (the static tables cover the U+1D4xx Latin series
-/// but not the U+1D6xx Greek series; a loaded font may lack either).
+/// the `.font` arm's cmap (the font returns null for codepoints the face
+/// does not map), else the bundled static tables. Layout uses this to
+/// validate a mapped math-italic codepoint (U+1D4xx/U+1D6xx) before
+/// emitting it: when the source lacks the mapped form, the base codepoint
+/// is kept, so the SVG never names a glyph the renderer cannot draw (the
+/// static tables cover the U+1D4xx Latin series but not the U+1D6xx Greek
+/// series; a loaded font may lack either).
 pub fn hasGlyph(fm: *const FontMetrics, cp: u21, style: atom.CharStyle) bool {
-    if (fm.font != null) return fontGlyph(fm, cp, style) != null;
-    return staticGlyph(cp, style) != null;
+    return switch (fm.*) {
+        .static => staticGlyph(cp, style) != null,
+        .font => |hook| hook.glyph(hook.ctx, cp, style) != null,
+    };
 }
 
 /// ASCII fast-path lookup table (cp < 128), derived at comptime from the same
@@ -2489,7 +2524,7 @@ pub fn lookupAscii(fm: *const FontMetrics, cp: u21, style: atom.CharStyle) ?Glyp
 
 /// Deterministic fallback for any unknown glyph: width 0.5em, height 0.7em,
 /// depth 0.2em. Math-italic style adds a small italic correction.
-fn glyphEstimate(self: *const FontMetrics, cp: u21, style: atom.CharStyle) Glyph {
+fn glyphEstimateImpl(self: *const FontMetrics, cp: u21, style: atom.CharStyle) Glyph {
     _ = self;
     _ = cp;
     var ic: f32 = 0.0;
@@ -2504,7 +2539,8 @@ fn glyphEstimate(self: *const FontMetrics, cp: u21, style: atom.CharStyle) Glyph
 
 /// TeX layout parameters at 10pt (MicroTeX tex_param.res.cpp × 10, plus
 /// denom3/sub3/x_height from the standard CM set). Layout scales by size/10.
-fn glue(self: *const FontMetrics) GlueParams {
+/// Shared by both `FontMetrics` arms (spacing facts, not render geometry).
+fn glueImpl(self: *const FontMetrics) GlueParams {
     _ = self;
     return .{
         .axis_height = 2.5,
@@ -2586,12 +2622,9 @@ pub fn displayOp(cp: u21) ?DisplayOp {
     return null;
 }
 
-/// Bundled default metrics (Latin-Modern-Math advance widths, 10pt base).
-pub const default: FontMetrics = .{
-    .glyph = glyph,
-    .glue = glue,
-    .glyphEstimate = glyphEstimate,
-};
+/// Bundled default metrics (Latin-Modern-Math advance widths, 10pt base):
+/// the `.static` arm of the FontMetrics union.
+pub const default: FontMetrics = .{ .static = .{} };
 
 // ── tests ────────────────────────────────
 
@@ -2605,7 +2638,7 @@ test "metrics: table is sorted by codepoint" {
 
 test "metrics: every bundled glyph resolves with positive extent" {
     for (table) |entry| {
-        const g = default.glyph(&default, entry.cp, .italic);
+        const g = glyph(&default, entry.cp, .italic);
         try testing.expect(g != null);
         if (g) |gg| {
             try testing.expect(gg.width > 0.0);
@@ -2636,7 +2669,7 @@ test "metrics: digits letters operators greek are covered" {
         0x2211, 0x220F, 0x222B, // ∑ ∏ ∫
     };
     for (cps) |cp| {
-        const g = default.glyph(&default, cp, .roman);
+        const g = glyph(&default, cp, .roman);
         try testing.expect(g != null);
         if (g) |gg| {
             try testing.expect(gg.width > 0.0);
@@ -2647,14 +2680,14 @@ test "metrics: digits letters operators greek are covered" {
 
 test "metrics: unknown codepoint falls back to estimate" {
     const cp: u21 = 0x1F600;
-    try testing.expect(default.glyph(&default, cp, .italic) == null);
-    const est = default.glyphEstimate(&default, cp, .italic);
+    try testing.expect(glyph(&default, cp, .italic) == null);
+    const est = glyphEstimate(&default, cp, .italic);
     try testing.expect(est.width > 0.0);
     try testing.expect(est.height > 0.0);
 }
 
 test "metrics: glue parameters are positive" {
-    const gp = default.glue(&default);
+    const gp = glue(&default);
     inline for (@typeInfo(GlueParams).@"struct".fields) |f| {
         // bigop_spacing5 is 0.0 in Latin Modern Math (the MATH-table
         // big-op padding, measured: fontspec fd13 = 0pt on the OT math
@@ -2668,16 +2701,16 @@ test "metrics: glue parameters are positive" {
 }
 
 test "metrics: greek alpha present; operators upright, variables slanted" {
-    const alpha = default.glyph(&default, 0x03B1, .italic);
+    const alpha = glyph(&default, 0x03B1, .italic);
     try testing.expect(alpha != null);
-    const plus = default.glyph(&default, 0x2B, .italic) orelse
+    const plus = glyph(&default, 0x2B, .italic) orelse
         return error.TestUnexpectedResult;
     try testing.expectEqual(@as(f32, 0.0), plus.italic_correction);
-    const f = default.glyph(&default, 0x66, .italic) orelse
+    const f = glyph(&default, 0x66, .italic) orelse
         return error.TestUnexpectedResult;
     try testing.expect(f.italic_correction > 0.0);
-    const est_i = default.glyphEstimate(&default, 0x1F600, .italic);
-    const est_r = default.glyphEstimate(&default, 0x1F600, .roman);
+    const est_i = glyphEstimate(&default, 0x1F600, .italic);
+    const est_r = glyphEstimate(&default, 0x1F600, .roman);
     try testing.expect(est_i.italic_correction > 0.0);
     try testing.expectEqual(@as(f32, 0.0), est_r.italic_correction);
 }
@@ -2719,7 +2752,7 @@ test "metrics: every roleOfCp math symbol resolves with real CM metrics" {
         0x22EF, 0x00B7,
     };
     for (bin ++ rel ++ open ++ close ++ punct ++ ops ++ extras) |cp| {
-        const g = default.glyph(&default, cp, .roman) orelse
+        const g = glyph(&default, cp, .roman) orelse
             return error.TestUnexpectedResult;
         try testing.expect(g.width > 0.0);
         try testing.expect(g.height + g.depth > 0.0);
@@ -2767,7 +2800,7 @@ test "metrics: corpus relation/bin widths are exact Latin-Modern-Math advances" 
         .{ .cp = 0x27F6, .w = 14.63 }, // longrightarrow LM 1.463em
     };
     for (cases) |c| {
-        const g = default.glyph(&default, c.cp, .roman) orelse
+        const g = glyph(&default, c.cp, .roman) orelse
             return error.TestUnexpectedResult;
         try testing.expectApproxEqAbs(c.w, g.width, 0.001);
     }
@@ -2788,7 +2821,7 @@ test "metrics: relation/bin symbols beat the glyphEstimate width" {
         0x2282, // subset real 7.78 vs 5.0
     };
     for (cases) |cp| {
-        const g = default.glyph(&default, cp, .roman) orelse
+        const g = glyph(&default, cp, .roman) orelse
             return error.TestUnexpectedResult;
         try testing.expect(g.width > 5.0);
     }
@@ -2816,7 +2849,7 @@ test "metrics: remaining glyphEstimate-fallback symbols resolve with real LM Mat
         .{ .cp = 0x22A4, .w = 7.78 }, // top LM 0.778em
     };
     for (cases) |c| {
-        const g = default.glyph(&default, c.cp, .roman) orelse
+        const g = glyph(&default, c.cp, .roman) orelse
             return error.TestUnexpectedResult;
         try testing.expectApproxEqAbs(c.w, g.width, 0.001);
         try testing.expect(g.height + g.depth > 0.0);
@@ -2829,7 +2862,7 @@ test "metrics: remaining glyphEstimate-fallback symbols resolve with real LM Mat
         0x211C, 0x2135, 0x2200, 0x2203, 0x22A4,
     };
     for (wide) |cp| {
-        const g = default.glyph(&default, cp, .roman) orelse
+        const g = glyph(&default, cp, .roman) orelse
             return error.TestUnexpectedResult;
         try testing.expect(g.width > 5.0);
     }
@@ -2910,7 +2943,7 @@ test "metrics: the 65 glyphEstimate-gap codepoints resolve with real LM Math adv
         .{ .cp = 0x2912, .w = 5.00002 }, // baruparrow (not in LM Math; CM kept)
     };
     for (cases) |c| {
-        const g = default.glyph(&default, c.cp, .roman) orelse
+        const g = glyph(&default, c.cp, .roman) orelse
             return error.TestUnexpectedResult;
         try testing.expectApproxEqAbs(c.w, g.width, 0.001);
         try testing.expect(g.height + g.depth > 0.0);
@@ -2926,7 +2959,7 @@ test "metrics: the 65 glyphEstimate-gap codepoints resolve with real LM Math adv
         0x2288, 0x2289, 0x22D8, 0x22D9, 0x21A3, 0x21C4, 0x2215, 0x2A2F,
     };
     for (wide) |cp| {
-        const g = default.glyph(&default, cp, .roman) orelse
+        const g = glyph(&default, cp, .roman) orelse
             return error.TestUnexpectedResult;
         try testing.expect(g.width > 5.0);
     }
@@ -2955,24 +2988,24 @@ test "metrics: roman style letters use LM Math advances, roman = italic" {
         .{ .cp = 'K', .roman = 7.78, .italic = 7.78 },
     };
     for (cases) |c| {
-        const r = default.glyph(&default, c.cp, .roman) orelse
+        const r = glyph(&default, c.cp, .roman) orelse
             return error.TestUnexpectedResult;
-        const i = default.glyph(&default, c.cp, .italic) orelse
+        const i = glyph(&default, c.cp, .italic) orelse
             return error.TestUnexpectedResult;
         try testing.expectApproxEqAbs(c.roman, r.width, 0.001);
         try testing.expectApproxEqAbs(c.italic, i.width, 0.001);
     }
     // \mathrm{ab} = LM a+b; "hello" = LM h+e+l+l+o (10.56 and 20.56).
     var ab: f32 = 0;
-    for ("ab") |ch| ab += (default.glyph(&default, ch, .roman) orelse
+    for ("ab") |ch| ab += (glyph(&default, ch, .roman) orelse
         return error.TestUnexpectedResult).width;
     try testing.expectApproxEqAbs(@as(f32, 10.56), ab, 0.001);
     var hello: f32 = 0;
-    for ("hello") |ch| hello += (default.glyph(&default, ch, .roman) orelse
+    for ("hello") |ch| hello += (glyph(&default, ch, .roman) orelse
         return error.TestUnexpectedResult).width;
     try testing.expectApproxEqAbs(@as(f32, 20.56), hello, 0.001);
     var hello_italic: f32 = 0;
-    for ("hello") |ch| hello_italic += (default.glyph(&default, ch, .italic) orelse
+    for ("hello") |ch| hello_italic += (glyph(&default, ch, .italic) orelse
         return error.TestUnexpectedResult).width;
     try testing.expectApproxEqAbs(@as(f32, 20.56), hello_italic, 0.001);
 }

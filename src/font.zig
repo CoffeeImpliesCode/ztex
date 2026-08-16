@@ -9,9 +9,13 @@
 //!   TTF (0x00010000/glyf) containers parse through the same code — only
 //!   metric tables are read, never outlines.
 //! - `FontContext`: the "init once, render many" core. Owns the embedded
-//!   Latin Modern fallback faces (LM Math + LM Roman regular/italic),
-//!   caches faces loaded from disk by path, memoizes disk discovery in
-//!   `findFont`, and serves per-(face, cp) metric lookups from a cache.
+//!   Latin Modern fallback fonts (LM Math + LM Roman regular/italic) and
+//!   serves per-(face, cp) metric lookups from a cache.
+//!
+//! Only the embedded fonts are used; disk font loading was removed (it was
+//! a parse-and-discard no-op — loaded fonts were never read by the metric
+//! or SVG path). context.zig — the sole importer — feeds the context to
+//! layout/metrics through the closed `FontMetrics` union (SIM2).
 //!
 //! All values returned in "em" units are font-relative (value ÷ unitsPerEm),
 //! so callers multiply by the desired size in points. Every number asserted
@@ -19,7 +23,6 @@
 //! notes/font-context.md for the measurement method).
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const lmmath = @import("fonts/lmmath.zig");
 const lmroman_regular = @import("fonts/lmroman_regular.zig");
@@ -255,7 +258,7 @@ pub const FontFace = struct {
         return parseOwned(owned, gpa);
     }
 
-    /// Release the owned byte copy. No-op for arena-managed faces (gpa null).
+    /// Release the owned byte copy. No-op for arena-managed fonts (gpa null).
     pub fn deinit(self: *FontFace) void {
         if (self.gpa) |gpa| gpa.free(self.data);
         self.* = undefined;
@@ -417,39 +420,17 @@ const CacheKey = struct {
     cp: u21,
 };
 
-/// Roots probed first by `findFont`, before user dirs and the nix store.
-const search_roots = [_][]const u8{
-    "/run/current-system/sw/share/fonts",
-    "/usr/share/fonts",
-    "/usr/local/share/fonts",
-    "/nix/var/nix/profiles/default/share/fonts",
-};
-
-/// Max recursion depth when walking font directories.
-const max_search_depth = 6;
-
-/// Max bytes accepted for a font file read.
-const max_font_bytes = 64 * 1024 * 1024;
-
-/// "Init once, render many": owns the embedded fallback faces, caches
-/// disk-loaded faces and per-glyph metrics, and memoizes disk discovery.
+/// "Init once, render many": owns the embedded fallback fonts and the
+/// per-glyph metrics cache.
 ///
-/// Every long-lived allocation lives in `arena` (faces, paths, cache
-/// entries); `deinit` releases everything at once. `metrics` is infallible:
-/// on an allocation failure it recomputes instead of caching.
+/// Every long-lived allocation lives in `arena` (font data, cache entries);
+/// `deinit` releases everything at once. `metrics` is infallible: on an
+/// allocation failure it recomputes instead of caching.
 pub const FontContext = struct {
     /// Caller's allocator; backs the arena.
     gpa: std.mem.Allocator,
-    /// Single arena owns every face, cached path, and cache entry.
+    /// Single arena owns every face and cache entry.
     arena: std.heap.ArenaAllocator,
-    /// I/O backend for file reads and directory scans. Uses the std
-    /// single-threaded instance (file ops need no concurrency here).
-    io: std.Io,
-
-    /// Path (arena-owned) → parsed face; dedupes `loadFromFile`.
-    faces: std.StringHashMapUnmanaged(*FontFace),
-    /// Font name → arena-owned discovered path; empty slice records a miss.
-    found: std.StringHashMapUnmanaged([]const u8),
     /// (face, cp) → em metrics at 1pt (scaled by size_pt on return).
     metrics_cache: std.AutoHashMapUnmanaged(CacheKey, GlyphMetrics),
 
@@ -460,10 +441,7 @@ pub const FontContext = struct {
     /// Embedded Latin Modern Roman italic.
     italic: *FontFace,
 
-    // TODO(macros): F2 will hang a macro table here (name → expansion).
-    // The slot is intentionally reserved; nothing else is needed now.
-
-    /// Create a context preloaded with the embedded fallback faces:
+    /// Create a context preloaded with the embedded fallback fonts:
     /// LM Math (math), LM Roman regular and italic (text).
     pub fn init(gpa: std.mem.Allocator) !FontContext {
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -475,9 +453,6 @@ pub const FontContext = struct {
         return .{
             .gpa = gpa,
             .arena = arena,
-            .io = std.Io.Threaded.global_single_threaded.io(),
-            .faces = .empty,
-            .found = .empty,
             .metrics_cache = .empty,
             .math = math,
             .roman = roman,
@@ -485,9 +460,9 @@ pub const FontContext = struct {
         };
     }
 
-    /// Release everything the context owns. Faces loaded via `loadFromFile`
-    /// are invalidated; standalone faces created via `FontFace.fromBytes`
-    /// are unaffected (they own their own memory).
+    /// Release everything the context owns (arena: embedded fonts, cache
+    /// entries). Standalone fonts created via `FontFace.fromBytes` are
+    /// unaffected (they own their own memory).
     pub fn deinit(self: *FontContext) void {
         self.arena.deinit();
         self.* = undefined;
@@ -502,37 +477,6 @@ pub const FontContext = struct {
     /// variant (for \text/\mathrm).
     pub fn romanFace(self: *const FontContext, italic: bool) *FontFace {
         return if (italic) self.italic else self.roman;
-    }
-
-    /// Parse a font file and cache the face by path. Repeated calls with the
-    /// same path return the cached face. The face is arena-owned: it lives
-    /// until `deinit`. `gpa` is used for the transient read buffer.
-    pub fn loadFromFile(self: *FontContext, gpa: std.mem.Allocator, path: []const u8) !*FontFace {
-        if (self.faces.get(path)) |face| return face;
-        const bytes = try std.Io.Dir.readFileAlloc(.cwd(), self.io, path, gpa, .limited(max_font_bytes));
-        defer gpa.free(bytes);
-        const face = try createFace(self.arena.allocator(), bytes);
-        const key = try self.arena.allocator().dupe(u8, path);
-        try self.faces.put(self.arena.allocator(), key, face);
-        return face;
-    }
-
-    /// Discover a font file on disk by name (basename, case-insensitive, or
-    /// prefix of it). Search order: explicit well-known roots, user font
-    /// dirs ($XDG_DATA_HOME/fonts, $HOME/.local/share/fonts), the nix store
-    /// (/nix/store scan of LM/font packages), then `fc-list` output.
-    /// Results (and misses) are memoized per name; the returned path is
-    /// arena-owned and valid until `deinit`.
-    pub fn findFont(self: *FontContext, name: []const u8) ?[]const u8 {
-        if (self.found.get(name)) |cached| {
-            return if (cached.len == 0) null else cached;
-        }
-        const path = self.findFontUncached(name);
-        const a = self.arena.allocator();
-        const cached_path = a.dupe(u8, path orelse "") catch return path;
-        const cached_name = a.dupe(u8, name) catch return path;
-        self.found.put(a, cached_name, cached_path) catch return path;
-        return path;
     }
 
     /// Per-glyph metrics at `size_pt` points, cached per (face, cp) in em
@@ -566,106 +510,6 @@ pub const FontContext = struct {
         face.* = try parseOwned(owned, null);
         return face;
     }
-
-    fn findFontUncached(self: *FontContext, name: []const u8) ?[]const u8 {
-        for (search_roots) |root| {
-            if (self.findInTree(root, name, 0)) |p| return p;
-        }
-        if (self.envGet("XDG_DATA_HOME")) |xdg| {
-            if (self.joinAlloc(&.{ xdg, "fonts" })) |dir| {
-                if (self.findInTree(dir, name, 0)) |p| return p;
-            }
-        }
-        if (self.envGet("HOME")) |home| {
-            if (self.joinAlloc(&.{ home, ".local", "share", "fonts" })) |dir| {
-                if (self.findInTree(dir, name, 0)) |p| return p;
-            }
-        }
-        if (self.findInNixStore(name)) |p| return p;
-        if (self.findViaFcList(name)) |p| return p;
-        return null;
-    }
-
-    /// Recursive, depth-limited directory walk looking for `name`.
-    fn findInTree(self: *FontContext, root: []const u8, name: []const u8, depth: u32) ?[]const u8 {
-        if (depth > max_search_depth) return null;
-        var dir = std.Io.Dir.openDir(.cwd(), self.io, root, .{ .iterate = true }) catch return null;
-        defer dir.close(self.io);
-        var it = dir.iterate();
-        while (it.next(self.io) catch return null) |entry| {
-            switch (entry.kind) {
-                .file => {
-                    if (basenameMatches(entry.name, name)) {
-                        return self.joinAlloc(&.{ root, entry.name });
-                    }
-                },
-                .directory, .sym_link => {
-                    const sub = self.joinAlloc(&.{ root, entry.name }) orelse continue;
-                    if (self.findInTree(sub, name, depth + 1)) |p| return p;
-                },
-                else => {},
-            }
-        }
-        return null;
-    }
-
-    /// Scan /nix/store outputs whose name hints at Latin Modern / fonts and
-    /// search their share/fonts trees. Store hashes vary per machine, so a
-    /// name-filtered walk beats hard-coding them.
-    fn findInNixStore(self: *FontContext, name: []const u8) ?[]const u8 {
-        var store = std.Io.Dir.openDir(.cwd(), self.io, "/nix/store", .{ .iterate = true }) catch return null;
-        defer store.close(self.io);
-        var it = store.iterate();
-        while (it.next(self.io) catch return null) |entry| {
-            if (entry.kind != .directory and entry.kind != .sym_link) continue;
-            if (!containsIgnoreCase(entry.name, "lm") and !containsIgnoreCase(entry.name, "font")) continue;
-            const share = self.joinAlloc(&.{ "/nix/store", entry.name, "share", "fonts" }) orelse continue;
-            if (self.findInTree(share, name, 0)) |p| return p;
-        }
-        return null;
-    }
-
-    /// Query fontconfig (`fc-list`) for a file path matching `name`.
-    fn findViaFcList(self: *FontContext, name: []const u8) ?[]const u8 {
-        const result = std.process.run(self.arena.allocator(), self.io, .{
-            .argv = &.{"fc-list"},
-            .stdout_limit = .limited(8 << 20),
-            .stderr_limit = .limited(1 << 20),
-        }) catch return null;
-        var lines = std.mem.splitScalar(u8, result.stdout, '\n');
-        while (lines.next()) |line| {
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-            const path = std.mem.trim(u8, line[0..colon], " \t");
-            if (path.len == 0) continue;
-            if (!basenameMatches(path, name)) continue;
-            std.Io.Dir.access(.cwd(), self.io, path, .{}) catch continue;
-            return self.arena.allocator().dupe(u8, path) catch null;
-        }
-        return null;
-    }
-
-    /// Best-effort environment lookup. Linux reads /proc/self/environ
-    /// (dependency-free, no libc); other platforms return null.
-    fn envGet(self: *FontContext, key: []const u8) ?[]const u8 {
-        if (builtin.os.tag != .linux) return null;
-        const data = std.Io.Dir.readFileAlloc(
-            .cwd(),
-            self.io,
-            "/proc/self/environ",
-            self.arena.allocator(),
-            .limited(1 << 20),
-        ) catch return null;
-        var it = std.mem.splitScalar(u8, data, 0);
-        while (it.next()) |entry| {
-            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
-            if (std.mem.eql(u8, entry[0..eq], key)) return entry[eq + 1 ..];
-        }
-        return null;
-    }
-
-    fn joinAlloc(self: *FontContext, parts: []const []const u8) ?[]const u8 {
-        return std.fs.path.join(self.arena.allocator(), parts) catch null;
-    }
 };
 
 /// Em metrics for a codepoint: real advance from hmtx when the glyph exists,
@@ -685,24 +529,6 @@ fn computeEmMetrics(face: *const FontFace, cp: u21) GlyphMetrics {
         .depth = nominal.depth,
         .line_gap = nominal.line_gap,
     };
-}
-
-/// Case-insensitive basename match; `name` may also prefix the basename
-/// (e.g. "latinmodern-math" matches "latinmodern-math.otf").
-fn basenameMatches(candidate: []const u8, name: []const u8) bool {
-    const base = std.fs.path.basename(candidate);
-    if (std.ascii.eqlIgnoreCase(base, name)) return true;
-    if (base.len >= name.len and std.ascii.eqlIgnoreCase(base[0..name.len], name)) return true;
-    return false;
-}
-
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0 or needle.len > haystack.len) return false;
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
 }
 
 // ── tests ────────────────────────────────
@@ -819,37 +645,4 @@ test "font: metrics for an unmapped codepoint use nominal extents" {
     try testing.expectApproxEqAbs(@as(f32, 10.0), g.width, 0.001); // 0.5em fallback
     try testing.expectApproxEqAbs(@as(f32, 16.12), g.height, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 3.88), g.depth, 0.001);
-}
-
-test "font: loadFromFile parses a cached face from disk" {
-    var ctx = try FontContext.init(testing.allocator);
-    defer ctx.deinit();
-    const path = ctx.findFont("latinmodern-math.otf") orelse return error.TestUnexpectedResult;
-    const face = try ctx.loadFromFile(testing.allocator, path);
-    try testing.expectApproxEqAbs(
-        @as(f32, 0.528),
-        face.advanceEm(face.glyphIndex('x').?),
-        0.001,
-    );
-    // second load with the same path returns the cached face
-    try testing.expect(face == try ctx.loadFromFile(testing.allocator, path));
-}
-
-test "font: findFont discovers the embedded fonts on disk" {
-    var ctx = try FontContext.init(testing.allocator);
-    defer ctx.deinit();
-    const names = [_][]const u8{
-        "latinmodern-math.otf",
-        "lmroman10-regular.otf",
-        "lmroman10-italic.otf",
-    };
-    for (names) |name| {
-        const path = ctx.findFont(name) orelse return error.TestUnexpectedResult;
-        try testing.expect(std.mem.endsWith(u8, path, name));
-        std.Io.Dir.access(.cwd(), ctx.io, path, .{}) catch return error.TestUnexpectedResult;
-    }
-    // memoized miss: unknown names are remembered as not-found, and a
-    // repeated call stays null (no rescan).
-    try testing.expect(ctx.findFont("no-such-font-xyz.otf") == null);
-    try testing.expect(ctx.findFont("no-such-font-xyz.otf") == null);
 }

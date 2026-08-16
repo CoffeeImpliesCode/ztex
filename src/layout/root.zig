@@ -15,12 +15,17 @@ pub const Style = layout.Style;
 
 /// Lay out an atom tree and flatten it to a draw list.
 ///
-/// The returned `DrawList`'s `text` primitives alias `ast.src`, so the source
-/// (and ast) must outlive the draw list. The box pool is scratch and freed.
+/// `fm` selects the metric source: `&metrics.default` for the bundled static
+/// tables (`ztex.render`), or a Context's font-backed union arm
+/// (`Context.render`) — this is the ONE shared pipeline (SIM1/H1); both
+/// facades call it. The returned `DrawList`'s `text` primitives alias
+/// `ast.src`, so the source (and ast) must outlive the draw list. The box
+/// pool is scratch and freed.
 pub fn render(
     gpa: std.mem.Allocator,
     ast: *const atom.Ast,
     root: u32,
+    fm: *const metrics.FontMetrics,
     size_pt: f32,
 ) !draw.DrawList {
     var list = box.BoxList.init(gpa);
@@ -34,7 +39,7 @@ pub fn render(
     try list.boxes.ensureTotalCapacity(gpa, ast.nodes.items.len);
     try list.childrefs.ensureTotalCapacity(gpa, ast.nodes.items.len);
     try list.scratch.ensureTotalCapacity(gpa, ast.nodes.items.len);
-    const root_box = try layout.layout(&list, ast, root, &metrics.default, .display, size_pt, .italic);
+    const root_box = try layout.layout(&list, ast, root, fm, .display, size_pt, .italic);
     var out = draw.DrawList.init(gpa);
     errdefer out.deinit();
     // Capacity-only hint: flatten emits at most one draw per box, and boxes
@@ -61,7 +66,7 @@ test "render: a single char yields one text primitive" {
     defer ast.deinit();
     try ast.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
     _ = try ast.createLeaf(.char, 0, 1, 0); // node 0: a char leaf
-    var out = try render(testing.allocator, &ast, 0, 20);
+    var out = try render(testing.allocator, &ast, 0, &metrics.default, 20);
     defer out.deinit();
     try testing.expectEqual(@as(usize, 1), out.len());
     try testing.expectEqualStrings("𝑥", out.items.items[0].text.bytes);

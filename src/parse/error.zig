@@ -30,6 +30,7 @@ pub const Kind = enum {
     unknown_environment,
     mismatched_end,
     unclosed_environment,
+    source_too_large,
 };
 
 /// Parse-error context filled by `lex`/`parse` when the caller passes a
@@ -57,6 +58,7 @@ pub const Info = struct {
             .unknown_environment => "Unknown environment",
             .mismatched_end => "Mismatched \\end",
             .unclosed_environment => "Unclosed environment",
+            .source_too_large => "Source too large",
         };
     }
 };

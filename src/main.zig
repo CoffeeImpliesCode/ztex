@@ -10,9 +10,6 @@ const usage =
     \\  -p <px>      SVG padding (default 0)
     \\  -b <color>   background: name or #RRGGBB[AA] (default: white; use
     \\               'none'/'transparent' for no background)
-    \\  --font <path>  load an extra font file into the render context
-    \\               (repeatable; metrics still come from the embedded
-    \\               Latin Modern faces, which the SVG names as its fonts)
     \\  -h, --help   show this help
     \\
 ;
@@ -30,8 +27,6 @@ pub fn main(init: std.process.Init) !void {
     var size: f32 = 20;
     var pad: f32 = 0;
     var bg: ?ztex.draw.Color = .{ .r = 255, .g = 255, .b = 255 }; // white
-    var font_paths: std.ArrayList([]const u8) = .empty;
-    defer font_paths.deinit(gpa);
 
     var arg_it = std.process.Args.Iterator.init(init.minimal.args);
     _ = arg_it.next(); // skip argv[0]
@@ -49,9 +44,6 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "-b") or std.mem.eql(u8, arg, "--bg")) {
             const v = arg_it.next() orelse return error.MissingValue;
             bg = ztex.svg.parseColor(v);
-        } else if (std.mem.eql(u8, arg, "--font")) {
-            const path = arg_it.next() orelse return error.MissingValue;
-            try font_paths.append(gpa, path);
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             try std.Io.File.stdout().writeStreamingAll(io, usage);
             return;
@@ -62,7 +54,6 @@ pub fn main(init: std.process.Init) !void {
 
     var ctx = try ztex.Context.init(gpa);
     defer ctx.deinit();
-    for (font_paths.items) |path| _ = try ctx.loadFont(gpa, path);
 
     // A parse failure fills `err_info` (kind + span) before returning its
     // error value; any other error (OOM, layout) leaves it untouched and

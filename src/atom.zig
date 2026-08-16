@@ -17,7 +17,6 @@ const token = @import("token.zig");
 pub const TokenTag = token.Tag;
 pub const Token = token.Token;
 pub const Span = token.Span;
-pub const null_span: token.Span = .{ .start = 0, .end = 0 };
 
 /// Math/text font style of a character or text run.
 pub const CharStyle = enum(u8) {
@@ -76,23 +75,26 @@ pub const EnvKind = enum(u8) {
 
 /// Bit layout of an `.env` node's `data`:
 ///   bits 0-3  environment kind (EnvKind)
-///   bits 4-7  packed array colspec length (nibbles that follow; 0 for the
+///   bits 4-7  packed array colspec length (slots that follow; 0 for the
 ///             matrix family / cases / aligned)
-///   bits 8+   array colspec nibbles, 4 bits per column (first column at
+///   bits 8+   array colspec slots, 2 bits per spec char (first char at
 ///             bit 8): 0 = l, 1 = c, 2 = r, 3 = | (vertical rule BEFORE
 ///             that column — a leading | draws a rule at the array's left
-///             edge). Max 6 spec columns; beyond the spec, columns align
+///             edge). Rules occupy their own slot, so a ruled spec
+///             `|c|c|...` consumes one slot per alignment AND one per rule:
+///             the 2-bit slot width fits 12 spec chars (6 ruled columns,
+///             e.g. `|c|c|c|c|c|c`); beyond the spec, columns align
 ///             centered (TeX: extra columns default to c).
 pub const EnvBits = struct {
     pub const kind_mask: u32 = 0xF;
     pub const count_shift: u5 = 4;
     pub const col_shift: u5 = 8;
-    pub const col_nibble: u32 = 0xF;
+    pub const col_nibble: u32 = 0x3;
     pub const col_l: u32 = 0;
     pub const col_c: u32 = 1;
     pub const col_r: u32 = 2;
     pub const col_rule: u32 = 3;
-    pub const max_spec_cols: usize = 6;
+    pub const max_spec_cols: usize = 12;
 };
 
 /// The environment kind of an `.env` node.
@@ -109,12 +111,12 @@ pub inline fn envSpecCount(data: u32) usize {
 /// spec (callers default to centered alignment).
 pub inline fn envColSpec(data: u32, i: usize) ?u32 {
     if (i >= envSpecCount(data)) return null;
-    return (data >> (EnvBits.col_shift + @as(u5, @intCast(4 * i)))) & EnvBits.col_nibble;
+    return (data >> (EnvBits.col_shift + @as(u5, @intCast(2 * i)))) & EnvBits.col_nibble;
 }
 
 /// Pack an `.env` node's `data` from the kind and the array colspec (a byte
 /// string of l/c/r/| chars; unknown chars count as centered). The spec is
-/// truncated to `max_spec_cols` columns.
+/// truncated to `max_spec_cols` slots.
 pub inline fn envData(kind: EnvKind, colspec: []const u8) u32 {
     var data: u32 = @intFromEnum(kind);
     const n = @min(colspec.len, EnvBits.max_spec_cols);
@@ -126,7 +128,7 @@ pub inline fn envData(kind: EnvKind, colspec: []const u8) u32 {
             '|' => EnvBits.col_rule,
             else => EnvBits.col_c,
         };
-        data |= nib << (EnvBits.col_shift + @as(u5, @intCast(4 * i)));
+        data |= nib << (EnvBits.col_shift + @as(u5, @intCast(2 * i)));
     }
     return data;
 }
@@ -193,8 +195,13 @@ pub inline fn fracPartsDisplay(data: u32) bool {
 /// "no explicit thickness". Values are clamped to [0, 255.99]; a non-rule
 /// genfrac (\atop-style) carries thickness 0 like a plain \frac/\atop.
 pub inline fn fracThicknessBits(pt: f32) u32 {
-    const q: i32 = @intFromFloat(@round(@max(pt, 0) * 256.0));
-    return (@as(u32, @intCast(@min(q, 0xFFFF))) << FractionBits.thick_shift) &
+    // Clamp into the Q8.8 range BEFORE the float->int conversion: an
+    // attacker-controlled \genfrac thickness (e.g. 99999999pt) would
+    // otherwise overflow i32 in `@intFromFloat` (panic in Debug/ReleaseSafe,
+    // UB in ReleaseFast). 255.99pt is the largest Q8.8 value (0xFFFF/256).
+    const clamped = @min(@max(pt, 0), 255.99);
+    const q: u32 = @intFromFloat(@round(clamped * 256.0));
+    return (q << FractionBits.thick_shift) &
         (FractionBits.thick_mask << FractionBits.thick_shift);
 }
 
@@ -242,7 +249,7 @@ pub const Tag = enum(u8) {
     script,
     /// `\frac{num}{den}` / `\atop`; children[0]=num, [1]=den; data: line flag
     fraction,
-    /// horizontal space (\, \; \quad); leaf; data: width_em as Q16.16
+    /// horizontal space (\, \; \quad); leaf; data: width_em (f32 bits)
     space,
     /// `\text{...}`; leaf; raw bytes re-read from source span; data: CharStyle
     text,
@@ -310,7 +317,9 @@ pub const Node = struct {
     first_token: u32,
     /// number of tokens this node spans
     num_tokens: u32,
-    /// index of the first child (into Ast.nodes); 0 = null/leaf
+    /// index of the first child (into Ast.nodes); leaf nodes set it to
+    /// `null_node` (0), but 0 is a VALID index — test `num_children == 0`
+    /// for "no children", never `first_child == 0`.
     first_child: u32,
     /// number of children in the contiguous run starting at `first_child`
     num_children: u16,
@@ -318,17 +327,22 @@ pub const Node = struct {
     data: u32,
 };
 
-/// Sentinel "no child / no node" index.
-pub const null_node: u32 = 0;
+/// Sentinel "no child / no node" index (0). Only a default for leaf nodes'
+/// `first_child`; the authoritative no-children test is `num_children == 0`
+/// (0 is a VALID node index, so never test `first_child == 0` for that).
+const null_node: u32 = 0;
 
-/// Encode a width-in-em as Q16.16 fixed point (for `space` node data).
+/// Encode a width-in-em for `space` node data: the f32 em value, stored as
+/// its raw bits (not Q16.16 — the payload only ever holds table constants).
+/// A bitcast round-trips losslessly; the previous Q16.16 conversion rounded
+/// each constant to 1/65536 em and could overflow on hostile inputs.
 pub inline fn emToFixed(em: f32) u32 {
-    return @bitCast(@as(i32, @intFromFloat(em * 65536.0)));
+    return @bitCast(em);
 }
 
-/// Decode a Q16.16 fixed-point width-in-em back to f32.
+/// Decode a `space` node's width-in-em back to f32 (raw f32 bits).
 pub inline fn fixedToEm(v: u32) f32 {
-    return @floatCast(@as(f64, @floatFromInt(@as(i32, @bitCast(v)))) / 65536.0);
+    return @bitCast(v);
 }
 
 /// The superflat AST: source + parallel token table + flat node pool.
@@ -336,6 +350,10 @@ pub inline fn fixedToEm(v: u32) f32 {
 /// Owns nothing beyond the two ArrayLists; the caller provides `gpa`. Free
 /// with `deinit`. Node addresses are stable for the lifetime of the Ast (the
 /// pool is append-only).
+///
+/// Ownership: `Ast` OWNS its two ArrayLists. Do NOT copy an `Ast` by value
+/// (a copy would alias the same buffers and double-free on `deinit`); create
+/// with `init` and free with `deinit` exactly once, on the original.
 pub const Ast = struct {
     gpa: std.mem.Allocator,
     src: []const u8,
@@ -424,9 +442,13 @@ pub const Ast = struct {
         return self.nodes.items[idx];
     }
 
-    /// The `i`-th child index of node `idx`.
+    /// The `i`-th child index of node `idx`. Panics if `i` is out of bounds
+    /// (callers must check `num_children` first; an empty node has
+    /// `num_children == 0` — never probe `first_child == 0`, which is a
+    /// valid index).
     pub fn child(self: *const Ast, idx: u32, i: usize) u32 {
         const n = self.node(idx);
+        if (i >= n.num_children) @panic("Ast.child: child index out of bounds");
         return n.first_child + @as(u32, @intCast(i));
     }
 

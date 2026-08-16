@@ -40,7 +40,9 @@ pub const Span = struct {
     end: u32,
 
     pub fn len(self: Span) usize {
-        return self.end - self.start;
+        // Saturating: a hand-built span with end < start must not underflow
+        // (panic in Debug/ReleaseSafe) — report 0 instead.
+        return self.end -| self.start;
     }
 };
 
