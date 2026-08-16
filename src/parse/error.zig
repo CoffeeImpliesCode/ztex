@@ -63,9 +63,22 @@ pub const Info = struct {
     }
 };
 
-/// 1-based (line, column) of byte `offset` in `src`. Column counts BYTES
-/// from the line start (sufficient for a caret under ASCII math input;
-/// for multi-byte input the caret may sit mid-codepoint).
+/// Number of codepoints in a UTF-8 byte slice. Counts every LEADING byte of
+/// a sequence (continuation bytes 0b10xxxxxx are not new codepoints), so it
+/// is exact for well-formed input and still yields a sane value on a prefix
+/// truncated mid-codepoint.
+pub fn countCodepoints(s: []const u8) usize {
+    var n: usize = 0;
+    for (s) |b| {
+        if (b & 0xC0 != 0x80) n += 1;
+    }
+    return n;
+}
+
+/// 1-based (line, column) of byte `offset` in `src`. The column counts
+/// CODEPOINTS from the line start (not bytes), so a caret aligned by `col`
+/// sits under the right visual character even when a multi-byte char
+/// precedes the error (L2).
 pub fn lineCol(src: []const u8, offset: usize) struct { line: usize, col: usize } {
     const o = @min(offset, src.len);
     var line: usize = 1;
@@ -76,7 +89,7 @@ pub fn lineCol(src: []const u8, offset: usize) struct { line: usize, col: usize 
             line_start = i + 1;
         }
     }
-    return .{ .line = line, .col = o - line_start + 1 };
+    return .{ .line = line, .col = countCodepoints(src[line_start..o]) + 1 };
 }
 
 /// The source line containing byte `offset`, with a trailing `\r` trimmed
@@ -115,6 +128,27 @@ test "error: lineCol is 1-based per line" {
     // an offset past EOF clamps to EOF
     try testing.expectEqual(eof.line, lineCol(src, src.len + 10).line);
     try testing.expectEqual(eof.col, lineCol(src, src.len + 10).col);
+}
+
+test "error: lineCol counts codepoints, not bytes" {
+    // 'ξ' (U+03BE) is 2 bytes. The '\' after it sits at byte offset 7 but
+    // codepoint column 7 (x, space, =, space, ξ, space = 6 cells before it).
+    const src = "x = ξ \\frac";
+    // "x = ξ \frac": x(0) sp(1) =(2) sp(3) ξ(4,5) sp(6) \(7)
+    const lc = lineCol(src, 7); // the backslash
+    try testing.expectEqual(@as(usize, 1), lc.line);
+    try testing.expectEqual(@as(usize, 7), lc.col); // not byte col 8
+    // ASCII still behaves exactly as before (codepoint count == byte count)
+    try testing.expectEqual(@as(usize, 3), lineCol(src, 2).col); // '='
+    try testing.expectEqual(@as(usize, 5), lineCol(src, 4).col); // ξ start
+    // An offset INSIDE a codepoint (never produced by real error spans,
+    // which point at token starts) counts the partial leading byte; kept
+    // to document the boundary, not as a real caret target.
+    try testing.expectEqual(@as(usize, 6), lineCol(src, 5).col); // mid-ξ
+    try testing.expectEqual(@as(usize, 6), lineCol(src, 6).col); // space after ξ (5 cps before)
+    // countCodepoints matches on ASCII
+    try testing.expectEqual(@as(usize, 5), countCodepoints("ab=c "));
+    try testing.expectEqual(@as(usize, 2), countCodepoints("ξx"));
 }
 
 test "error: sourceLine returns the containing line, CR trimmed" {

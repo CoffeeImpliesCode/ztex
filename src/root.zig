@@ -30,10 +30,15 @@ pub fn render(
     src: []const u8,
     size_pt: f32,
     err_info: ?*parse.Info,
-) !draw.DrawList {
+) parse.Error!draw.DrawList {
     var ast = try parse.parse(gpa, src, err_info);
     defer ast.deinit();
-    return layout.render(gpa, &ast, ast.root, &layout.metrics.default, size_pt);
+    // layout.render's set is anyerror but it only ever fails on allocation;
+    // map it onto the closed parse.Error set (OutOfMemory is a member via
+    // std.mem.Allocator.Error) so this facade's return type stays the typed
+    // parse set (H2) — callers match the parse errors exhaustively instead
+    // of re-enumerating them by hand.
+    return layout.render(gpa, &ast, ast.root, &layout.metrics.default, size_pt) catch error.OutOfMemory;
 }
 
 test {

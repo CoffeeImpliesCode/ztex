@@ -30,7 +30,10 @@ pub const Draw = union(enum) {
 };
 
 pub const Text = struct {
-    /// utf-8 glyph bytes (a slice into the source, never copied)
+    /// utf-8 glyph bytes. Two ownership domains, discriminated by
+    /// `synthetic`: false = a slice into the source (never copied); true =
+    /// bytes duped into DrawList.glyph_arena (owned by the arena, freed on
+    /// draw-list deinit — never free or retain across the list).
     bytes: []const u8,
     /// baseline position in output coordinates
     x: f32,
@@ -40,6 +43,10 @@ pub const Text = struct {
     /// effective font style (\text/\mathrm = roman, variables = italic, …)
     style: atom.CharStyle,
     color: Color,
+    /// true when `bytes` is arena-owned (a synthesized glyph with no source
+    /// bytes to alias, e.g. \sum → ∑); false when `bytes` aliases the source.
+    /// Carried from the box's `synthetic` in `flatten`.
+    synthetic: bool = false,
     /// big-op form carried from the box: `.variant` = a DISPLAY big-op
     /// drawing the MATH .v1 variant (svg.zig emits data-op="v1" so the
     /// rasterizer/verifier resolve the variant); everything else stays the
@@ -81,6 +88,11 @@ pub const Line = struct {
 };
 
 /// The flat, ordered draw list. Painter's order; absolute coordinates.
+///
+/// Do NOT copy a DrawList by value: it owns the `items` array and the
+/// `glyph_arena` (which owns every synthetic glyph's bytes) and deinits
+/// them exactly once. `init`/`deinit` must be paired 1:1; after `deinit`
+/// the list is unusable.
 pub const DrawList = struct {
     gpa: std.mem.Allocator,
     items: std.ArrayList(Draw) = .empty,
@@ -149,6 +161,7 @@ pub fn flatten(
                 .size = b.size,
                 .style = b.style,
                 .color = black,
+                .synthetic = b.synthetic,
                 .bigop_form = b.bigop_form,
                 .radical_form = b.radical_form,
                 .delim_fixed = b.delim_fixed,

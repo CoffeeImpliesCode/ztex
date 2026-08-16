@@ -57,7 +57,9 @@ pub const Box = struct {
     width: f32,
     height: f32,
     depth: f32,
-    /// index of the first ChildRef (into BoxList.childrefs); 0 = leaf
+    /// index of the first ChildRef (into BoxList.childrefs). Meaningful only
+    /// when `num_children > 0`; the no-children test is `num_children == 0`,
+    /// NEVER `first_child == 0` — index 0 is a valid ChildRef slot.
     first_child: u32,
     num_children: u16,
     /// char: the glyph codepoint
@@ -108,9 +110,11 @@ pub const Box = struct {
     delim_fixed: f32 = 0,
 };
 
-pub const null_child: u32 = 0;
-
 /// The flat box pool.
+///
+/// Do NOT copy a BoxList by value: it owns the `boxes`, `childrefs`, and
+/// `scratch` arrays and deinits them exactly once. `init`/`deinit` must be
+/// paired 1:1; after `deinit` the list is unusable.
 pub const BoxList = struct {
     gpa: std.mem.Allocator,
     boxes: std.ArrayList(Box) = .empty,
@@ -133,14 +137,20 @@ pub const BoxList = struct {
     }
 
     pub fn get(self: *const BoxList, idx: u32) Box {
+        std.debug.assert(idx < self.boxes.items.len);
         return self.boxes.items[idx];
     }
 
     /// ChildRef run of a box (empty for leaves).
+    ///
+    /// Invalidation contract: the returned slice aliases `childrefs`
+    /// storage. Any `create`/`createLeaf` call may reallocate that array and
+    /// dangle the slice — never hold it across a `create` call.
     pub fn children(self: *const BoxList, idx: u32) []const ChildRef {
         // Read the fields straight from the pool instead of going through
         // `get` (which copies the whole Box) — one less by-value copy per
         // parent. `get` stays by-value for callers that want a Box.
+        std.debug.assert(idx < self.boxes.items.len);
         const b = &self.boxes.items[idx];
         if (b.num_children == 0) return &.{};
         return self.childrefs.items[b.first_child .. b.first_child + b.num_children];
@@ -224,10 +234,6 @@ test "boxlist: leaf has empty children" {
     defer list.deinit();
     const c = try list.createLeaf(.char, 4.0, 3.0, 0.5, .{ .start = 0, .end = 1 });
     try testing.expectEqual(@as(usize, 0), list.children(c).len);
-}
-
-test "boxlist: NULL_CHILD sentinel is zero" {
-    try testing.expectEqual(@as(u32, 0), null_child);
 }
 
 test "boxlist: child offsets accumulate through nested parents" {

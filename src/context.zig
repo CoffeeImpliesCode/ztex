@@ -104,10 +104,13 @@ pub const Context = struct {
         src: []const u8,
         size_pt: f32,
         err_info: ?*parse.Info,
-    ) !draw.DrawList {
+    ) parse.Error!draw.DrawList {
         var ast = try parse.parse(gpa, src, err_info);
         defer ast.deinit();
-        return layout.render(gpa, &ast, ast.root, &self.fm, size_pt);
+        // See root.zig render: layout only fails on allocation, mapped onto
+        // the closed parse.Error set so the facade returns the typed parse
+        // error (H2).
+        return layout.render(gpa, &ast, ast.root, &self.fm, size_pt) catch error.OutOfMemory;
     }
 };
 

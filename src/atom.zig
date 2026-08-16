@@ -11,12 +11,52 @@
 //! the root-reachable chain is the tree.
 
 const std = @import("std");
-const token = @import("token.zig");
 
-// Re-export the provenance types so consumers import only ztex.atom.
-pub const TokenTag = token.Tag;
-pub const Token = token.Token;
-pub const Span = token.Span;
+// ── lexical tokens (folded in from the former token.zig) ────────────
+//
+// Provenance design (house superflat pattern, cf. `~/projects/{vain,skript}`):
+// the lexer pre-tokenizes the whole source into a flat token table. Every
+// token carries a byte span into the original source. Atoms reference token
+// ranges; boxes and drawables carry resolved byte spans. So any output
+// drawable maps back to its input text in O(1).
+
+/// Lexical token kind.
+pub const TokenTag = enum(u8) {
+    /// an ordinary character/codepoint (`x`, digits, `+`, `[`, `]`, utf-8…)
+    char,
+    /// a control sequence `\name`; the name is `src[start+1..end]`
+    command,
+    /// `{`
+    l_group,
+    /// `}`
+    r_group,
+    /// `^`
+    sup,
+    /// `_`
+    sub,
+};
+
+/// A token plus its byte span into the source.
+pub const Token = struct {
+    tag: TokenTag,
+    /// byte offset of the first byte of this token in the source
+    start: u32,
+    /// byte offset just past the last byte of this token in the source
+    end: u32,
+};
+
+/// A byte span into the original source. The universal provenance currency:
+/// source → token → atom → box → drawable.
+pub const Span = struct {
+    start: u32,
+    end: u32,
+
+    pub fn len(self: Span) usize {
+        // Saturating: a hand-built span with end < start must not underflow
+        // (panic in Debug/ReleaseSafe) — report 0 instead.
+        return self.end -| self.start;
+    }
+};
 
 /// Math/text font style of a character or text run.
 pub const CharStyle = enum(u8) {
@@ -357,7 +397,7 @@ pub inline fn fixedToEm(v: u32) f32 {
 pub const Ast = struct {
     gpa: std.mem.Allocator,
     src: []const u8,
-    tokens: std.ArrayList(token.Token) = .empty,
+    tokens: std.ArrayList(Token) = .empty,
     nodes: std.ArrayList(Node) = .empty,
     /// index of the root node (the whole formula), set by the parser
     root: u32 = 0,
@@ -381,7 +421,7 @@ pub const Ast = struct {
     }
 
     /// Append a token; returns nothing (caller tracks indices via items.len).
-    pub fn pushToken(self: *Ast, t: token.Token) !void {
+    pub fn pushToken(self: *Ast, t: Token) !void {
         try self.tokens.append(self.gpa, t);
     }
 
@@ -456,7 +496,7 @@ pub const Ast = struct {
     ///
     /// O(1): `src[tokens[first].start .. tokens[last].end]`. Only meaningful
     /// for nodes whose token range is non-empty.
-    pub fn span(self: *const Ast, idx: u32) token.Span {
+    pub fn span(self: *const Ast, idx: u32) Span {
         const n = self.node(idx);
         if (n.num_tokens == 0) return .{ .start = 0, .end = 0 };
         const first_t = self.tokens.items[n.first_token];
@@ -471,6 +511,11 @@ const testing = std.testing;
 
 test {
     testing.refAllDecls(@This());
+}
+
+test "span: length is end minus start" {
+    const s: Span = .{ .start = 4, .end = 9 };
+    try testing.expectEqual(@as(usize, 5), s.len());
 }
 
 fn testAst() !Ast {

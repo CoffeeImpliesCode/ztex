@@ -10,6 +10,7 @@ const usage =
     \\  -p <px>      SVG padding (default 0)
     \\  -b <color>   background: name or #RRGGBB[AA] (default: white; use
     \\               'none'/'transparent' for no background)
+    \\  --bg <color>  alias for -b
     \\  -h, --help   show this help
     \\
 ;
@@ -43,7 +44,23 @@ pub fn main(init: std.process.Init) !void {
                 return error.BadPadding;
         } else if (std.mem.eql(u8, arg, "-b") or std.mem.eql(u8, arg, "--bg")) {
             const v = arg_it.next() orelse return error.MissingValue;
-            bg = ztex.svg.parseColor(v);
+            // parseColorChecked distinguishes the valid "no background"
+            // values (none/transparent → null) from a typo, which is a real
+            // CLI error instead of a silent transparent background (H3).
+            bg = ztex.svg.parseColorChecked(v) catch |e| switch (e) {
+                error.UnrecognizedColor => {
+                    try std.Io.File.stderr().writeStreamingAll(
+                        io,
+                        "ztex: unrecognized background color '",
+                    );
+                    try std.Io.File.stderr().writeStreamingAll(io, v);
+                    try std.Io.File.stderr().writeStreamingAll(
+                        io,
+                        "' (use a color name, #RRGGBB[AA], or 'none'/'transparent')\n",
+                    );
+                    std.process.exit(1);
+                },
+            };
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             try std.Io.File.stdout().writeStreamingAll(io, usage);
             return;
@@ -56,15 +73,17 @@ pub fn main(init: std.process.Init) !void {
     defer ctx.deinit();
 
     // A parse failure fills `err_info` (kind + span) before returning its
-    // error value; any other error (OOM, layout) leaves it untouched and
-    // keeps the current path.
+    // error value. `ctx.render` returns the TYPED parse.Error (H2), so we
+    // match it exhaustively: every member except OutOfMemory is a parse
+    // front-end error whose Info was filled by lex/parse; OutOfMemory (and
+    // any future non-parse member) propagates and leaves `err_info` unused.
     var err_info: ztex.parse.Info = undefined;
-    const dl = ctx.render(gpa, src, size, &err_info) catch |e| {
-        if (isParseError(e)) {
+    const dl = ctx.render(gpa, src, size, &err_info) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => {
             try printParseError(gpa, io, e, err_info, src);
             std.process.exit(1);
-        }
-        return e;
+        },
     };
     const opts: ztex.svg.Options = .{ .padding = pad, .background = bg };
 
@@ -77,29 +96,6 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-/// True when `e` is one of the parse front-end's error values (the same
-/// set `ztex.parse.Error` unions). Used to tell a parse failure — whose
-/// Info was filled by lex/parse — apart from allocator/layout errors.
-fn isParseError(e: anyerror) bool {
-    return switch (e) {
-        error.DanglingEscape,
-        error.InvalidUtf8,
-        error.UnexpectedRGroup,
-        error.UnexpectedScript,
-        error.DoubleScript,
-        error.UnknownCommand,
-        error.MissingArgument,
-        error.MissingScript,
-        error.UnclosedGroup,
-        error.UnexpectedMiddle,
-        error.UnknownEnvironment,
-        error.MismatchedEnd,
-        error.UnclosedEnvironment,
-        => true,
-        else => false,
-    };
-}
-
 /// Print a caret-annotated parse error to stderr. The first line carries
 /// the TeX-style message and the error-set name; the following lines echo
 /// the offending source line with a caret under the span:
@@ -110,7 +106,7 @@ fn isParseError(e: anyerror) bool {
 fn printParseError(
     gpa: std.mem.Allocator,
     io: std.Io,
-    e: anyerror,
+    e: ztex.parse.Error,
     info: ztex.parse.Info,
     src: []const u8,
 ) !void {
@@ -131,8 +127,11 @@ fn printParseError(
     const line = ztex.parse.err.sourceLine(src, info.span.start);
     try err_file.writeStreamingAll(io, line);
     try err_file.writeStreamingAll(io, "\n");
+    // `lc.col` is a CODEPOINT column (L2), so `pad` and the caret width are
+    // measured in codepoints too — aligned with how the echoed line renders.
     const pad = lc.col - 1;
-    const caret_len = @max(@as(usize, 1), @min(info.span.len(), line.len -| pad));
+    const line_cps = ztex.parse.err.countCodepoints(line);
+    const caret_len = @max(@as(usize, 1), @min(info.span.len(), line_cps -| pad));
     const caret = try gpa.alloc(u8, pad + caret_len + 1);
     defer gpa.free(caret);
     @memset(caret, ' ');
