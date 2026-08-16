@@ -543,17 +543,35 @@ def rasterize_svg(svg_path, png_path, font_dir=DEFAULT_FONT_DIR, scale=1.0):
                 # size and the baseline shift aligning the variant's ink center
                 # with the base glyph's (both on the MATH axis — shift ≈ 0
                 # for LM Math).
-                res = _delimiter_resolution(find_lm_font(_lm_font_name(a), font_dir),
-                                            ord(content), size_pt,
-                                            delim_targets[(x_pt, y_pt, content)])
-                if res is not None:
-                    pua, _gname, size_v_pt, shift_pt = res
+                spec = delim_targets[(x_pt, y_pt, content)]
+                if spec.get("mode") == "pieces":
+                    # An UNPAIRED cases brace beyond the largest MATH variant:
+                    # draw the GlyphAssembly PIECES (⎧ + N extenders + ⎨ + N
+                    # extenders + ⎩, XeTeX's make_delim assembly) at the base
+                    # size — constant stroke, narrow ink — instead of scaling
+                    # the tallest variant (which thickened the stroke and
+                    # widened the ink ~2.3x). The plan's svg_y offsets are
+                    # relative to this delimiter's baseline. The patched
+                    # font carries the extender glyphs (PUA), the hooks are
+                    # the real U+23A7..U+23A9 cmap chars.
                     font = _variant_font(find_lm_font(_lm_font_name(a), font_dir),
-                                         size_v_pt * PT_TO_PX * ss)
-                    content = chr(pua)
-                    y_pt += shift_pt
+                                         size_pt * PT_TO_PX * ss)
+                    for cp_i, _gname, dy in spec["plan"]["pieces"]:
+                        draw.text(((x_pt) * PT_TO_PX * ss,
+                                   (y_pt + dy) * PT_TO_PX * ss),
+                                  chr(cp_i), font=font, fill=fill, anchor="ls")
+                    content = ""   # the pieces are drawn; skip the base char
                 else:
-                    font = _face_for(a, font_dir, size_pt * PT_TO_PX * ss)
+                    res = _delimiter_resolution(find_lm_font(_lm_font_name(a), font_dir),
+                                                ord(content), size_pt, spec)
+                    if res is not None:
+                        pua, _gname, size_v_pt, shift_pt = res
+                        font = _variant_font(find_lm_font(_lm_font_name(a), font_dir),
+                                             size_v_pt * PT_TO_PX * ss)
+                        content = chr(pua)
+                        y_pt += shift_pt
+                    else:
+                        font = _face_for(a, font_dir, size_pt * PT_TO_PX * ss)
             else:
                 font = _face_for(a, font_dir, size_pt * PT_TO_PX * ss)
             draw.text((x_pt * PT_TO_PX * ss, y_pt * PT_TO_PX * ss),
@@ -1166,8 +1184,23 @@ def _delimiter_targets(elements, w_pt, h_pt, font_dir, base_size):
                 targets[key] = {"req": gap / d["size"], "mode": "level",
                                 "level": best_k, "base": None}
             else:
-                targets[key] = {"req": need_em, "mode": "scaled",
-                                "level": None, "base": base_size}
+                # The ladder is exhausted (a tall \cases array): XeTeX
+                # assembles an arbitrary-tall brace from the MATH-table
+                # GlyphAssembly PIECES (fixed hooks + extenders, constant
+                # stroke — the scaled-base fallback thickened the stroke and
+                # widened the ink ~2.3x). The piece plan covers the same
+                # required extent (need_em × base size pt) and keeps the
+                # base glyph's axis-centered placement; delimiters without an
+                # assembly keep the old continuous scaled-base path.
+                plan = _delimiter_piece_plan(path, d["cp"], d["size"],
+                                             need_em * base_size)
+                if plan is not None:
+                    targets[key] = {"req": need_em, "mode": "pieces",
+                                    "level": None, "base": base_size,
+                                    "plan": plan}
+                else:
+                    targets[key] = {"req": need_em, "mode": "scaled",
+                                    "level": None, "base": base_size}
     return targets, spans
 
 
@@ -1245,6 +1278,170 @@ _variant_font_cache = {}   # (path, size_px) -> patched PIL ImageFont
 _variant_tt_bytes = {}     # path -> bytes of the patched font (PUA -> .v1)
 
 
+_piece_plan_cache = {}   # (path, cp, size_pt, v_pt) -> plan dict or None
+
+
+def _assembly_extender_glyphs(tt, cp):
+    """Distinct extender glyphs of cp's MATH GlyphAssembly (part order), or [].
+
+    The brace extender (braceleft.ex) is NOT a Unicode cmap glyph — it is
+    addressed through the patched PUA font (slot 8+ of the delimiter's PUA
+    space, see _variant_font and _delimiter_piece_plan) exactly like the
+    size variants.
+    """
+    cmap = tt.getBestCmap()
+    base = cmap.get(cp)
+    if base is None:
+        return []
+    math = tt.get("MATH")
+    if math is None:
+        return []
+    mv = math.table.MathVariants
+    try:
+        names = list(mv.VertGlyphCoverage.glyphs)
+    except AttributeError:
+        names = [c.glyphName for c in mv.VertGlyphCoverage]
+    for name, gc in zip(names, mv.VertGlyphConstruction):
+        if name == base and gc.GlyphAssembly is not None:
+            seen = []
+            for p in gc.GlyphAssembly.PartRecords:
+                if (getattr(p, "PartFlags", 0) & 1) and p.glyph not in seen:
+                    seen.append(p.glyph)
+            return seen
+    return []
+
+
+def _delimiter_piece_plan(path, cp, size_pt, v_pt):
+    """XeTeX-style GlyphAssembly plan for a STRETCHED delimiter, or None.
+
+    When the required ink exceeds the LARGEST MATH size variant, XeTeX stops
+    using the variant ladder and ASSEMBLES the delimiter from the MATH
+    table's VertGlyphConstruction parts (TeX make_delim with extenders):
+    the top hook + N extenders + middle piece + N extenders + bottom hook,
+    stacked with connector overlaps. LM Math's braceleft assembly is
+    ⎩(uni23A9) + { extenders (braceleft.ex) + ⎨(uni23A8) + extenders +
+    ⎧(uni23A7) — the same Unicode brace pieces (U+23A7..U+23AA) XeTeX draws.
+
+    Reproduces XeTeX's algorithm (xetex-math.c build_opentype_assembly,
+    verified against the xelatex PDF of the 3-row \\cases at 30pt, which
+    stacks ⎧/⎨/⎩ + two braceleft.ex at origin spacings 19.796/42.271/
+    19.796/19.855pt):
+      · the extender count n is the smallest count whose assembly height
+        s_max(n) covers the required v — each extender position repeats n
+        times and s_max = Σ over parts of (FullAdvance − min(startConn,
+        prevEnd, MinConnectorOverlap)) (min_o = MathVariants
+        MinConnectorOverlap, 20 for LM Math);
+      · each part stacks at its INK height (glyph bbox; the brace pieces
+        all have depth 0) minus a glue whose natural width is −oo
+        (oo = min(startConn, prevEnd)) and stretch oo − min(oo, min_o);
+      · the glues stretch by glue_set = clamp((v − nat)/str, 0, 1), so at
+        the required v the stacked ink extent comes out EXACTLY v — the
+        same 124.6pt cover the old scaled-v7 fallback produced — while
+        every piece keeps its constant stroke and narrow width (the hooks'
+        0.355em ink vs the scaled v7's 0.608em × 1.38: the "bold, 2.3x
+        wider brace" defect).
+
+    Returns {"pieces": [(codepoint, glyph_name, svg_y)], "box": (y0, y1)}
+    — svg_y is the piece baseline in SVG pt (y down) RELATIVE to the
+    delimiter baseline; box is the union ink (y down, relative) — or None
+    when the font has no assembly for cp (the caller falls back to the
+    scaled-variant draw).
+    """
+    key = (path, cp, size_pt, v_pt)
+    plan = _piece_plan_cache.get(key)
+    if plan is not None or key in _piece_plan_cache:
+        return plan
+    _piece_plan_cache[key] = None
+    tt = _tt_font(path)
+    cmap = _tt_cmap(path)
+    base = cmap.get(cp)
+    if base is None:
+        return None
+    math = tt.get("MATH")
+    if math is None:
+        return None
+    mv = math.table.MathVariants
+    try:
+        names = list(mv.VertGlyphCoverage.glyphs)
+    except AttributeError:
+        names = [c.glyphName for c in mv.VertGlyphCoverage]
+    ga = None
+    for name, gc in zip(names, mv.VertGlyphConstruction):
+        if name == base and gc.GlyphAssembly is not None:
+            ga = gc.GlyphAssembly
+            break
+    if ga is None:
+        return None
+    upem = tt["head"].unitsPerEm
+    min_o = getattr(mv, "MinConnectorOverlap", None) or 0
+    parts = []   # (glyph, startConn, endConn, fullAdvance, is_extender)
+    for p in ga.PartRecords:
+        parts.append((p.glyph, p.StartConnectorLength, p.EndConnectorLength,
+                      p.FullAdvance, bool(getattr(p, "PartFlags", 0) & 1)))
+    heights = []   # ink heights in font units (all brace pieces: depth 0)
+    for gname, _st, _en, _fu, _ex in parts:
+        h_em, _c = _glyph_ink_em(tt, path, gname)
+        heights.append(h_em * upem)
+    v_units = v_pt * upem / size_pt
+    # Smallest extender count whose assembly height covers v (XeTeX's first
+    # pass: n starts at 0 — an extender contributes nothing at n = 0).
+    n = -1
+    while True:
+        n += 1
+        s_max, prev = 0, 0
+        for i, (_g, st, en, full, ext) in enumerate(parts):
+            for _ in range(n if ext else 1):
+                o = min(st, prev, min_o)
+                s_max += full - o
+                prev = en
+        if s_max >= v_units or not any(p[4] for p in parts):
+            break
+    # The stacked part list with per-part glue (natural −oo, stretch).
+    stack = []   # (glyph, height_units, glue_natural_units, stretch_units)
+    prev = 0
+    for i, (gname, st, en, _fu, ext) in enumerate(parts):
+        for _ in range(n if ext else 1):
+            oo = min(st, prev)
+            o = min(oo, min_o)
+            stack.append((gname, heights[i], -oo, oo - o))
+            prev = en
+    nat = sum(h + g for _g, h, g, _s in stack)
+    str_total = sum(s for _g, _h, _gl, s in stack)
+    g = 0.0
+    if str_total > 0 and v_units > nat:
+        g = min((v_units - nat) / str_total, 1.0)
+    # Baseline offsets (pt, y up) from the BOTTOM piece's baseline: the
+    # XeTeX vlist stacks each piece above the previous at h_prev + glue.
+    glue = [gl + st * g for _g, _h, gl, st in stack]
+    yb = [0.0]
+    for i in range(1, len(stack)):
+        yb.append(yb[i - 1] + (stack[i - 1][1] + glue[i]) * size_pt / upem)
+    extent = yb[-1] + stack[-1][1] * size_pt / upem
+    # SVG y (down) of each piece baseline relative to the delimiter
+    # baseline: the stack's ink center lands on the base glyph's ink center
+    # (c_b × size above the baseline — the same axis-centering the scaled
+    # variant draw uses, so the brace keeps the current 124.6pt cover).
+    _h_b, c_b = _glyph_ink_em(tt, path, base)
+    shift_up = c_b * size_pt - extent / 2.0
+    # Codepoints to draw: the hooks/middle are real Unicode (U+23A7..U+23A9
+    # in the cmap); the extender glyphs (braceleft.ex) live only in the MATH
+    # table, so they are addressed through the patched PUA font (slot 8+ of
+    # this delimiter's PUA space — see _variant_font).
+    pua_slot = DELIM_PUA_BASE + DELIMITER_CPS.index(cp) * DELIM_PUA_SLOTS
+    ext_pua = {g: pua_slot + DELIM_PUA_SLOTS + i
+               for i, g in enumerate(_assembly_extender_glyphs(tt, cp))}
+    pieces = []
+    for i, (gname, _h_u, _gl, _st) in enumerate(stack):
+        cp_i = next((c for c, gn in cmap.items() if gn == gname), None)
+        if cp_i is None:
+            cp_i = ext_pua.get(gname)
+        if cp_i is not None:
+            pieces.append((cp_i, gname, -shift_up - yb[i]))
+    plan = {"pieces": pieces, "box": (-shift_up - extent, -shift_up)}
+    _piece_plan_cache[key] = plan
+    return plan
+
+
 def _variant_font(path, size_px):
     """PIL font drawing the MATH variants: big-op .v1 display glyphs AND the
     delimiter size variants.
@@ -1271,6 +1468,12 @@ def _variant_font(path, size_px):
             for cp in DELIMITER_CPS:
                 for k, gname in enumerate(_delimiter_variants(tt, cp), start=1):
                     mapping[_delim_pua(cp, k)] = gname
+                # GlyphAssembly extender glyphs (slot 8+): the piece-
+                # assembled brace draw (\cases beyond the largest variant)
+                # stacks braceleft.ex extenders between the hooks — they are
+                # not Unicode cmap glyphs, so they need PUA addresses too.
+                for i, gname in enumerate(_assembly_extender_glyphs(tt, cp)):
+                    mapping[_delim_pua(cp, DELIM_PUA_SLOTS + i)] = gname
             # Radical vertical variants: map PUA chars to radical.v1..v4 so
             # the PIL raster draws the variant the layout requested (the
             # data-radical="vN" attribute — not the base √ the browser shows).
@@ -1347,6 +1550,24 @@ def _glyph_ink_boxes(attrs, content, font_dir, delim_targets=None):
             # Stretched delimiter: the raster draws the MATH size variant at
             # the resolved size with a shifted baseline — measure that ink.
             spec = delim_targets.get((ex, ey, ch))
+            if spec is not None and spec.get("mode") == "pieces":
+                # The unpaired cases brace draws the GlyphAssembly PIECES
+                # (constant-stroke ⎧⎨⎩ + extenders) — the union of their ink
+                # boxes at the plan's baselines is what the raster draws.
+                subs = []
+                for _cp_i, pname, dy in spec["plan"]["pieces"]:
+                    pen = BoundsPen(gs)
+                    try:
+                        gs[pname].draw(pen)
+                    except Exception:  # noqa: BLE001 — defensive
+                        pen = None
+                    if pen is None or not pen.bounds:
+                        continue
+                    xmin, ymin, xmax, ymax = pen.bounds
+                    subs.append((ex + xmin * scale, ey + dy - ymax * scale,
+                                 ex + xmax * scale, ey + dy - ymin * scale))
+                boxes.append(_union(subs))
+                continue
             if spec is not None:
                 res = _delimiter_resolution(path, ord(ch), size, spec)
                 if res is not None:
