@@ -1,13 +1,5 @@
-//! ztex.layout.box — superflat TeX box model.
-//!
-//! Same pattern as the atom AST: one flat array of fixed-size boxes, with
-//! child placement stored as contiguous index runs in a parallel array. A box
-//! carries its own dimensions (width/height/depth) plus a source byte span, so
-//! every drawable downstream can map back to input text.
-//!
-//! Child placement is per-parent, so it lives in `ChildRef` (index + offsets),
-//! never in the shared child box. `flatten` positions each child at
-//! `(x + cr.x_shift, y + cr.shift)` uniformly.
+//! ztex.layout.box — superflat TeX box model: one flat array of fixed-size
+//! boxes with per-parent child placement in a parallel `ChildRef` array.
 
 const std = @import("std");
 const atom = @import("ztex.atom");

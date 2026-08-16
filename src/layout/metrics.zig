@@ -99,7 +99,7 @@ pub const StaticTables = struct {};
 /// context.zig — the one file that imports font.zig — performs the concrete
 /// cast) — together with the lookup, so the arm is atomic: a `.font` arm
 /// always has both its context and its lookup, and the per-instance state
-/// of `FontMetrics` is just the union tag + this payload (SIM2). The
+/// of `FontMetrics` is just the union tag + this payload. The
 /// lookup returns null for codepoints the face does not map, so
 /// `glyph`/`glyphAt` fall through to the static tables and finally to
 /// glyphEstimate.
@@ -113,7 +113,7 @@ pub const FontHook = struct {
 };
 
 /// Closed metric source for the layout: either the bundled static tables or
-/// a real font backend (SIM2). Replaces the previous four-fn-pointer +
+/// a real font backend. Replaces the previous four-fn-pointer +
 /// opaque `?*anyopaque` struct: the per-instance state is only the union
 /// arm; the lookup entry points below are comptime constants that dispatch
 /// on it.
@@ -1906,6 +1906,17 @@ pub fn glyphAt(fm: *const FontMetrics, cp: u21, style: atom.CharStyle, size_pt: 
             return .{ .width = e.w, .height = e.h, .depth = e.d, .italic_correction = e.ic };
         }
     }
+    // O(1) ASCII fast path (lookupAscii, wired here so layoutChar actually
+    // takes it): the LUTs derive from the 10pt `table`/`table_roman`, so
+    // they are bit-identical to the slow path ONLY outside the 7pt/5pt
+    // optical bands — the script-size tables carry their own h/d/ic. Inside
+    // the bands — and for the `.font` arm / any fm != `&default` — it
+    // returns null and the slow path below runs.
+    const band7 = size_pt > 6.4 and size_pt < 7.6;
+    const band5 = size_pt > 4.5 and size_pt < 5.5;
+    if (!band7 and !band5) {
+        if (lookupAscii(fm, cp, style)) |g| return g;
+    }
     if (fontGlyph(fm, cp, style)) |g| return g;
     if (search(tableFor(cp, style, size_pt), cp)) |e| {
         return .{ .width = e.w, .height = e.h, .depth = e.d, .italic_correction = e.ic };
@@ -2510,11 +2521,13 @@ const roman_ascii_lut = blk: {
 };
 
 /// O(1) ASCII glyph lookup for the bundled default metrics: direct table
-/// read, no binary search, no indirect call. Returns null unless `fm` is
-/// exactly the bundled `default` and `cp < 128` (including ASCII codepoints
-/// absent from the table), so callers fall through to `glyph` otherwise.
-/// Roman-style letters resolve from `table_roman` (cmr10), everything else
-/// from `table`, matching `glyph`/`glyphAt`.
+/// read, no binary search, no indirect call — `glyphAt` takes this fast
+/// path outside the 7pt/5pt optical bands (where the script-size tables
+/// would answer). Returns null unless `fm` is exactly the bundled `default`
+/// and `cp < 128` (including ASCII codepoints absent from the table), so
+/// callers fall through to `glyph` otherwise. Roman-style letters resolve
+/// from `table_roman` (cmr10), everything else from `table`, matching
+/// `glyph`/`glyphAt`.
 pub fn lookupAscii(fm: *const FontMetrics, cp: u21, style: atom.CharStyle) ?Glyph {
     if (fm != &default) return null;
     if (cp >= 128) return null;
@@ -2578,48 +2591,6 @@ fn glueImpl(self: *const FontMetrics) GlueParams {
         .scriptscriptfactor = 0.5,
         .x_height = 4.30555,
     };
-}
-
-/// Display-variant metrics for a big operator: the cmex10 next-larger
-/// character TeX uses in display style (TFM NEXTLARGER chain, verified via
-/// tftopl: ∑ O130, ∏ O131, ∐ O141, ∫/∮ O111, ⋂/⋃/⨆ O107), em × 10 at 10pt
-/// like `table`. `w` is now the Latin-Modern-Math advance of the drawn
-/// display glyph (∑ 10.56, ∏/∐ 9.44, ⋂/⋃/⨆ 8.33, ∫/∮ 6.65), kept for
-/// reference and parity with the metric tables; layoutOp boxes the op by
-/// bigOpInk (layout.zig) at the drawn size instead. The display glyph is
-/// drawn at DESIGN size (1.0× size_pt — unicode-math/XeTeX draws the
-/// display big op at its design size, measured ≈9.96pt at 10pt), so this
-/// table carries no scale factor; only `ic` is live: the display-limit skew
-/// and the post-op italic-correction tail use the Latin-Modern-Math
-/// MATH-table italicsCorrection (∫/∮ 0.332em → 3.32 at 10pt, verified in
-/// XeTeX-LM \showbox: the post-∫ kern and the limit skew are 3.32pt at 10pt
-/// and 6.64pt at 20pt, i.e. it scales with size_pt like the other table ic
-/// values). The h/d below are the old cmex10 reference values only.
-pub const DisplayOp = struct {
-    cp: u21,
-    w: f32,
-    h: f32,
-    d: f32,
-    ic: f32,
-};
-
-const display_ops = [_]DisplayOp{
-    .{ .cp = 0x220F, .w = 9.44, .h = 1.00001, .d = 15.00012, .ic = 0 }, // ∏ O131
-    .{ .cp = 0x2210, .w = 9.44, .h = 1.00001, .d = 15.00012, .ic = 0 }, // ∐ O141
-    .{ .cp = 0x2211, .w = 10.56, .h = 1.00001, .d = 15.00012, .ic = 0 }, // ∑ O130
-    .{ .cp = 0x222B, .w = 6.65, .h = 0, .d = 22.22246, .ic = 3.32 }, // ∫ O111
-    .{ .cp = 0x222E, .w = 6.65, .h = 0, .d = 22.22246, .ic = 3.32 }, // ∮ O111
-    .{ .cp = 0x22C2, .w = 8.33, .h = 1.00001, .d = 15.00012, .ic = 0 }, // ⋂ O107
-    .{ .cp = 0x22C3, .w = 8.33, .h = 1.00001, .d = 15.00012, .ic = 0 }, // ⋃ O107
-    .{ .cp = 0x2A06, .w = 8.33, .h = 1.00001, .d = 15.00012, .ic = 0 }, // ⨆ O107
-};
-
-/// Display-variant metrics for a big-operator codepoint; null if not one.
-pub fn displayOp(cp: u21) ?DisplayOp {
-    for (display_ops) |op| {
-        if (op.cp == cp) return op;
-    }
-    return null;
 }
 
 /// Bundled default metrics (Latin-Modern-Math advance widths, 10pt base):
@@ -3031,6 +3002,33 @@ test "metrics: roman letters at script sizes scale the LM Math advance" {
     const fast_i = lookupAscii(&default, 'a', .italic) orelse
         return error.TestUnexpectedResult;
     try testing.expectApproxEqAbs(@as(f32, 5.0), fast_i.width, 0.001);
+}
+
+test "metrics: glyphAt takes the lookupAscii fast path outside the optical bands" {
+    // glyphAt wires in lookupAscii (M7): outside the 7pt/5pt bands it must
+    // return BIT-IDENTICAL values to the LUT (both derive from the same 10pt
+    // table rows); inside the bands the script-size tables carry their own
+    // h/d/ic and the slow path must win.
+    const fast = lookupAscii(&default, '+', .italic) orelse
+        return error.TestUnexpectedResult;
+    const g10 = glyphAt(&default, '+', .italic, 10.0) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(fast.width, g10.width);
+    try testing.expectEqual(fast.height, g10.height);
+    try testing.expectEqual(fast.depth, g10.depth);
+    try testing.expectEqual(fast.italic_correction, g10.italic_correction);
+    const fast_r = lookupAscii(&default, 'a', .roman) orelse
+        return error.TestUnexpectedResult;
+    const g10r = glyphAt(&default, 'a', .roman, 10.0) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(fast_r.width, g10r.width);
+    try testing.expectEqual(fast_r.height, g10r.height);
+    // 7pt band: table7's '+' is taller than the 10pt row (6.19049 vs
+    // 5.83334), so glyphAt must NOT take the LUT there.
+    const g7 = glyphAt(&default, '+', .italic, 7.0) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(@as(f32, 6.19049), g7.height, 0.0001);
+    try testing.expect(!std.math.approxEqAbs(f32, g7.height, fast.height, 0.0001));
 }
 
 test "metrics: roman style at >= 15pt uses the LMRoman17 optical advances" {

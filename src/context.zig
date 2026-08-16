@@ -7,6 +7,13 @@
 //! codepoint) metric cache, which the first render fills and every later
 //! render hits. Create one context, render any number of formulas with it.
 //!
+//! Thread-safety: a `Context` is NOT shareable — the first render lazily
+//! fills the font metric cache and arena, so two threads rendering through
+//! the same Context race on that state. Use one Context per thread, or
+//! guard a shared Context with an external mutex. The static facade
+//! `ztex.render` IS shareable: it measures from the immutable static
+//! tables and shares no mutable state.
+//!
 //! The FontContext is heap-allocated: the `fm` union arm (a pointer into
 //! it) must stay valid across the `init` return, and a `FontContext` value
 //! returned by `init` is not guaranteed to be placed at the caller's result
@@ -16,10 +23,10 @@
 //! must be called exactly once.
 //!
 //! This is the font-backed pipeline; `ztex.render` (static metric tables)
-//! stays available for one-shot use and for tests. Both call the SINGLE
-//! shared pipeline `layout.render` with an explicit `FontMetrics` argument
-//! (SIM1/H1). The metric source is the closed `FontMetrics` union (SIM2):
-//! context.zig builds the `.font` arm — a `FontHook` carrying the
+//! stays available for one-shot use and for tests. Both facades call the
+//! SINGLE shared pipeline `renderPipeline` (root.zig) with an explicit
+//! `FontMetrics` argument. The metric source is the closed `FontMetrics`
+//! union: context.zig builds the `.font` arm — a `FontHook` carrying the
 //! `*FontContext` (opaque to the layout module, which cannot import
 //! font.zig) plus the font-glyph lookup below — so `init` is one struct
 //! literal instead of hand-installed fn-pointer plumbing, and the concrete
@@ -32,6 +39,10 @@ const parse = @import("ztex.parse");
 const layout = @import("ztex.layout");
 const metrics = layout.metrics;
 const draw = layout.draw;
+// The root module hosts the shared `renderPipeline` this facade delegates
+// to (same module directory, so the relative import stays inside the ztex
+// module; root.zig imports this file back — Zig resolves the cycle lazily).
+const root = @import("root.zig");
 
 /// Font-backed glyph lookup, the `.font` arm's hook (see `FontHook` in
 /// metrics.zig). Real-font metrics for `cp` in `style` at the 10pt base
@@ -90,27 +101,23 @@ pub const Context = struct {
     }
 
     /// Full pipeline: LaTeX source → draw list, measured from the real
-    /// fonts via `self.fm`. The returned `DrawList`'s `text` primitives
-    /// alias `src`, so `src` must outlive the draw list. `size_pt` is the
-    /// base font size in points. On a parse error, `err_info` (when
-    /// non-null) is filled with the kind + span.
+    /// fonts via `self.fm`. Thin wrapper over the shared `renderPipeline`
+    /// (root.zig) with this Context's metric source; the returned
+    /// `DrawList`'s `text` primitives alias `src`, so `src` must outlive
+    /// the draw list. `size_pt` is the base font size in points. On a
+    /// parse error, `err_info` (when non-null) is filled with the kind +
+    /// span. Allocates with `self.gpa`.
     ///
-    /// Takes `*Context` (not `*const`, C1): the first render fills the font
+    /// Takes `*Context` (not `*const`): the first render fills the font
     /// metric cache (`FontContext.metrics` mutates it while measuring), so
     /// rendering is not a const operation.
     pub fn render(
         self: *Context,
-        gpa: std.mem.Allocator,
         src: []const u8,
         size_pt: f32,
         err_info: ?*parse.Info,
-    ) parse.Error!draw.DrawList {
-        var ast = try parse.parse(gpa, src, err_info);
-        defer ast.deinit();
-        // See root.zig render: layout only fails on allocation, mapped onto
-        // the closed parse.Error set so the facade returns the typed parse
-        // error (H2).
-        return layout.render(gpa, &ast, ast.root, &self.fm, size_pt) catch error.OutOfMemory;
+    ) (parse.Error || error{InvalidAst})!draw.DrawList {
+        return root.renderPipeline(self.gpa, &self.fm, src, size_pt, err_info);
     }
 };
 
@@ -127,7 +134,7 @@ test "context: init once, render many — font metrics match the LM table widths
     defer ctx.deinit();
     // x at 20pt: math-italic U+1D465 advance 0.572em × 20 = 11.44
     // row 5.28pt × 2). The font path answers through the metrics cache.
-    var out = try ctx.render(testing.allocator, "x", 20, null);
+    var out = try ctx.render("x", 20, null);
     defer out.deinit();
     try testing.expectEqual(@as(usize, 1), out.len());
     const t = out.items.items[0].text;
@@ -135,7 +142,7 @@ test "context: init once, render many — font metrics match the LM table widths
     try testing.expectEqual(@as(f32, 20), t.size);
     try testing.expectApproxEqAbs(@as(f32, 11.44), out.width, 0.001);
     // a second render reuses the same context (and its font metric cache)
-    var out2 = try ctx.render(testing.allocator, "x", 20, null);
+    var out2 = try ctx.render("x", 20, null);
     defer out2.deinit();
     try testing.expectApproxEqAbs(out.width, out2.width, 0.0001);
     // The per-(face, cp) cache holds ONE entry after two renders of "x":
@@ -150,7 +157,7 @@ test "context: unmapped codepoint falls back to the static table / estimate" {
     // to the static table's row (CM width kept for codepoints LM Math does
     // not cover) instead of the 0.5em nominal advance, and rendering still
     // produces a glyph box — graceful, no hole.
-    var out = try ctx.render(testing.allocator, "\\triangleright", 20, null);
+    var out = try ctx.render("\\triangleright", 20, null);
     defer out.deinit();
     try testing.expect(out.len() > 0);
     try testing.expectApproxEqAbs(@as(f32, 10.00004), out.width, 0.01);

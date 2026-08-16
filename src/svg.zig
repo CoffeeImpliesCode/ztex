@@ -49,7 +49,9 @@ fn fontSpec(style: atom.CharStyle, opts: *const Options) FontSpec {
 }
 
 /// Serialize a draw list to an SVG string. Caller owns the returned bytes.
-pub fn render(gpa: std.mem.Allocator, dl: *const draw.DrawList, opts: Options) ![]u8 {
+/// Fails only on allocation failure (`error.OutOfMemory`) or a non-finite
+/// coordinate (`error.NonFiniteCoordinate`, rejected by checkFinite).
+pub fn render(gpa: std.mem.Allocator, dl: *const draw.DrawList, opts: Options) error{ OutOfMemory, NonFiniteCoordinate }![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
 
@@ -161,11 +163,11 @@ pub fn render(gpa: std.mem.Allocator, dl: *const draw.DrawList, opts: Options) !
     return buf.toOwnedSlice(gpa);
 }
 
-/// Write the SVG for a draw list to `path` (created/truncated).
-pub fn writeFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, dl: *const draw.DrawList, opts: Options) !void {
+/// Write the SVG for a draw list to `path` (created/truncated) inside `dir`.
+pub fn writeFile(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, dl: *const draw.DrawList, opts: Options) !void {
     const svg = try render(gpa, dl, opts);
     defer gpa.free(svg);
-    var file = try std.Io.Dir.createFile(.cwd(), io, path, .{});
+    var file = try std.Io.Dir.createFile(dir, io, path, .{});
     defer file.close(io);
     try file.writeStreamingAll(io, svg);
 }
@@ -189,8 +191,7 @@ fn hexByte(v: u8, out: []u8) void {
 /// Returns null for the valid "no background" values `none`/`transparent`,
 /// a `draw.Color` for a recognized name/hex, and
 /// `error.UnrecognizedColor` for anything else — so callers can tell "no
-/// background" apart from a typo (e.g. `-b blak`). Prefer this over
-/// `parseColor`, which collapses the two cases into null.
+/// background" apart from a typo (e.g. `-b blak`).
 pub fn parseColorChecked(s: []const u8) !?draw.Color {
     if (std.mem.eql(u8, s, "none") or std.mem.eql(u8, s, "transparent")) return null;
     if (s.len > 0 and s[0] == '#') return parseHex(s[1..]) orelse error.UnrecognizedColor;
@@ -211,14 +212,6 @@ pub fn parseColorChecked(s: []const u8) !?draw.Color {
         if (std.mem.eql(u8, s, n.name)) return n.c;
     }
     return error.UnrecognizedColor;
-}
-
-/// Legacy wrapper: same as `parseColorChecked`, but collapses an
-/// unrecognized input to null (no background). Kept so existing callers
-/// compile unchanged; new callers should use `parseColorChecked` so they
-/// can distinguish `none`/`transparent` from a typo.
-pub fn parseColor(s: []const u8) ?draw.Color {
-    return parseColorChecked(s) catch null;
 }
 
 fn parseHex(s: []const u8) ?draw.Color {
@@ -368,17 +361,6 @@ test "svg: pt units and per-style fonts on the svg root and text" {
         "font-style=\"normal\"") != null);
     // \mathbf: bold weight on the text family
     try testing.expect(std.mem.indexOf(u8, svg, "font-weight=\"bold\"") != null);
-}
-
-test "svg: parseColor resolves names and hex" {
-    try testing.expectEqual(@as(draw.Color, .{ .r = 255, .g = 255, .b = 255 }), parseColor("white").?);
-    try testing.expect(parseColor("none") == null);
-    try testing.expect(parseColor("transparent") == null);
-    const c = parseColor("#ff8000").?;
-    try testing.expectEqual(@as(u8, 255), c.r);
-    try testing.expectEqual(@as(u8, 128), c.g);
-    try testing.expectEqual(@as(u8, 0), c.b);
-    try testing.expectEqual(@as(u8, 255), c.a);
 }
 
 test "svg: parseColorChecked tells none/transparent from unrecognized" {

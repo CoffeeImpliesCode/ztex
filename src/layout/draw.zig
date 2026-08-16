@@ -1,12 +1,6 @@
-//! ztex.layout.draw — SVG-style draw model + box→draw flattening.
-//!
-//! The terminal artifact of the pipeline: a flat, painter-ordered list of
-//! primitives (`text` / `rect` / `line`) at absolute coordinates. Backend
-//! neutral — trivially emitted as SVG or consumed by any renderer.
-//!
-//! Every primitive carries the byte span (into the original source) of the box
-//! it came from, so any output drawable maps back to its input text/tokens in
-//! O(1) — the provenance requirement.
+//! ztex.layout.draw — the terminal flat, painter-ordered draw list
+//! (text/rect/line at absolute coordinates) + box→draw flattening. Every
+//! primitive carries the byte span of the box it came from.
 
 const std = @import("std");
 const box = @import("box.zig");
@@ -93,16 +87,38 @@ pub const Line = struct {
 /// `glyph_arena` (which owns every synthetic glyph's bytes) and deinits
 /// them exactly once. `init`/`deinit` must be paired 1:1; after `deinit`
 /// the list is unusable.
+///
+/// Two bound sources, both relative to the root box's reference point
+/// (baseline at y = 0, left edge at x = 0):
+///   - `width`/`height`/`depth` — the BOX bounds: the laid-out root box's
+///     advance and design extents (set by the caller, e.g. layout/root.zig
+///     render from the root box; svg.zig draws the viewBox from these).
+///     Boxes deliberately under-bind the drawn ink (italic overhang, tall
+///     display variants), which is why svg.zig pads them heuristically.
+///   - `bounds()` — the INK bounds accumulated by `flatten`: the exact
+///     vertical ink extents of every drawn glyph (char boxes carry the
+///     drawn glyph's ink as their h/d) and the exact rect areas, with the
+///     horizontal glyph extent taken from the advance box (the ink table
+///     carries only asc/desc, so the true ink left/right edges are not
+///     available).
 pub const DrawList = struct {
     gpa: std.mem.Allocator,
     items: std.ArrayList(Draw) = .empty,
     /// arena for generated glyphs (e.g. big-operator ∑) that have no source
     /// bytes; frees with the draw list
     glyph_arena: std.heap.ArenaAllocator,
-    /// total laid-out bounds (for an SVG viewBox)
+    /// total laid-out BOX bounds (for an SVG viewBox); see the struct doc
     width: f32 = 0,
     height: f32 = 0,
     depth: f32 = 0,
+    /// running ink bbox accumulated by `flatten` (`ink_valid` guards the
+    /// initial union; all zeros for an empty draw list). Internal — read
+    /// through `bounds()`.
+    ink_valid: bool = false,
+    ink_min_x: f32 = 0,
+    ink_min_y: f32 = 0,
+    ink_max_x: f32 = 0,
+    ink_max_y: f32 = 0,
 
     pub fn init(gpa: std.mem.Allocator) DrawList {
         return .{
@@ -124,6 +140,38 @@ pub const DrawList = struct {
     pub fn len(self: *const DrawList) usize {
         return self.items.items.len;
     }
+
+    /// Exact ink bounds of everything `flatten` drew, relative to the root
+    /// reference point: `width` = horizontal ink span, `height` = ink
+    /// ascent above the baseline, `depth` = ink descent below it. All zero
+    /// for an empty draw list. See the struct doc for the box-vs-ink
+    /// semantics (this is the INK bound; `width`/`height`/`depth` are the
+    /// BOX bounds).
+    pub fn bounds(self: *const DrawList) struct { width: f32, height: f32, depth: f32 } {
+        if (!self.ink_valid) return .{ .width = 0, .height = 0, .depth = 0 };
+        return .{
+            .width = self.ink_max_x - self.ink_min_x,
+            .height = -self.ink_min_y,
+            .depth = self.ink_max_y,
+        };
+    }
+
+    /// Union a drawn primitive's extent (x0,y0)-(x1,y1) into the running
+    /// ink bbox. Called by `flatten` for every emitted primitive.
+    fn accInk(self: *DrawList, x0: f32, y0: f32, x1: f32, y1: f32) void {
+        if (!self.ink_valid) {
+            self.ink_valid = true;
+            self.ink_min_x = x0;
+            self.ink_min_y = y0;
+            self.ink_max_x = x1;
+            self.ink_max_y = y1;
+            return;
+        }
+        self.ink_min_x = @min(self.ink_min_x, x0);
+        self.ink_min_y = @min(self.ink_min_y, y0);
+        self.ink_max_x = @max(self.ink_max_x, x1);
+        self.ink_max_y = @max(self.ink_max_y, y1);
+    }
 };
 
 const black: Color = .{ .r = 0, .g = 0, .b = 0 };
@@ -131,7 +179,9 @@ const black: Color = .{ .r = 0, .g = 0, .b = 0 };
 /// Flatten a box tree into a draw list in painter's order.
 ///
 /// `(x, y)` is the box's reference point (baseline). Children are placed at
-/// `(x + cr.x_shift, y + cr.shift)`, computed by layout.
+/// `(x + cr.x_shift, y + cr.shift)`, computed by layout. Every emitted
+/// primitive's extent is also unioned into the list's running ink bbox
+/// (see `DrawList.bounds()`).
 pub fn flatten(
     list: *const box.BoxList,
     root: u32,
@@ -169,6 +219,13 @@ pub fn flatten(
                 .src_start = b.src_start,
                 .src_end = b.src_end,
             } });
+            // Ink extent: vertical from the box h/d — for a char box these
+            // ARE the drawn glyph's ink (layoutChar/layoutText box by
+            // glyphInk × drawn size; display big-ops by their .v1 variant
+            // ink) — horizontal from the advance box (the ink table carries
+            // only asc/desc, so the true ink left/right edges are not
+            // available).
+            out.accInk(x, y - b.height, x + b.width, y + b.depth);
         },
         .rule => {
             try out.add(.{ .rect = .{
@@ -180,6 +237,7 @@ pub fn flatten(
                 .src_start = b.src_start,
                 .src_end = b.src_end,
             } });
+            out.accInk(x, y - b.height, x + b.width, y + b.depth);
         },
         .glue, .strut => {}, // metrics only; nothing to draw
         .hbox, .vbox, .script => {
@@ -322,4 +380,35 @@ test "flatten: strut emits nothing" {
     const st = try list.createLeaf(.strut, 2.0, 3.0, 1.0, .{ .start = 0, .end = 1 });
     try flatten(&list, st, "x", 0, 0, &out);
     try testing.expectEqual(@as(usize, 0), out.len());
+}
+
+test "bounds: flatten accumulates the drawn ink extents" {
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    var out = DrawList.init(testing.allocator);
+    defer out.deinit();
+    const c = try list.createLeaf(.char, 4.0, 3.0, 0.5, .{ .start = 0, .end = 1 });
+    list.charDataPtr(c).cp = 'x';
+    // baseline at y = 0 (the root reference point); ink y ∈ [−3, +0.5]
+    try flatten(&list, c, "x", 10, 0, &out);
+    const b0 = out.bounds();
+    try testing.expectApproxEqAbs(@as(f32, 4), b0.width, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 3), b0.height, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), b0.depth, 0.001);
+    const r = try list.createLeaf(.rule, 2.0, 1.0, 1.0, .{ .start = 0, .end = 1 });
+    try flatten(&list, r, "x", 5, 30, &out);
+    const b1 = out.bounds();
+    // union: x span [5, 14], top at y −3, bottom at y 31
+    try testing.expectApproxEqAbs(@as(f32, 9), b1.width, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 3), b1.height, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 31), b1.depth, 0.001);
+}
+
+test "bounds: empty draw list reports zero" {
+    var out = DrawList.init(testing.allocator);
+    defer out.deinit();
+    const b = out.bounds();
+    try testing.expectEqual(@as(f32, 0), b.width);
+    try testing.expectEqual(@as(f32, 0), b.height);
+    try testing.expectEqual(@as(f32, 0), b.depth);
 }

@@ -46,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
             const v = arg_it.next() orelse return error.MissingValue;
             // parseColorChecked distinguishes the valid "no background"
             // values (none/transparent → null) from a typo, which is a real
-            // CLI error instead of a silent transparent background (H3).
+            // CLI error instead of a silent transparent background.
             bg = ztex.svg.parseColorChecked(v) catch |e| switch (e) {
                 error.UnrecognizedColor => {
                     try std.Io.File.stderr().writeStreamingAll(
@@ -73,22 +73,27 @@ pub fn main(init: std.process.Init) !void {
     defer ctx.deinit();
 
     // A parse failure fills `err_info` (kind + span) before returning its
-    // error value. `ctx.render` returns the TYPED parse.Error (H2), so we
-    // match it exhaustively: every member except OutOfMemory is a parse
-    // front-end error whose Info was filled by lex/parse; OutOfMemory (and
-    // any future non-parse member) propagates and leaves `err_info` unused.
+    // error value. `ctx.render` returns the TYPED facade error set, so we
+    // match it exhaustively: every member except OutOfMemory/InvalidAst is
+    // a parse front-end error whose Info was filled by lex/parse. The two
+    // exceptions are not parse errors — `err_info` stays untouched — so
+    // they propagate as-is.
     var err_info: ztex.parse.Info = undefined;
-    const dl = ctx.render(gpa, src, size, &err_info) catch |e| switch (e) {
+    const dl = ctx.render(src, size, &err_info) catch |e| switch (e) {
         error.OutOfMemory => return e,
+        error.InvalidAst => return e,
         else => {
-            try printParseError(gpa, io, e, err_info, src);
+            // The arms above handle the only non-parse members, so `else`
+            // is always a parse error whose Info was filled by lex/parse;
+            // the cast just narrows the type for printParseError.
+            try printParseError(gpa, io, @errorCast(e), err_info, src);
             std.process.exit(1);
         },
     };
     const opts: ztex.svg.Options = .{ .padding = pad, .background = bg };
 
     if (out_path) |path| {
-        try ztex.svg.writeFile(gpa, init.io, path, &dl, opts);
+        try ztex.svg.writeFile(gpa, init.io, std.Io.Dir.cwd(), path, &dl, opts);
     } else {
         const svg = try ztex.svg.render(gpa, &dl, opts);
         defer gpa.free(svg);
@@ -127,7 +132,7 @@ fn printParseError(
     const line = ztex.parse.err.sourceLine(src, info.span.start);
     try err_file.writeStreamingAll(io, line);
     try err_file.writeStreamingAll(io, "\n");
-    // `lc.col` is a CODEPOINT column (L2), so `pad` and the caret width are
+    // `lc.col` is a CODEPOINT column, so `pad` and the caret width are
     // measured in codepoints too — aligned with how the echoed line renders.
     const pad = lc.col - 1;
     const line_cps = ztex.parse.err.countCodepoints(line);

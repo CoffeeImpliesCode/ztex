@@ -11,34 +11,52 @@ pub const parse = @import("ztex.parse");
 pub const layout = @import("ztex.layout");
 pub const draw = layout.draw;
 pub const svg = @import("ztex.svg");
-pub const context = @import("context.zig");
+// Imported by path, not re-exported: hosts reach the font-backed context
+// through `ztex.Context` below.
+const context = @import("context.zig");
 
 /// Font-backed rendering context: owns a FontContext and a FontMetrics
 /// wired to it — "initialize once, render many" (see context.zig).
 pub const Context = context.Context;
 
-/// Full pipeline: LaTeX source → draw list (SVG-style primitives).
+/// Shared parse+layout pipeline behind both facades. Internal — not part of
+/// the host-facing API: `ztex.render` and `Context.render` are the public
+/// entry points, differing only in the metric source (`&metrics.default`
+/// vs a Context's `.font` arm).
 ///
 /// The returned `DrawList`'s `text` primitives alias `src`, so `src` must
 /// outlive the draw list. `size_pt` is the base font size in points. On a
 /// parse error, `err_info` (when non-null) is filled with the kind + span.
-/// Measures from the bundled static tables (`layout.metrics.default`);
-/// `Context.render` is the same single pipeline measured from the real
-/// fonts (SIM1/H1: one shared layout body, two metric sources).
+/// Errors propagate unmapped: `layout.render`'s closed set (OutOfMemory,
+/// InvalidAst) is a subset of this facade's typed return set, so callers
+/// match the typed set exhaustively instead of re-enumerating errors.
+pub fn renderPipeline(
+    gpa: std.mem.Allocator,
+    fm: *const layout.metrics.FontMetrics,
+    src: []const u8,
+    size_pt: f32,
+    err_info: ?*parse.Info,
+) (parse.Error || error{InvalidAst})!draw.DrawList {
+    var ast = try parse.parse(gpa, src, err_info);
+    defer ast.deinit();
+    // layout.render fails only with OutOfMemory/InvalidAst, both members of
+    // the typed set below, so they propagate unmapped — callers match the
+    // closed facade set exhaustively instead of re-enumerating errors.
+    return layout.render(gpa, &ast, ast.root, fm, size_pt);
+}
+
+/// Full pipeline: LaTeX source → draw list (SVG-style primitives),
+/// measured from the bundled static tables (`layout.metrics.default`).
+/// `Context.render` is the same pipeline measured from the real fonts; both
+/// share the body in `renderPipeline` above. Details on the returned draw
+/// list's lifetime and `err_info` are documented there.
 pub fn render(
     gpa: std.mem.Allocator,
     src: []const u8,
     size_pt: f32,
     err_info: ?*parse.Info,
-) parse.Error!draw.DrawList {
-    var ast = try parse.parse(gpa, src, err_info);
-    defer ast.deinit();
-    // layout.render's set is anyerror but it only ever fails on allocation;
-    // map it onto the closed parse.Error set (OutOfMemory is a member via
-    // std.mem.Allocator.Error) so this facade's return type stays the typed
-    // parse set (H2) — callers match the parse errors exhaustively instead
-    // of re-enumerating them by hand.
-    return layout.render(gpa, &ast, ast.root, &layout.metrics.default, size_pt) catch error.OutOfMemory;
+) (parse.Error || error{InvalidAst})!draw.DrawList {
+    return renderPipeline(gpa, &layout.metrics.default, src, size_pt, err_info);
 }
 
 test {

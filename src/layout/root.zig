@@ -17,17 +17,24 @@ pub const Style = layout.Style;
 ///
 /// `fm` selects the metric source: `&metrics.default` for the bundled static
 /// tables (`ztex.render`), or a Context's font-backed union arm
-/// (`Context.render`) — this is the ONE shared pipeline (SIM1/H1); both
-/// facades call it. The returned `DrawList`'s `text` primitives alias
-/// `ast.src`, so the source (and ast) must outlive the draw list. The box
-/// pool is scratch and freed.
+/// (`Context.render`) — this is the ONE shared pipeline; both facades call
+/// it. The returned `DrawList`'s `text` primitives alias `ast.src`, so the
+/// source (and ast) must outlive the draw list. The box pool is scratch and
+/// freed.
+///
+/// The tree is validated once at this boundary (child counts vs each tag's
+/// expected arity, child indices in bounds, and a tree-shaped
+/// root-reachable subgraph): a malformed hand-built AST returns
+/// `error.InvalidAst` instead of panicking in `Ast.child` or the box
+/// asserts. The only other failure is allocation.
 pub fn render(
     gpa: std.mem.Allocator,
     ast: *const atom.Ast,
     root: u32,
     fm: *const metrics.FontMetrics,
     size_pt: f32,
-) !draw.DrawList {
+) error{ OutOfMemory, InvalidAst }!draw.DrawList {
+    try validateAst(gpa, ast, root);
     var list = box.BoxList.init(gpa);
     defer list.deinit();
     // Pre-reserve a safe over-bound: a single node can emit more boxes than
@@ -53,6 +60,68 @@ pub fn render(
     return out;
 }
 
+/// Whether a node's child count matches its tag's expected arity, per the
+/// atom.zig layout docs: fixed-arity tags (group/styled/mathstyle/opname/
+/// overline = 1, char/space/text/op = 0, fraction = 2, mathchoice = 4),
+/// bounded ranges (left = 1..3, substack/env = 1+), and the script node,
+/// whose children are [base, sup?, sub?] — one slot per ScriptBits presence
+/// bit. `row` accepts any count (including 0 — an empty line).
+fn arityOk(tag: atom.Tag, n: atom.Node) bool {
+    return switch (tag) {
+        .row => true,
+        .group, .styled, .mathstyle, .opname, .overline => n.num_children == 1,
+        .char, .space, .text, .op => n.num_children == 0,
+        .script => n.num_children ==
+            1 +
+                @as(u16, @intFromBool(n.data & atom.ScriptBits.sup != 0)) +
+                @as(u16, @intFromBool(n.data & atom.ScriptBits.sub != 0)),
+        .fraction => n.num_children == 2,
+        .left => n.num_children >= 1 and n.num_children <= 3,
+        .mathchoice => n.num_children == 4,
+        .substack, .env => n.num_children >= 1,
+    };
+}
+
+/// Validate the root-reachable subtree ONCE at the layout boundary: every
+/// node's child count must match its tag's arity, every child index must be
+/// in bounds, and the reachable subgraph must be a TREE — a repeated visit
+/// means a cycle or a shared child, either of which the recursive layout
+/// would mis-lay-out (a cycle would recurse forever). The walk is iterative
+/// (worklist), so a pathological tree cannot overflow the validator's own
+/// stack. On any violation returns `error.InvalidAst`; the `Ast.child`
+/// @panic and BoxList asserts stay as internal invariant checks that a
+/// validated tree never trips.
+fn validateAst(
+    gpa: std.mem.Allocator,
+    ast: *const atom.Ast,
+    root: u32,
+) error{ OutOfMemory, InvalidAst }!void {
+    if (root >= ast.nodes.items.len) return error.InvalidAst;
+    const seen = try gpa.alloc(bool, ast.nodes.items.len);
+    defer gpa.free(seen);
+    @memset(seen, false);
+    seen[root] = true;
+    var worklist: std.ArrayList(u32) = .empty;
+    defer worklist.deinit(gpa);
+    try worklist.append(gpa, root);
+    while (worklist.pop()) |idx| {
+        const n = ast.nodes.items[idx];
+        if (!arityOk(n.tag, n)) return error.InvalidAst;
+        if (n.num_children == 0) continue;
+        // first_child + num_children must not overflow u32 (a hand-built
+        // node could set first_child near maxInt).
+        if (n.first_child > std.math.maxInt(u32) - @as(u32, n.num_children)) return error.InvalidAst;
+        const end = n.first_child + n.num_children;
+        var c = n.first_child;
+        while (c < end) : (c += 1) {
+            if (c >= ast.nodes.items.len) return error.InvalidAst;
+            if (seen[c]) return error.InvalidAst;
+            seen[c] = true;
+            try worklist.append(gpa, c);
+        }
+    }
+}
+
 // ── tests ────────────────────────────────
 
 const testing = std.testing;
@@ -71,4 +140,53 @@ test "render: a single char yields one text primitive" {
     try testing.expectEqual(@as(usize, 1), out.len());
     try testing.expectEqualStrings("𝑥", out.items.items[0].text.bytes);
     try testing.expectEqual(@as(f32, 20), out.items.items[0].text.size);
+}
+
+test "render: wrong arity returns error.InvalidAst, not a panic" {
+    var ast = atom.Ast.init(testing.allocator, "x");
+    defer ast.deinit();
+    try ast.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
+    _ = try ast.createNode(.group, 0, 1, &.{}, 0); // a group with 0 children
+    try testing.expectError(
+        error.InvalidAst,
+        render(testing.allocator, &ast, 0, &metrics.default, 20),
+    );
+}
+
+test "render: out-of-bounds child index returns error.InvalidAst" {
+    var ast = atom.Ast.init(testing.allocator, "x");
+    defer ast.deinit();
+    try ast.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
+    // a row whose single child points past the pool end
+    _ = try ast.pushNode(.{
+        .tag = .row,
+        .first_token = 0,
+        .num_tokens = 1,
+        .first_child = 7,
+        .num_children = 1,
+        .data = 0,
+    });
+    try testing.expectError(
+        error.InvalidAst,
+        render(testing.allocator, &ast, 0, &metrics.default, 20),
+    );
+}
+
+test "render: a cyclic tree returns error.InvalidAst" {
+    var ast = atom.Ast.init(testing.allocator, "x");
+    defer ast.deinit();
+    try ast.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
+    // a row that is its own child (self-loop)
+    _ = try ast.pushNode(.{
+        .tag = .row,
+        .first_token = 0,
+        .num_tokens = 1,
+        .first_child = 0,
+        .num_children = 1,
+        .data = 0,
+    });
+    try testing.expectError(
+        error.InvalidAst,
+        render(testing.allocator, &ast, 0, &metrics.default, 20),
+    );
 }

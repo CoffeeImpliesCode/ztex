@@ -15,7 +15,7 @@
 //! Only the embedded fonts are used; disk font loading was removed (it was
 //! a parse-and-discard no-op — loaded fonts were never read by the metric
 //! or SVG path). context.zig — the sole importer — feeds the context to
-//! layout/metrics through the closed `FontMetrics` union (SIM2).
+//! layout/metrics through the closed `FontMetrics` union.
 //!
 //! All values returned in "em" units are font-relative (value ÷ unitsPerEm),
 //! so callers multiply by the desired size in points. Every number asserted
@@ -265,54 +265,54 @@ pub const FontFace = struct {
     }
 
     /// Font design size in font units per em (head.unitsPerEm).
-    pub fn unitsPerEm(self: *const FontFace) u16 {
+    fn unitsPerEm(self: *const FontFace) u16 {
         return self.units_per_em;
     }
 
     /// Nominal ascent, em units (hhea.ascent ÷ upem).
-    pub fn ascenderEm(self: *const FontFace) f32 {
+    fn ascenderEm(self: *const FontFace) f32 {
         const upem: f32 = @floatFromInt(self.units_per_em);
         return @as(f32, @floatFromInt(self.hhea_ascender)) / upem;
     }
 
     /// Nominal descent, em units, positive (-hhea.descent ÷ upem).
-    pub fn descenderEm(self: *const FontFace) f32 {
+    fn descenderEm(self: *const FontFace) f32 {
         const upem: f32 = @floatFromInt(self.units_per_em);
         return @as(f32, @floatFromInt(-self.hhea_descender)) / upem;
     }
 
     /// Nominal line gap, em units (hhea.lineGap ÷ upem).
-    pub fn lineGapEm(self: *const FontFace) f32 {
+    fn lineGapEm(self: *const FontFace) f32 {
         const upem: f32 = @floatFromInt(self.units_per_em);
         return @as(f32, @floatFromInt(self.hhea_line_gap)) / upem;
     }
 
     /// OS/2 sTypoAscender, em units.
-    pub fn typoAscenderEm(self: *const FontFace) f32 {
+    fn typoAscenderEm(self: *const FontFace) f32 {
         const upem: f32 = @floatFromInt(self.units_per_em);
         return @as(f32, @floatFromInt(self.os2_typo_ascender)) / upem;
     }
 
     /// OS/2 sTypoDescender, em units, positive.
-    pub fn typoDescenderEm(self: *const FontFace) f32 {
+    fn typoDescenderEm(self: *const FontFace) f32 {
         const upem: f32 = @floatFromInt(self.units_per_em);
         return @as(f32, @floatFromInt(-self.os2_typo_descender)) / upem;
     }
 
     /// OS/2 sTypoLineGap, em units.
-    pub fn typoLineGapEm(self: *const FontFace) f32 {
+    fn typoLineGapEm(self: *const FontFace) f32 {
         const upem: f32 = @floatFromInt(self.units_per_em);
         return @as(f32, @floatFromInt(self.os2_typo_line_gap)) / upem;
     }
 
     /// OS/2 usWinAscent (clipping extent), em units.
-    pub fn winAscentEm(self: *const FontFace) f32 {
+    fn winAscentEm(self: *const FontFace) f32 {
         const upem: f32 = @floatFromInt(self.units_per_em);
         return @as(f32, @floatFromInt(self.os2_win_ascent)) / upem;
     }
 
     /// OS/2 usWinDescent (clipping extent), em units.
-    pub fn winDescentEm(self: *const FontFace) f32 {
+    fn winDescentEm(self: *const FontFace) f32 {
         const upem: f32 = @floatFromInt(self.units_per_em);
         return @as(f32, @floatFromInt(self.os2_win_descent)) / upem;
     }
@@ -335,7 +335,7 @@ pub const FontFace = struct {
     /// The cmap-validation primitive for the math-italic mapping: a mapped
     /// Mathematical-Alphanumeric-Symbols codepoint (U+1D4xx/U+1D6xx) is
     /// only emitted when the font actually carries the glyph.
-    pub fn hasGlyph(self: *const FontFace, cp: u21) bool {
+    fn hasGlyph(self: *const FontFace, cp: u21) bool {
         return self.glyphIndex(cp) != null;
     }
 

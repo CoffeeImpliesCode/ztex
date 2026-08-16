@@ -28,6 +28,11 @@ pub const Error = std.mem.Allocator.Error || error{
     MismatchedEnd,
     /// \begin{...} never closed by \end{...} (or \end missing its name).
     UnclosedEnvironment,
+    /// The parse nested deeper than `max_nesting`. A few-KB input of nested
+    /// braces/fractions is ~1 level per byte and would overflow the C stack;
+    /// Zig cannot catch a stack overflow, so without this guard the host
+    /// process would die. See `max_nesting`.
+    NestingTooDeep,
 };
 
 /// Opcode for each supported command name; `cmd_map` returns one of these and
@@ -652,6 +657,15 @@ const not_cp_map = [_]struct { cp: u21, neg: u21 }{
     .{ .cp = 0x2AB0, .neg = 0x22E1 }, // ⪰ → ⋡ \nsucceq
 };
 
+/// Maximum parse-nesting depth, counted as active `parseRow` frames.
+/// parseRow/parseGroup/parseCommand/parseDelimiter recurse mutually at
+/// ~4 frames per nesting level, so 500 levels ≈ 2K frames — comfortably
+/// inside the default stack — while still admitting any realistic formula.
+/// Deeper input fails with `error.NestingTooDeep` instead of overflowing
+/// the stack (Zig cannot catch a stack overflow, so the host process
+/// would otherwise die).
+pub const max_nesting: u32 = 500;
+
 /// Recursive-descent parser over a flat token table.
 pub const Parser = struct {
     gpa: std.mem.Allocator,
@@ -662,6 +676,13 @@ pub const Parser = struct {
     /// .delimited mode): \middle is only valid there (TeX). parseLeftRight
     /// increments before the interior and decrements after.
     delim_depth: u32 = 0,
+    /// Current parse-nesting depth: the number of active parseRow frames.
+    /// parseRow is the common recursion point of every mutually-recursive
+    /// path (groups, fractions, \left..\right, environments, style
+    /// switches, substacks), so counting it there bounds them all. When the
+    /// depth exceeds `max_nesting` the parse fails with NestingTooDeep
+    /// instead of overflowing the stack (C1).
+    depth: u32 = 0,
     /// Caller-provided parse-error context: filled (when non-null) with the
     /// kind + offending span immediately before any error is returned.
     err_info: ?*parse_err.Info = null,
@@ -700,8 +721,8 @@ pub const Parser = struct {
     /// Every error-return site goes through here, so the error VALUES are
     /// unchanged (`expectError` still sees error.Xxx) and the Info is always
     /// filled before the caller's `catch` observes the failure. This switch
-    /// is the parser's kind→error mapping (the lexer's two kinds never
-    /// reach the parser — `fail` is only called with the 11 parser kinds).
+    /// is the parser's kind→error mapping (the lexer's kinds never reach
+    /// the parser — `fail` is only called with the parser kinds).
     fn fail(self: *Parser, kind: parse_err.Kind, span: atom.Span) Error {
         self.setErr(kind, span);
         return switch (kind) {
@@ -716,10 +737,15 @@ pub const Parser = struct {
             .unknown_environment => error.UnknownEnvironment,
             .mismatched_end => error.MismatchedEnd,
             .unclosed_environment => error.UnclosedEnvironment,
-            // lexer-only kinds: never reach the parser (the size gate runs
-            // in parse.parse before lexing, and `fail` is only called with
-            // the parser kinds).
-            .dangling_escape, .invalid_utf8, .source_too_large => unreachable,
+            .nesting_too_deep => error.NestingTooDeep,
+            // The lexer-only kinds have no parser error values (they are
+            // returned directly by lex()/parse() at their own sites), so a
+            // call here is a programming error. Abort loudly in EVERY build
+            // mode: `unreachable` is undefined behavior in ReleaseFast and
+            // could corrupt the process instead of failing (M7).
+            .dangling_escape, .invalid_utf8, .source_too_large => @panic(
+                "parse.parser.fail: lexer-only kind routed to the parser",
+            ),
         };
     }
 
@@ -777,6 +803,15 @@ pub const Parser = struct {
     /// returned as a fraction node (TeX: `{a \atop b}`). A second delimiter
     /// is ambiguous (TeX: "you need another { and }") and errors.
     fn parseRow(self: *Parser, ast: *atom.Ast, mode: RowMode) Error!u32 {
+        self.depth += 1;
+        defer self.depth -= 1;
+        // Nesting guard (C1): every recursive path (parseGroup, fractions'
+        // required args, \left..\right, environments, style switches,
+        // substacks) re-enters parseRow, so this counts the whole mutual
+        // recursion. Beyond `max_nesting` the input is pathological — a
+        // few-KB source of nested braces is ~1 level per byte, and without
+        // the cap it would overflow the C stack (uncatchable in Zig).
+        if (self.depth > max_nesting) return self.fail(.nesting_too_deep, self.curSpan());
         const start_tok: u32 = @intCast(self.pos);
         var last_tok: u32 = start_tok;
         // Collect each child's node value, then copy the whole run

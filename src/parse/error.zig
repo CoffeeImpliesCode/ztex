@@ -31,6 +31,7 @@ pub const Kind = enum {
     mismatched_end,
     unclosed_environment,
     source_too_large,
+    nesting_too_deep,
 };
 
 /// Parse-error context filled by `lex`/`parse` when the caller passes a
@@ -59,14 +60,14 @@ pub const Info = struct {
             .mismatched_end => "Mismatched \\end",
             .unclosed_environment => "Unclosed environment",
             .source_too_large => "Source too large",
+            .nesting_too_deep => "Nesting too deep",
         };
     }
 };
 
-/// Number of codepoints in a UTF-8 byte slice. Counts every LEADING byte of
-/// a sequence (continuation bytes 0b10xxxxxx are not new codepoints), so it
-/// is exact for well-formed input and still yields a sane value on a prefix
-/// truncated mid-codepoint.
+/// Counts every LEADING byte of a sequence (continuation bytes 0b10xxxxxx
+/// are not new codepoints), so it is exact for well-formed input and still
+/// yields a sane value on a prefix truncated mid-codepoint.
 pub fn countCodepoints(s: []const u8) usize {
     var n: usize = 0;
     for (s) |b| {
@@ -75,10 +76,9 @@ pub fn countCodepoints(s: []const u8) usize {
     return n;
 }
 
-/// 1-based (line, column) of byte `offset` in `src`. The column counts
-/// CODEPOINTS from the line start (not bytes), so a caret aligned by `col`
-/// sits under the right visual character even when a multi-byte char
-/// precedes the error (L2).
+/// The column counts CODEPOINTS from the line start (not bytes), so a caret
+/// aligned by `col` sits under the right visual character even when a
+/// multi-byte char precedes the error.
 pub fn lineCol(src: []const u8, offset: usize) struct { line: usize, col: usize } {
     const o = @min(offset, src.len);
     var line: usize = 1;
@@ -92,8 +92,8 @@ pub fn lineCol(src: []const u8, offset: usize) struct { line: usize, col: usize 
     return .{ .line = line, .col = countCodepoints(src[line_start..o]) + 1 };
 }
 
-/// The source line containing byte `offset`, with a trailing `\r` trimmed
-/// (so a CRLF-terminated line prints clean). Empty source yields "".
+/// With a trailing `\r` trimmed (so a CRLF-terminated line prints clean).
+/// Empty source yields "".
 pub fn sourceLine(src: []const u8, offset: usize) []const u8 {
     const o = @min(offset, src.len);
     var start = o;

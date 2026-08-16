@@ -13,12 +13,6 @@
 const std = @import("std");
 
 // ── lexical tokens (folded in from the former token.zig) ────────────
-//
-// Provenance design (house superflat pattern, cf. `~/projects/{vain,skript}`):
-// the lexer pre-tokenizes the whole source into a flat token table. Every
-// token carries a byte span into the original source. Atoms reference token
-// ranges; boxes and drawables carry resolved byte spans. So any output
-// drawable maps back to its input text in O(1).
 
 /// Lexical token kind.
 pub const TokenTag = enum(u8) {
@@ -420,19 +414,19 @@ pub const Ast = struct {
         try self.nodes.ensureTotalCapacity(self.gpa, node_count);
     }
 
-    /// Append a token; returns nothing (caller tracks indices via items.len).
+    /// Append a token; the caller tracks indices via items.len.
     pub fn pushToken(self: *Ast, t: Token) !void {
         try self.tokens.append(self.gpa, t);
     }
 
-    /// Append a single node; returns its index.
+    /// Append one node; returns its index.
     pub fn pushNode(self: *Ast, n: Node) !u32 {
         const idx: u32 = @intCast(self.nodes.items.len);
         try self.nodes.append(self.gpa, n);
         return idx;
     }
 
-    /// Append a contiguous run of nodes; returns the index of the first.
+    /// Append a contiguous run of nodes; returns the first index.
     pub fn pushNodes(self: *Ast, ns: []const Node) !u32 {
         const first: u32 = @intCast(self.nodes.items.len);
         try self.nodes.appendSlice(self.gpa, ns);

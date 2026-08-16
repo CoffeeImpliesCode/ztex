@@ -889,13 +889,16 @@ fn layoutNot(
     else
         char_x + anchor_w / 2 + 0.264 * size_pt;
 
-    // Vertical: raise the slash baseline by max(0.25em, h − 0.20em), where
-    // 0.25em = the slash's ink desc (= the LM Math axis height) and 0.20em
-    // = AccentBaseHeight − axis (0.45 − 0.25) — XeTeX's overlay vlist
-    // [accent, kern −min(h, 0.45em), base], measured above. The 0.25/0.20
-    // em fractions enter as 10pt-base metrics (2.5pt / 2.0pt), scaled by
-    // s() like every other em parameter in this file.
-    const raise = @max(s(2.5, size_pt), anchor_h - s(2.0, size_pt));
+    // Vertical: raise the slash baseline by max(axis, h − (AccentBaseHeight
+    // − axis)), where the axis is the slash's ink desc (= the LM Math axis
+    // height, 0.25em) and AccentBaseHeight = 0.45em — XeTeX's overlay
+    // vlist [accent, kern −min(h, 0.45em), base], measured above. Both
+    // fractions enter as 10pt-base metrics routed through gl.axis_height
+    // (2.5pt / 4.5−2.5 = 2.0pt), scaled by s() like every other em
+    // parameter in this file.
+    const gl = metrics.glue(fm);
+    const axis = s(gl.axis_height, size_pt);
+    const raise = @max(axis, anchor_h - s(4.5 - gl.axis_height, size_pt));
 
     const saved_len = list.scratch.items.len;
     defer list.scratch.items.len = saved_len;
@@ -1168,7 +1171,7 @@ fn layoutRow(
         // italic correction to the advance before the next atom (TeXbook
         // p.170; measured post-∫ advance 16.15pt = box + ic + thin — ztex
         // was 6.65pt short).
-        x += opTailIc(ast, child_idx, fm, style, size_pt);
+        x += opTailIc(ast, child_idx, style, size_pt);
         height = @max(height, cb.height - op_shift);
         depth = @max(depth, cb.depth + op_shift);
         prev_role = if (child_atom.tag == .char) role else rightRole(ast, child_idx);
@@ -2591,11 +2594,11 @@ fn layoutSqrt(
     var height = rule_top;
     var width = radicand_x + rb.width;
     if (degree) |d| {
-        // Root index at 0.5×size (XeTeX measured), bottom raised to
-        // rule_top − 0.4·rad_ink_height (RadicalDegreeBottomRaisePercent =
-        // 60 of the radical's ink height), left edge 0.278·deg_size right
+        // Root index at scriptscript size (XeTeX measured), bottom raised
+        // to rule_top − 0.4·rad_ink_height (RadicalDegreeBottomRaisePercent
+        // = 60 of the radical's ink height), left edge 0.278·deg_size right
         // of the bar.
-        const deg_size = 0.5 * size_pt;
+        const deg_size = size_pt * gl.scriptscriptfactor;
         const db = try layoutInner(list, ast, d, fm, .script_script, deg_size, cstyle, true);
         const gb = list.get(db);
         const deg_x = 0.073 * rad_ink_height + 0.278 * deg_size;
@@ -2635,11 +2638,9 @@ fn layoutSqrt(
 fn opTailIc(
     ast: *const atom.Ast,
     idx: u32,
-    fm: *const metrics.FontMetrics,
     style: Style,
     size_pt: f32,
 ) f32 {
-    _ = fm;
     const n = ast.node(idx);
     if (n.tag == .op) {
         if (style != .display) return 0;
@@ -2830,11 +2831,11 @@ fn layoutScript(
     // confirm the same drops (6.301 = 8.051 − 1.75, 5.749 = 7.501 − 1.75).
     // SuperscriptBaselineDropMax 0.25em / SubscriptBaselineDropMin 0.20em,
     // evaluated at the script size (× 0.7), so the 10pt-base values are
-    // 1.75/1.40 and they scale with size_pt like the other em-relative
-    // parameters. The old constants 2.4722/0.5 (cmsy7 supdrop/subdrop)
-    // left the ∫ scripts ~1.2pt too tight at 10pt.
-    const supdrop = s(1.75, size_pt);
-    const subdrop = s(1.4, size_pt);
+    // gl.supdrop/gl.subdrop (1.75/1.40) and they scale with size_pt like
+    // the other em-relative parameters. The old constants 2.4722/0.5
+    // (cmsy7 supdrop/subdrop) left the ∫ scripts ~1.2pt too tight at 10pt.
+    const supdrop = s(gl.supdrop, size_pt);
+    const subdrop = s(gl.subdrop, size_pt);
     const sym = symFor(style);
 
     // Superscript raise: max(shift_up0, sup1|sup2|sup3, sup.depth +
@@ -3003,7 +3004,12 @@ fn layoutOpLimits(
     const variant = bcd.bigop_form == .variant;
     const delta = if (variant)
         s(bcd.disp_ic, size_pt)
-    else if (metrics.displayOp(bcd.cp)) |dop| s(dop.ic, size_pt) else 0;
+    else if (bigOpByCp(bcd.cp)) |op|
+        // Text/script ops: the BASE glyph's italic correction (∫/∮ 3.32 —
+        // bigOpInk is the single source for every big-op advance/ic).
+        s(bigOpInk(op, false).ic, size_pt)
+    else
+        0;
 
     // A big-operator GLYPH is centered on the axis (MicroTeX
     // SymbolAtom::createBox big-op branch: y-down shift = (h−d)/2 − axis; the
@@ -3100,6 +3106,22 @@ fn bigOpCodepoint(op: atom.BigOp) u21 {
         .bigcap => 0x22C2, // ⋂
         .bigsqcup => 0x2A06, // ⨆
         .oint => 0x222E, // ∮
+    };
+}
+
+/// The big-operator enum for a big-op codepoint (the inverse of
+/// `bigOpCodepoint`); null for any other glyph.
+fn bigOpByCp(cp: u21) ?atom.BigOp {
+    return switch (cp) {
+        0x2211 => .sum,
+        0x222B => .int,
+        0x220F => .prod,
+        0x2210 => .coprod,
+        0x22C3 => .bigcup,
+        0x22C2 => .bigcap,
+        0x2A06 => .bigsqcup,
+        0x222E => .oint,
+        else => null,
     };
 }
 
@@ -3487,9 +3509,15 @@ fn layoutFraction(
     const rt = if (thick > 0) thick else s(gl.rule_thickness, eff_size);
 
     // Numerator and denominator are set one style level down (MicroTeX
-    // FractionAtom::createBox → env.numStyle()/dnomStyle()): display → text,
-    // text → script, script/scriptscript → scriptscript. \cfrac instead
-    // sets BOTH parts in display style.
+    // FractionAtom::createBox → env.numStyle()/dnomStyle(); tex.web
+    // num_style/denom_style): display → text, text → script,
+    // script/scriptscript → scriptscript. \cfrac instead sets BOTH parts
+    // in display style. The NUMERATOR inherits the cramped bit (num_style:
+    // cramped iff the current style is cramped); the DENOMINATOR is always
+    // cramped (denom_style: smaller + cramped) — verified: display
+    // \frac{x^2}{y^2} raises the numerator sup by sup2 (3.62892) but the
+    // denominator sup by sup3 (2.88889). \cfrac's parts are explicit
+    // \displaystyle fields (amsmath), so BOTH are uncramped.
     const part_style: Style = if (parts_display)
         .display
     else if (eff_style == .display) .text else if (eff_style == .text) .script else .script_script;
@@ -3499,14 +3527,6 @@ fn layoutFraction(
         .script_script => gl.scriptscriptfactor,
     };
     const part_size = eff_size * part_scale;
-
-    // Numerator and denominator are set one style level down (tex.web
-    // num_style/denom_style). The NUMERATOR inherits the cramped bit
-    // (num_style: cramped iff the current style is cramped); the
-    // DENOMINATOR is always cramped (denom_style: smaller + cramped) —
-    // verified: display \frac{x^2}{y^2} raises the numerator sup by sup2
-    // (3.62892) but the denominator sup by sup3 (2.88889). \cfrac's parts
-    // are explicit \displaystyle fields (amsmath), so BOTH are uncramped.
     const part_cramped = !parts_display;
     const num = try layoutInner(
         list,
@@ -3815,7 +3835,7 @@ fn layoutText(
             } else {
                 // A combining mark: zero width (the font's marks are
                 // zero-advance by design), boxed by its own ink.
-                try textEmitMark(list, fm, tstyle, size_pt, d.code, cstart, cend, &x, &height, &depth);
+                try textEmitMark(list, tstyle, size_pt, d.code, cstart, cend, &x, &height, &depth);
             }
             first = false;
         }
@@ -4179,7 +4199,6 @@ fn textEmitChar(
 /// advance, so the box is a zero-width char at the base's position.
 fn textEmitMark(
     list: *box.BoxList,
-    fm: *const metrics.FontMetrics,
     tstyle: atom.CharStyle,
     size_pt: f32,
     cp: u21,
@@ -4189,7 +4208,6 @@ fn textEmitMark(
     height: *f32,
     depth: *f32,
 ) !void {
-    _ = fm;
     const ink = metrics.glyphInk(cp);
     const cbox = try list.create(
         .char,
@@ -4256,7 +4274,7 @@ fn textEmitAccented(
     // would be worse than no accent).
     if (mark != 0 and mark != 0x0327 and mark != 0x0361) {
         try textEmitChar(list, src, fm, tstyle, size_pt, base, gs, ge, x, height, depth);
-        try textEmitMark(list, fm, tstyle, size_pt, mark, gs, ge, x, height, depth);
+        try textEmitMark(list, tstyle, size_pt, mark, gs, ge, x, height, depth);
         return;
     }
     try textEmitChar(list, src, fm, tstyle, size_pt, base, gs, ge, x, height, depth);

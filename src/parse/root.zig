@@ -28,10 +28,14 @@ pub const Error = lexer.Error || parser.Error || error{
 /// Hard upper bound on `src.len`. `Span` (token.zig) stores byte offsets as
 /// u32, and the lexer's `emit` casts its usize positions with `@intCast`; a
 /// source longer than `maxInt(u32)` bytes would overflow that cast (a
-/// safe-mode panic / a ReleaseFast truncation). We reject such sources up
-/// front with `error.SourceTooLarge` instead. Realistic math input is orders
-/// of magnitude smaller; the bound only guards the degenerate case.
-pub const max_source_bytes: usize = std.math.maxInt(u32);
+/// safe-mode panic / a ReleaseFast truncation). The bound is HALF of that
+/// because the node pool grows to ~2× the token count on nested/scripted
+/// input, and `pushNode` (atom.zig) casts `nodes.items.len` to u32 the same
+/// way — a source near `maxInt(u32)` could push the pool past the cast
+/// (H2). We reject such sources up front with `error.SourceTooLarge`
+/// instead. Realistic math input is orders of magnitude smaller; the bound
+/// only guards the degenerate case.
+pub const max_source_bytes: usize = std.math.maxInt(u32) / 2;
 
 /// True when a source of `len` bytes is too long for u32 byte offsets.
 /// Factored out so the boundary is unit-testable without a multi-GiB
@@ -79,10 +83,12 @@ test {
     testing.refAllDecls(@This());
 }
 
-test "parse: sourceTooLong boundary is maxInt(u32)" {
-    // Constructing a real >4 GiB source is impractical, so the check is
+test "parse: sourceTooLong boundary is maxInt(u32)/2" {
+    // Constructing a real >2 GiB source is impractical, so the check is
     // factored into `sourceTooLong` and tested at the boundary directly.
-    try testing.expectEqual(max_source_bytes, std.math.maxInt(u32));
+    // maxInt(u32)/2: the node pool grows to ~2× the token count and
+    // pushNode casts nodes.len to u32 (atom.zig) — see max_source_bytes.
+    try testing.expectEqual(max_source_bytes, std.math.maxInt(u32) / 2);
     try testing.expect(!sourceTooLong(max_source_bytes)); // last representable
     try testing.expect(sourceTooLong(max_source_bytes + 1)); // first overflow
     try testing.expect(sourceTooLong(std.math.maxInt(usize)));
@@ -221,4 +227,75 @@ test "parse: thin space command" {
     const sp = ast.node(ast.child(ast.root, 0));
     try testing.expectEqual(.space, sp.tag);
     try testing.expectApproxEqAbs(@as(f32, 0.166), atom.fixedToEm(sp.data), 0.001);
+}
+
+/// Build `"{{…{x}…}}"` with `n` nested groups.
+fn nestedBraces(n: usize, buf: []u8) []const u8 {
+    @memset(buf[0..n], '{');
+    buf[n] = 'x';
+    @memset(buf[n + 1 .. 2 * n + 1], '}');
+    return buf[0 .. 2 * n + 1];
+}
+
+test "parse: deeply nested input returns NestingTooDeep, not a crash" {
+    // 5000 nested groups ≈ 1 nesting level per byte; without the depth
+    // guard (C1) this would overflow the C stack, which Zig cannot catch.
+    // The guard trips at max_nesting and unwinds cleanly.
+    var buf: [5000 * 2 + 1]u8 = undefined;
+    const src = nestedBraces(5000, &buf);
+    var err_info: Info = undefined;
+    try testing.expectError(
+        error.NestingTooDeep,
+        parse(testing.allocator, src, &err_info),
+    );
+    const info = err_info;
+    try testing.expectEqual(Kind.nesting_too_deep, info.kind);
+    try testing.expectEqualStrings("Nesting too deep", info.message());
+    // the span points at the opening brace that pushed past the bound
+    // (depth max_nesting + 1 → token index max_nesting)
+    try testing.expectEqual(@as(u32, parser.max_nesting), info.span.start);
+    try testing.expectEqual(@as(u32, parser.max_nesting + 1), info.span.end);
+}
+
+test "parse: nesting boundary is max_nesting" {
+    // `n` nested groups need `n + 1` active parseRow frames (the top-level
+    // row plus one per group), so max_nesting − 1 groups parse (depth
+    // reaches exactly max_nesting) and max_nesting groups trip the guard —
+    // the depth limit must not change normal inputs.
+    var ok_buf: [(parser.max_nesting - 1) * 2 + 1]u8 = undefined;
+    const ok_src = nestedBraces(parser.max_nesting - 1, &ok_buf);
+    var ast = try parse(testing.allocator, ok_src, null);
+    defer ast.deinit();
+    try testing.expectEqual(.group, ast.node(ast.child(ast.root, 0)).tag);
+
+    var over_buf: [parser.max_nesting * 2 + 1]u8 = undefined;
+    const over_src = nestedBraces(parser.max_nesting, &over_buf);
+    try testing.expectError(
+        error.NestingTooDeep,
+        parse(testing.allocator, over_src, null),
+    );
+}
+
+test "parse: nested fractions still parse at reasonable depth" {
+    // The mutual parseRow/parseGroup/parseCommand recursion through
+    // \frac args must be unaffected by the depth guard at sane nesting.
+    // 20 levels: \frac{\frac{...\frac{1}{1}...}{1}}{1} (120 + 1 + 60 = 181
+    // bytes, comfortably inside buf).
+    const open: []const u8 = "\\frac{";
+    const close: []const u8 = "}{1}";
+    var buf: [256]u8 = undefined;
+    var len: usize = 0;
+    for (0..20) |_| {
+        @memcpy(buf[len .. len + open.len], open);
+        len += open.len;
+    }
+    buf[len] = '1';
+    len += 1;
+    for (0..20) |_| {
+        @memcpy(buf[len .. len + close.len], close);
+        len += close.len;
+    }
+    var ast = try parse(testing.allocator, buf[0..len], null);
+    defer ast.deinit();
+    try testing.expectEqual(.fraction, ast.node(ast.child(ast.root, 0)).tag);
 }
