@@ -2542,123 +2542,148 @@ fn layoutSqrt(
     const H = rb.height;
     const D = rb.depth;
 
-    // MATH vertical radical construction (VertGlyphConstruction): assemble
-    // the √ from top/extender/bottom pieces with constant stroke, matching
-    // XeTeX+unicode-math+KaTeX. Pre-built variants (radical.v1..v4) give a
-    // different shape; the assembly pieces produce XeTeX's actual rendering.
-    const target_em = (H + D + clr + rt) / size_pt;
-    // Assembly height with N extenders: top.asc + N*ext.asc + bot.asc − (N+1)*overlap.
-    // For N=0: top.asc + bot.asc − overlap = 2.120em. We need N such that
-    // assembly_height ≥ target_em.
-    const overlap_em = 0.320;
-    const n_ext: usize = blk: {
-        // assembly_height(N) = top.asc + bot.asc − overlap + N*(ext.asc)
-        //   = (top.asc + bot.asc − overlap) + N*ext.asc
-        const base = metrics.radical_top_piece.ink_asc + metrics.radical_bot_piece.ink_asc - overlap_em;
-        if (target_em <= base) break :blk 0;
-        break :blk @intFromFloat(@ceil((target_em - base) / metrics.radical_ext_piece.ink_asc));
-    };
-    const rad_ink_height = metrics.radicalAssemblyHeight(n_ext) * size_pt;
+    // Height gate: only assemble (top + N*ext + bot pieces) when the required
+    // radical ink height EXCEEDS the LARGEST pre-built MATH variant's
+    // AdvanceMeasurement (radical.v4, 3.001em). Below this threshold XeTeX
+    // selects the smallest variant covering the radicand (radical.v0–v4) — a
+    // single ⟨text⟩ char at the base math size with the variant's ink
+    // extents. Pre-built variants give the "classic" look; the assembly is
+    // only needed for genuinely tall stacks beyond what .v4 covers.
+    const largest_variant_em: f32 = 3.001;
+    const req_em = (H + D + clr + rt) / size_pt;
+    const vi = metrics.radicalVariant(req_em);
+    const use_assembly = req_em > largest_variant_em;
 
-    // TeX make_radical's clearance adjustment — same formula, using the
-    // assembly's total ink extent (total = top.asc + N*ext.asc + bot.asc −
-    // (N+1)*0.320 in em). The delta and clr2 float the vinculum clear of the
-    // radicand exactly as before.
-    const delta = @max(0.0, (rad_ink_height - rt) - (H + D + clr));
-    const clr2 = clr + delta / 2;
-    const rule_top = H + clr2 + rt;
-    const hbox_depth = @max(D, rad_ink_height - rule_top);
-
-    // Create assembly piece char boxes. Pieces are stacked TOP→BOTTOM:
-    // top (radical.tp, hook) + N*extender (radical.ex, bar) + bottom (uni23B7, foot).
-    //
-    // The assembly's total ink = top.asc + N*ext.asc + bot.asc − (N+1)*overlap
-    // where overlap=0.320em. Pieces are positioned so their ink fills this
-    // span exactly: each piece's ink top is at `assembly_top − piece_offset`
-    // and ink bottom at `assembly_top − piece_offset − ink_asc` (all desc=0).
-    // The overlap means adjacent pieces' ink regions overlap by `overlap` em,
-    // producing a continuous vertical stroke.
-    const radicand_x = metrics.radical_piece_adv * size_pt;
     const saved_len = list.scratch.items.len;
     defer list.scratch.items.len = saved_len;
+    const sn_surd = ast.node(surd_leaf);
 
-    // Top piece: ink TOP at rule_top → baseline at rule_top − top.ink_asc.
-    var cur_y = rule_top - metrics.radical_top_piece.ink_asc * size_pt;
-    const top_surd = try list.create(
-        .char,
-        metrics.radical_piece_adv * size_pt,
-        metrics.radical_top_piece.ink_asc * size_pt,
-        0,
-        &.{},
-        metrics.radical_top_piece.cp,
-        cstyle,
-        size_pt,
-        ast.span(surd_leaf),
-    );
-    {
-        const sn = ast.node(surd_leaf);
-        if (sn.data != 0) list.charDataPtr(top_surd).synthetic = true;
-        list.charDataPtr(top_surd).radical_form = 5; // top piece marker
-    }
-    try list.scratch.append(list.gpa, .{ .idx = top_surd, .x_shift = 0, .shift = -cur_y });
+    // radicand_x, rad_ink_height, rule_top, clr2, hbox_depth are computed
+    // per-branch below (each branch places its surd glyph(s) with ABSOLUTE
+    // shifts anchored at rule_top, matching the pre-fix assembly code).
+    var radicand_x: f32 = undefined;
+    var rad_ink_height: f32 = undefined;
+    var rule_top: f32 = undefined;
+    var clr2: f32 = undefined;
+    var hbox_depth: f32 = undefined;
+    const overlap_em: f32 = 0.320;
 
-    // Extenders (N = 0 for shallow radicands).
-    // Each extender's ink overlaps the piece above by overlap=0.320em.
-    // The baseline gap between consecutive extenders is ext.asc − overlap = 0.320em.
-    // The first extender's baseline is at top.baseline − (ext.asc − overlap).
-    const ext_gap = (metrics.radical_ext_piece.ink_asc - 0.320) * size_pt;
-    for (0..n_ext) |i| {
-        if (i == 0) {
-            cur_y -= ext_gap; // first extender: gap from top
-        } else {
-            cur_y -= ext_gap; // subsequent extenders: same gap
-        }
-        const ext_box = try list.create(
+    if (!use_assembly) {
+        // ── Variant path (shallow radicals) ──────────────────────────────
+        // Pre-built MATH variant (radical.v0–v4): a single √ char at the
+        // current math size with the variant's adv/asc/desc — NOT scaled
+        // up. The variant's ink ascent anchors at the vinculum top.
+        const rv = metrics.radical_variants[vi];
+        radicand_x = rv.adv * size_pt;
+        rad_ink_height = (rv.asc + rv.desc) * size_pt;
+        const delta_v = @max(0.0, rad_ink_height - rt - (H + D + clr));
+        clr2 = clr + delta_v / 2;
+        rule_top = H + clr2 + rt;
+        hbox_depth = @max(D, rad_ink_height - rule_top);
+
+        const surd = try list.create(
             .char,
-            metrics.radical_piece_adv * size_pt,
-            metrics.radical_ext_piece.ink_asc * size_pt,
-            0,
+            rv.adv * size_pt,
+            rv.asc * size_pt,
+            rv.desc * size_pt,
             &.{},
-            metrics.radical_ext_piece.cp,
+            0x221A, // √ \surd
             cstyle,
             size_pt,
             ast.span(surd_leaf),
         );
-        {
-            const sn = ast.node(surd_leaf);
-            if (sn.data != 0) list.charDataPtr(ext_box).synthetic = true;
-            list.charDataPtr(ext_box).radical_form = 6; // extender marker
+        if (sn_surd.data != 0) list.charDataPtr(surd).synthetic = true;
+        list.charDataPtr(surd).radical_form = @intCast(vi);
+        // glyph_baseline = rule_top − asc; shift = −glyph_baseline
+        const glyph_baseline = rule_top - rv.asc * size_pt;
+        try list.scratch.append(list.gpa, .{
+            .idx = surd,
+            .x_shift = 0,
+            .shift = -glyph_baseline,
+        });
+    } else {
+        // ── Assembly path (tall radicals beyond .v4) ────────────────────
+        // MATH vertical radical construction (VertGlyphConstruction): stack
+        // top + N*extender + bottom pieces at constant stroke.
+        // Each extender contributes (ext.asc − overlap) = 0.320em of new
+        // ink height (the overlap with the piece above is already counted).
+        // The formula in the original code used ext.asc (0.64) instead of
+        // the true stride (0.32), under-counting extenders and leaving the
+        // assembly's ink short of the radicand bottom.
+        const stride_em: f32 = metrics.radical_ext_piece.ink_asc - overlap_em; // 0.320
+        const base_em: f32 = metrics.radical_top_piece.ink_asc + metrics.radical_bot_piece.ink_asc - overlap_em; // 2.120
+        const n_ext: usize = blk: {
+            if (req_em <= base_em) break :blk @as(usize, 0);
+            break :blk @intFromFloat(@ceil((req_em - base_em) / stride_em));
+        };
+        rad_ink_height = metrics.radicalAssemblyHeight(n_ext) * size_pt;
+        radicand_x = metrics.radical_piece_adv * size_pt;
+        const delta_a = @max(0.0, rad_ink_height - rt - (H + D + clr));
+        clr2 = clr + delta_a / 2;
+        rule_top = H + clr2 + rt;
+        hbox_depth = @max(D, rad_ink_height - rule_top);
+
+        // TOP piece: ink TOP at vinculum top (rule_top) → baseline at
+        // rule_top − top.asc. shift = −baseline (piece baselines are below
+        // the row baseline for desc=0 pieces, so cur_y grows downward).
+        var cur_y = rule_top - metrics.radical_top_piece.ink_asc * size_pt;
+        const top_surd = try list.create(
+            .char,
+            metrics.radical_piece_adv * size_pt,
+            metrics.radical_top_piece.ink_asc * size_pt,
+            0,
+            &.{},
+            metrics.radical_top_piece.cp,
+            cstyle,
+            size_pt,
+            ast.span(surd_leaf),
+        );
+        if (sn_surd.data != 0) list.charDataPtr(top_surd).synthetic = true;
+        list.charDataPtr(top_surd).radical_form = 5;
+        try list.scratch.append(list.gpa, .{ .idx = top_surd, .x_shift = 0, .shift = -cur_y });
+
+        // Extenders: overlap the piece above by overlap_em; each baseline at
+        // (prev baseline − (ext.asc − overlap)).
+        const ext_gap = stride_em * size_pt;
+        for (0..n_ext) |_| {
+            cur_y -= ext_gap;
+            const ext_box = try list.create(
+                .char,
+                metrics.radical_piece_adv * size_pt,
+                metrics.radical_ext_piece.ink_asc * size_pt,
+                0,
+                &.{},
+                metrics.radical_ext_piece.cp,
+                cstyle,
+                size_pt,
+                ast.span(surd_leaf),
+            );
+            if (sn_surd.data != 0) list.charDataPtr(ext_box).synthetic = true;
+            list.charDataPtr(ext_box).radical_form = 6;
+            try list.scratch.append(list.gpa, .{ .idx = ext_box, .x_shift = 0, .shift = -cur_y });
         }
-        try list.scratch.append(list.gpa, .{ .idx = ext_box, .x_shift = 0, .shift = -cur_y });
+
+        // BOTTOM piece: baseline at (prev baseline − (bot.asc − overlap)).
+        cur_y -= (metrics.radical_bot_piece.ink_asc - overlap_em) * size_pt;
+        const bot_box = try list.create(
+            .char,
+            metrics.radical_piece_adv * size_pt,
+            metrics.radical_bot_piece.ink_asc * size_pt,
+            0,
+            &.{},
+            metrics.radical_bot_piece.cp,
+            cstyle,
+            size_pt,
+            ast.span(surd_leaf),
+        );
+        if (sn_surd.data != 0) list.charDataPtr(bot_box).synthetic = true;
+        list.charDataPtr(bot_box).radical_form = 7;
+        try list.scratch.append(list.gpa, .{ .idx = bot_box, .x_shift = 0, .shift = -cur_y });
     }
 
-    // Bottom piece: overlaps with the last piece above by 0.320em.
-    // The bottom's ink extends bot.asc below its baseline. Its ink top should
-    // be overlap=0.320em below the previous piece's ink bottom (baseline).
-    // So baseline = prev_baseline − (bot.asc − overlap).
-    cur_y -= (metrics.radical_bot_piece.ink_asc - 0.320) * size_pt;
-    const bot_box = try list.create(
-        .char,
-        metrics.radical_piece_adv * size_pt,
-        metrics.radical_bot_piece.ink_asc * size_pt,
-        0,
-        &.{},
-        metrics.radical_bot_piece.cp,
-        cstyle,
-        size_pt,
-        ast.span(surd_leaf),
-    );
-    {
-        const sn = ast.node(surd_leaf);
-        if (sn.data != 0) list.charDataPtr(bot_box).synthetic = true;
-        list.charDataPtr(bot_box).radical_form = 7; // bottom piece marker
-    }
-    try list.scratch.append(list.gpa, .{ .idx = bot_box, .x_shift = 0, .shift = -cur_y });
-
+    // Radicand: flush at x = surd advance; baseline = row baseline (shift 0).
     try list.scratch.append(list.gpa, .{ .idx = radicand, .x_shift = radicand_x, .shift = 0 });
-    // Vinculum: a rule of thickness rt centered at H + clr2 + rt/2, spanning
-    // exactly the radicand's width (measured XeTeX: the rule runs from the
-    // radicand's left edge to its right edge; the hook connects it to the bar).
+    // Vinculum: rule of thickness rt centered at H + clr2 + rt/2.
     const rule = try list.createLeaf(.rule, rb.width, rt / 2, rt / 2, span);
     try list.scratch.append(list.gpa, .{ .idx = rule, .x_shift = radicand_x, .shift = -(H + clr2 + rt / 2) });
     // The construction's height = vinculum top + rt: XeTeX's overbar is
@@ -2669,17 +2694,23 @@ fn layoutSqrt(
     var width = radicand_x + rb.width;
     if (degree) |d| {
         // Root index at scriptscript size (XeTeX measured), left edge
-        // 0.278·deg_size right of the bar. Its BASELINE is raised by
-        // 0.6·(hbox height − depth) above the row baseline — amsmath's
-        // \r@@t: \raise .6\dimen@\copy\rootbox with \dimen@ = \ht−\dp of the
-        // radical box (measured \sqrt[3]{\frac{a}{b}}: degree baseline
-        // 11.7pt above the axis at 30pt; the old rule_top−0.4·ink_height
-        // anchor rode the degree up with the vinculum, ~5pt too high).
+        // 0.278·deg_size right of the bar. Its BASELINE is raised above the
+        // row baseline (amsmath \r@@t: \raise .6\dimen@\copy\rootbox with
+        // \dimen@ = \ht−\dp of the radical box):
+        //  · variant path (shallow radicals): 0.6 × (height − hbox_depth) —
+        //    for shallow radicands hbox_depth is small so this ≈ 0.6·rule_top,
+        //    matching the measured reference (\sqrt[3]{a/b}: degree baseline
+        //    ~11.7pt above the axis at 30pt);
+        //  · assembly path (tall radicals): 0.6 × rule_top — the
+        //    (height − hbox_depth) formula collapses for deep radicands
+        //    (hbox_depth ≈ D is large), parking the degree far too low. TeX
+        //    places the index at the upper-left of the radical, baseline ≈
+        //    0.6 of the radical's top (rule_top above the row baseline).
         const deg_size = size_pt * gl.scriptscriptfactor;
         const db = try layoutInner(list, ast, d, fm, .script_script, deg_size, cstyle, true);
         const gb = list.get(db);
         const deg_x = 0.073 * rad_ink_height + 0.278 * deg_size;
-        const raise = 0.6 * (height - hbox_depth);
+        const raise = if (use_assembly) 0.6 * rule_top else 0.6 * (height - hbox_depth);
         try list.scratch.append(list.gpa, .{ .idx = db, .x_shift = deg_x, .shift = -raise });
         height = @max(height, raise + gb.height);
         width = @max(width, deg_x + gb.width);

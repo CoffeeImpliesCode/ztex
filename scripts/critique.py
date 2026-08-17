@@ -109,9 +109,11 @@ BIGOP_PUA = {cp: BIGOP_PUA_BASE + i for i, cp in enumerate(BIGOP_DISPLAY_CPS)}
 # .v1 glyphs (the patched font maps each PUA char to the variant glyph,
 # drawn at its own size).
 DELIMITER_CPS = (0x0028, 0x0029, 0x005B, 0x005D, 0x007B, 0x007D,
-                 0x27E8, 0x27E9, 0x230A, 0x230B, 0x2308, 0x2309)
+                 0x27E8, 0x27E9, 0x230A, 0x230B, 0x2308, 0x2309,
+                 0x007C, 0x2223, 0x2016)
 DELIM_PAIRS = {0x0028: 0x0029, 0x005B: 0x005D, 0x007B: 0x007D,
-               0x27E8: 0x27E9, 0x230A: 0x230B, 0x2308: 0x2309}  # open -> close
+               0x27E8: 0x27E9, 0x230A: 0x230B, 0x2308: 0x2309,
+               0x007C: 0x007C, 0x2223: 0x2223, 0x2016: 0x2016}  # open -> close
 DELIM_OPENERS = frozenset(DELIM_PAIRS)
 DELIM_CLOSERS = frozenset(DELIM_PAIRS.values())
 DELIM_OPENER_OF = {close: open_ for open_, close in DELIM_PAIRS.items()}
@@ -167,6 +169,13 @@ RADICAL_PIECE_PUA = {
     5: 0xF300,  # top piece → radical.tp
     6: 0xF301,  # extender   → radical.ex
     7: 0xF302,  # bottom piece → uni23B7
+}
+# Glyph name mapping for radical assembly pieces: verifier measures these
+# OTF glyph outlines instead of the base √ the browser shows.
+_RADICAL_PIECE_GLYPHS = {
+    5: "radical.tp",   # top hook
+    6: "radical.ex",   # extender (vertical bar)
+    7: "uni23B7",      # bottom foot + bar
 }
 
 
@@ -319,15 +328,27 @@ _LM_FONT_PATTERNS = {
 }
 
 
+_lm_font_cache: dict[tuple[str, str], str | None] = {}
+_LM_FONT_SENTINEL = object()
+
+
 def find_lm_font(name, font_dir=DEFAULT_FONT_DIR):
     """Absolute path to a Latin Modern face; None if not found.
 
     Tries the known devenv-profile path first, then globs the Nix store and
     system font dirs so the script still works when the store path moves.
+    Cached: the same (name, font_dir) pair always returns the same result
+    without re-globbing the filesystem.
     """
+    key = (name, font_dir)
+    cached = _lm_font_cache.get(key, _LM_FONT_SENTINEL)
+    if cached is not _LM_FONT_SENTINEL:
+        return cached
     for pat in _LM_FONT_PATTERNS[name]:
         for hit in sorted(glob.glob(pat.format(dir=font_dir))):
+            _lm_font_cache[key] = hit
             return hit
+    _lm_font_cache[key] = None
     return None
 
 
@@ -996,19 +1017,18 @@ def _delimiter_targets(elements, w_pt, h_pt, font_dir, base_size):
         if cur_y is None or ry != cur_y:
             stack = []   # delimiters never pair across baselines (array rows)
             cur_y = ry
-        if d["cp"] in DELIM_OPENERS:
-            stack.append(d)
-        elif d["cp"] in DELIM_CLOSERS:
+        if d["cp"] in DELIM_CLOSERS:
+            found = False
             for i in range(len(stack) - 1, -1, -1):
-                # A close only pairs with an unmatched opener strictly LEFT
-                # of it. LIFO alone mispairs sibling pairs whose x interleave
-                # as `( ( ) )` (adjacent array columns) and pairs across rows:
-                # that inflated the enclosed extent and drew parenleft.v7
-                # (~3x) instead of the base paren (the giant-paren bug).
                 if (stack[i]["cp"] == DELIM_OPENER_OF[d["cp"]] and
                         stack[i]["x"] < d["x"]):
                     pairs.append((stack.pop(i), d))
+                    found = True
                     break
+            if not found and d["cp"] in DELIM_OPENERS:
+                stack.append(d)
+        elif d["cp"] in DELIM_OPENERS:
+            stack.append(d)
     matched = set()
     targets = {}
     spans = []
@@ -1047,20 +1067,32 @@ def _delimiter_targets(elements, w_pt, h_pt, font_dir, base_size):
         # axis — the giant-paren guard: a fence in one array/cases row must
         # not absorb sibling rows' glyphs (that is why row_tol exists).
         frac_tol = 0.75 * o["size"]
-        script_tol = 1.35 * o["size"]
-        has_frac_bar = any(
-            osz == 0 and lo < (b[0] + b[2]) / 2.0 < hi
-            and (b[3] - b[1]) <= 0.15 * o["size"]
-            and (b[2] - b[0]) >= 2.0 * (b[3] - b[1])
-            and abs((b[1] + b[3]) / 2.0 - (o["y"] - axis)) <= 0.05 * o["size"]
-            for b, osz in zip(others, others_size))
-        if has_frac_bar:
+        # Rule-anchored fence extension: collect every rule inside the pair
+        # that's thin (h ≤ 0.15*size, w ≥ 2h) and centered on the pair's
+        # axis ±0.05em. Extending based on rules (not a boolean) bounds the
+        # absorbed content to fractions whose bar sits on THIS fence's axis
+        # — sibling ARRAY rows (fractions at different axis offsets) stay
+        # excluded.
+        qualifying_rules = [b for b, osz in zip(others, others_size)
+                            if osz == 0 and lo < (b[0] + b[2]) / 2.0 < hi
+                            and (b[3] - b[1]) <= 0.15 * o["size"]
+                            and (b[2] - b[0]) >= 2.0 * (b[3] - b[1])
+                            and abs((b[1] + b[3]) / 2.0
+                                    - (o["y"] - axis)) <= 0.05 * o["size"]]
+        if qualifying_rules:
+            rule_centers = [(b[1] + b[3]) / 2.0 for b in qualifying_rules]
+            script_tol = 1.35 * o["size"]
             for b, base_y, osz in zip(others, others_base, others_size):
                 if not (lo < (b[0] + b[2]) / 2.0 < hi) or base_y is None:
                     continue
-                dy = abs(base_y - o["y"])
-                if dy < frac_tol or (osz > 0 and osz < o["size"]
-                                     and dy < script_tol):
+                anchored = any(abs(base_y - rc) < frac_tol
+                              for rc in rule_centers)
+                within_pair = abs(base_y - o["y"]) < frac_tol
+                # Include script-sized boxes near the fraction bar
+                script_near = (osz > 0 and osz < o["size"]
+                               and any(abs(base_y - rc) < script_tol
+                                       for rc in rule_centers))
+                if anchored or within_pair or script_near:
                     inside.append(b)
         extent = _union(inside)
         if not extent:
@@ -1097,7 +1129,7 @@ def _delimiter_targets(elements, w_pt, h_pt, font_dir, base_size):
             consistent = res is not None and gap is not None and (
                 abs(gap - _hmtx_advance(path, res[1]) * o["size"])
                 <= DELIM_CONSISTENT_TOL_EM * o["size"])
-            if not consistent and gap is not None:
+            if not consistent and gap is not None and res is not None:
                 tt = _tt_font(path)
                 variants = _delimiter_variants(tt, o["cp"])
                 best_k, best_err = None, None
@@ -1566,8 +1598,7 @@ def _glyph_ink_boxes(attrs, content, font_dir, delim_targets=None):
                 # Assembly piece: map the piece index to the LM Math glyph
                 # name (top/ext/bottom) so the verifier measures the
                 # assembly piece ink, not the base √ or a .notdef.
-                _piece_names = {5: "radical.tp", 6: "radical.ex", 7: "uni23B7"}
-                gname = _piece_names.get(vi)
+                gname = _RADICAL_PIECE_GLYPHS.get(vi)
             else:
                 vname = f"radical.v{vi}"
                 if vname in font.getGlyphOrder():
