@@ -2224,6 +2224,60 @@ pub fn radicalVariant(req_em: f32) usize {
     return radical_variants.len - 1; // .v4 (tallest) if none covers
 }
 
+/// LM Math's radical GlyphAssembly pieces (MATH VertGlyphConstruction).
+/// Three parts stacked TOP → BOTTOM:
+///   top  (radical.tp, the curved hook — `cp=U+F300` PUA): ink y[0,0.620]em,
+///     advance=1.056em; bottom 0.320em of its ink is the connector for the
+///     extender above.
+///   ext  (radical.ex, the vertical bar — `cp=U+F301` PUA, repeatable): ink
+///     y[0,0.640]em, advance=1.056em; full 0.640em connector on both ends
+///     (extenders stack without overlap).
+///   bot  (uni23B7 = U+23B7, the foot + bar): ink y[0,1.820]em, advance=
+///     1.056em; top 0.320em of its ink is the connector for the extender
+///     above.
+/// Measured with fontTools on latinmodern-math.otf 2.005 (BoundsPen + hmtx +
+/// MathVariants VertGlyphConstruction records); connectors from the
+/// PartRecords (StartConnectorLength, EndConnectorLength, in 1/1000 em).
+/// XeTeX's make_radical reads this GlyphAssembly and stacks top + N*ext +
+/// bot, computing N from the required radical height — same as KaTeX and
+/// MathJax, both of which use the assembly pieces instead of the pre-built
+/// variants (radical.v1..v4). The pre-built variants give a different
+/// shape; the assembly produces XeTeX's constant-stroke vertical radical.
+pub const RadicalPiece = struct {
+    cp: u21,
+    /// ink height above baseline, in em (desc=0 for all radical pieces)
+    ink_asc: f32,
+    /// Ink available for overlap at the TOP of this piece (with the piece
+    /// above it), in em. For the top piece this is 0 (nothing above); for
+    /// the extender it is 0.640em (full); for the bottom piece 0.320em.
+    connector_top: f32,
+    /// Ink available for overlap at the BOTTOM of this piece (with the
+    /// piece below it), in em. For the top piece 0.320em (overlaps with
+    /// the extender); for the extender 0.640em; for the bottom piece 0
+    /// (nothing below).
+    connector_bot: f32,
+};
+pub const radical_top_piece = RadicalPiece{ .cp = 0xF300, .ink_asc = 0.620, .connector_top = 0.000, .connector_bot = 0.320 };
+pub const radical_ext_piece = RadicalPiece{ .cp = 0xF301, .ink_asc = 0.640, .connector_top = 0.640, .connector_bot = 0.640 };
+pub const radical_bot_piece = RadicalPiece{ .cp = 0x23B7, .ink_asc = 1.820, .connector_top = 0.320, .connector_bot = 0.000 };
+/// Advance (width) of every radical piece in em — all three share the same
+/// hmtx 1056/1000em on LM Math (the vertical bar at x=702..742 is constant
+/// across the assembly; only the hook (right) and foot (left) extend
+/// beyond it, but the advance stays 1.056em).
+pub const radical_piece_adv: f32 = 1.056;
+/// Ink extent of an assembled radical with N extenders, in em.
+/// Overlap between adjacent pieces = min(upper.connector_bot,
+/// lower.connector_top); for the radical this is always 0.320em.
+/// Total = sum(ink_asc) − (N+1) × overlap + N × (ext.ink_asc − overlap)
+///       = top.asc + N×ext.asc + bot.asc − (N+1)×0.320.
+/// Returns 0 for negative N (defensive).
+pub fn radicalAssemblyHeight(N: usize) f32 {
+    const overlap = 0.320;
+    var h: f32 = radical_top_piece.ink_asc + radical_bot_piece.ink_asc;
+    h += @as(f32, @floatFromInt(N)) * radical_ext_piece.ink_asc;
+    h -= (@as(f32, @floatFromInt(N)) + 1.0) * overlap;
+    return h;
+}
 /// Horizontal position of a glyph's TOP-ACCENT ATTACHMENT point, in em
 /// right of the glyph origin — the MATH-table MathTopAccentAttachment
 /// (fontTools on latinmodern-math.otf 2.005). XeTeX+unicode-math places an

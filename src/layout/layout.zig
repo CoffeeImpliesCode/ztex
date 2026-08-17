@@ -2256,8 +2256,8 @@ fn layoutLeftRight(
 /// none does), boxed at the BASE font size by the variant's hmtx advance and
 /// ink extents — no font-size scaling. The drawn glyph stays the base
 /// delimiter char at the base size (the rasterizer resolves the variant from
-/// the MATH table). Codepoints without a variant ladder (e.g. \left|) fall
-/// back to the continuous scaled-base path (layoutScaledChar) with the same
+/// the MATH table). Codepoints without a variant ladder (e.g. \left\backslash)
+/// fall back to the continuous scaled-base path (layoutScaledChar) with the
 /// extent floors as the old layoutLeftRight.
 fn layoutDelimChar(
     list: *box.BoxList,
@@ -2542,67 +2542,119 @@ fn layoutSqrt(
     const H = rb.height;
     const D = rb.depth;
 
-    // Select the MATH-table radical variant: XeTeX draws √ at the current
-    // font size using the smallest variant whose AdvanceMeasurement covers
-    // the radicand's full extent (H + D + clr + θ). The base glyph (1.001em)
-    // suffices for shallow radicands; tall ones (fractions, nested
-    // radicals) need radical.v1–v4. The surd is NEVER scaled up — variants
-    // provide the height while keeping the width slim (∼1em advance).
-    const req_em = (H + D + clr + rt) / size_pt;
-    const vi = metrics.radicalVariant(req_em);
-    const rv = metrics.radical_variants[vi];
-    const rad_ink_height = (rv.asc + rv.desc) * size_pt;
+    // MATH vertical radical construction (VertGlyphConstruction): assemble
+    // the √ from top/extender/bottom pieces with constant stroke, matching
+    // XeTeX+unicode-math+KaTeX. Pre-built variants (radical.v1..v4) give a
+    // different shape; the assembly pieces produce XeTeX's actual rendering.
+    const target_em = (H + D + clr + rt) / size_pt;
+    // Assembly height with N extenders: top.asc + N*ext.asc + bot.asc − (N+1)*overlap.
+    // For N=0: top.asc + bot.asc − overlap = 2.120em. We need N such that
+    // assembly_height ≥ target_em.
+    const overlap_em = 0.320;
+    const n_ext: usize = blk: {
+        // assembly_height(N) = top.asc + bot.asc − overlap + N*(ext.asc)
+        //   = (top.asc + bot.asc − overlap) + N*ext.asc
+        const base = metrics.radical_top_piece.ink_asc + metrics.radical_bot_piece.ink_asc - overlap_em;
+        if (target_em <= base) break :blk 0;
+        break :blk @intFromFloat(@ceil((target_em - base) / metrics.radical_ext_piece.ink_asc));
+    };
+    const rad_ink_height = metrics.radicalAssemblyHeight(n_ext) * size_pt;
 
-    // TeX make_radical's clearance adjustment (xetex.web): the radical glyph
-    // box's depth is REPLACED by (total ink − rule_thickness) — the vinculum
-    // rule occupies the top rt of the glyph's ink — then
-    //   delta = depth(y) − (H + D + clr)
-    // and half the excess (the glyph's ink hanging below the radicand's
-    // extent) is added to the clearance, raising the vinculum. The base
-    // glyph's descent (0.96em) equals total−rt only because its ascent is
-    // exactly rt; tall variants (.v1–.v4, desc 0.35–1.25em) under-count by
-    // asc−rt (1.41em for .v3), leaving the vinculum ~0.2em too low and the
-    // radicand riding high in the surd (measured \sqrt[3]{\frac{a}{b}}:
-    // numerator 'a' 24.6pt above the √ baseline vs XeTeX's 18.6pt).
-    const delta = @max(0.0, ((rv.asc + rv.desc) * size_pt - rt) - (H + D + clr));
+    // TeX make_radical's clearance adjustment — same formula, using the
+    // assembly's total ink extent (total = top.asc + N*ext.asc + bot.asc −
+    // (N+1)*0.320 in em). The delta and clr2 float the vinculum clear of the
+    // radicand exactly as before.
+    const delta = @max(0.0, (rad_ink_height - rt) - (H + D + clr));
     const clr2 = clr + delta / 2;
     const rule_top = H + clr2 + rt;
-    // The construction's depth (XeTeX hpack extents, measured \sqrt{x}:
-    // 5.715 = total 30 − rule_top 24.285; \sqrt[3]{\frac{a}{b}}: 26.85 =
-    // 72 − 45.15): the glyph's ink bottom when it out-hangs the radicand.
     const hbox_depth = @max(D, rad_ink_height - rule_top);
 
-    // Create the surd char box at size_pt (the current math size) with the
-    // variant's advance/ink — NOT layoutScaledChar, which would use the base
-    // glyph's metrics and scale it to gs. The variant keeps the width slim
-    // while its height covers the radicand.
-    const surd_cp: u21 = 0x221A;
-    const surd = try list.create(
+    // Create assembly piece char boxes. Pieces are stacked TOP→BOTTOM:
+    // top (radical.tp, hook) + N*extender (radical.ex, bar) + bottom (uni23B7, foot).
+    //
+    // The assembly's total ink = top.asc + N*ext.asc + bot.asc − (N+1)*overlap
+    // where overlap=0.320em. Pieces are positioned so their ink fills this
+    // span exactly: each piece's ink top is at `assembly_top − piece_offset`
+    // and ink bottom at `assembly_top − piece_offset − ink_asc` (all desc=0).
+    // The overlap means adjacent pieces' ink regions overlap by `overlap` em,
+    // producing a continuous vertical stroke.
+    const radicand_x = metrics.radical_piece_adv * size_pt;
+    const saved_len = list.scratch.items.len;
+    defer list.scratch.items.len = saved_len;
+
+    // Top piece: ink TOP at rule_top → baseline at rule_top − top.ink_asc.
+    var cur_y = rule_top - metrics.radical_top_piece.ink_asc * size_pt;
+    const top_surd = try list.create(
         .char,
-        rv.adv * size_pt, // width = variant advance × size
-        rv.asc * size_pt, // height = ink ascent
-        rv.desc * size_pt, // depth = ink descent
+        metrics.radical_piece_adv * size_pt,
+        metrics.radical_top_piece.ink_asc * size_pt,
+        0,
         &.{},
-        surd_cp,
+        metrics.radical_top_piece.cp,
         cstyle,
         size_pt,
         ast.span(surd_leaf),
     );
-    // √ is synthesized from \sqrt (source data = codepoint, not text bytes),
-    // so mark synthetic so flatten dupes the glyph into the arena.
-    const sn = ast.node(surd_leaf);
-    if (sn.data != 0) list.charDataPtr(surd).synthetic = true;
-    list.charDataPtr(surd).radical_form = @intCast(vi);
+    {
+        const sn = ast.node(surd_leaf);
+        if (sn.data != 0) list.charDataPtr(top_surd).synthetic = true;
+        list.charDataPtr(top_surd).radical_form = 5; // top piece marker
+    }
+    try list.scratch.append(list.gpa, .{ .idx = top_surd, .x_shift = 0, .shift = -cur_y });
 
-    // Anchor: glyph ink top (asc·size_pt above its baseline) at vinculum top;
-    // shift = glyph baseline's height above the row baseline (neg. = up).
-    const glyph_baseline = rule_top - rv.asc * size_pt;
-    const shift = -glyph_baseline;
+    // Extenders (N = 0 for shallow radicands).
+    // Each extender's ink overlaps the piece above by overlap=0.320em.
+    // The baseline gap between consecutive extenders is ext.asc − overlap = 0.320em.
+    // The first extender's baseline is at top.baseline − (ext.asc − overlap).
+    const ext_gap = (metrics.radical_ext_piece.ink_asc - 0.320) * size_pt;
+    for (0..n_ext) |i| {
+        if (i == 0) {
+            cur_y -= ext_gap; // first extender: gap from top
+        } else {
+            cur_y -= ext_gap; // subsequent extenders: same gap
+        }
+        const ext_box = try list.create(
+            .char,
+            metrics.radical_piece_adv * size_pt,
+            metrics.radical_ext_piece.ink_asc * size_pt,
+            0,
+            &.{},
+            metrics.radical_ext_piece.cp,
+            cstyle,
+            size_pt,
+            ast.span(surd_leaf),
+        );
+        {
+            const sn = ast.node(surd_leaf);
+            if (sn.data != 0) list.charDataPtr(ext_box).synthetic = true;
+            list.charDataPtr(ext_box).radical_form = 6; // extender marker
+        }
+        try list.scratch.append(list.gpa, .{ .idx = ext_box, .x_shift = 0, .shift = -cur_y });
+    }
 
-    const radicand_x = rv.adv * size_pt; // variant advance; radicand starts here
-    const saved_len = list.scratch.items.len;
-    defer list.scratch.items.len = saved_len;
-    try list.scratch.append(list.gpa, .{ .idx = surd, .x_shift = 0, .shift = shift });
+    // Bottom piece: overlaps with the last piece above by 0.320em.
+    // The bottom's ink extends bot.asc below its baseline. Its ink top should
+    // be overlap=0.320em below the previous piece's ink bottom (baseline).
+    // So baseline = prev_baseline − (bot.asc − overlap).
+    cur_y -= (metrics.radical_bot_piece.ink_asc - 0.320) * size_pt;
+    const bot_box = try list.create(
+        .char,
+        metrics.radical_piece_adv * size_pt,
+        metrics.radical_bot_piece.ink_asc * size_pt,
+        0,
+        &.{},
+        metrics.radical_bot_piece.cp,
+        cstyle,
+        size_pt,
+        ast.span(surd_leaf),
+    );
+    {
+        const sn = ast.node(surd_leaf);
+        if (sn.data != 0) list.charDataPtr(bot_box).synthetic = true;
+        list.charDataPtr(bot_box).radical_form = 7; // bottom piece marker
+    }
+    try list.scratch.append(list.gpa, .{ .idx = bot_box, .x_shift = 0, .shift = -cur_y });
+
     try list.scratch.append(list.gpa, .{ .idx = radicand, .x_shift = radicand_x, .shift = 0 });
     // Vinculum: a rule of thickness rt centered at H + clr2 + rt/2, spanning
     // exactly the radicand's width (measured XeTeX: the rule runs from the
@@ -3462,7 +3514,10 @@ fn denomLastCharScale(
                 const ps: Style = if (atom.fracPartsDisplay(n.data))
                     .display
                 else if (eff == .display) .text else if (eff == .text) .script else .script_script;
-                scale *= styleScale(gl, ps);
+                // Absolute from base: each nested fraction's parts are at
+                // a fixed scale from the document base, not a further
+                // multiplication of the parent's part scale.
+                scale = styleScale(gl, ps);
                 style = eff;
                 u = ast.child(u, 1);
             },
@@ -3551,7 +3606,13 @@ fn layoutFraction(
         .script => gl.scriptfactor,
         .script_script => gl.scriptscriptfactor,
     };
-    const part_size = eff_size * part_scale;
+    // TeX sizes are absolute from the document base, not compounded
+    // multiplicatively.  eff_size already reflects forced-style rescaling,
+    // so dividing back by the fraction's OWN style scale recovers the
+    // document base, and multiplying by the part style's scale gives the
+    // correct absolute size at any nesting depth.
+    const base_size = eff_size / styleScale(gl, eff_style);
+    const part_size = base_size * part_scale;
     const part_cramped = !parts_display;
     const num = try layoutInner(
         list,

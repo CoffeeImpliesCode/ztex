@@ -161,6 +161,13 @@ DELIM_TIP_OVERHANG_EM = 0.096
 RADICAL_CPS = (0x221A,)  # √ \surd
 RADICAL_PUA_BASE = 0xF200                  # PUA slot for radical variants
 RADICAL_PUA = {i: RADICAL_PUA_BASE + i - 1 for i in range(1, 5)}  # v1..v4
+# Radical assembly pieces (layoutSqrt emits data-radical="v5/v6/v7" for
+# top/ext/bottom pieces). Each PUA maps to a specific LM Math glyph.
+RADICAL_PIECE_PUA = {
+    5: 0xF300,  # top piece → radical.tp
+    6: 0xF301,  # extender   → radical.ex
+    7: 0xF302,  # bottom piece → uni23B7
+}
 
 
 def _delim_pua(cp, k):
@@ -520,21 +527,22 @@ def rasterize_svg(svg_path, png_path, font_dir=DEFAULT_FONT_DIR, scale=1.0):
                 font = _variant_font(find_lm_font(_lm_font_name(a), font_dir),
                                      size_pt * PT_TO_PX * ss)
                 content = chr(pua)
-            elif (len(content) == 1 and ord(content) in RADICAL_CPS
-                    and a.get("data-radical")):
-                # Stretchy √ glyph: the layout selected a MATH-table vertical
-                # variant (radical.v1..v4) so the surd's height covers the
-                # radicand while its width stays slim (1.0em advance, ∼0.91em
-                # ink at the current size). The SVG declares font-size=size_pt;
-                # data-radical="vN" tells the raster to draw the variant, not
-                # the base √ the browser would render (which is 1.0em tall —
-                # too short for fractions). The variant draws at the SAME size
-                # and baseline (no shift needed: LM Math variants share the
-                # base glyph's baseline convention).
-                pua = RADICAL_PUA[int(a["data-radical"][1:])]
-                font = _variant_font(find_lm_font(_lm_font_name(a), font_dir),
-                                     size_pt * PT_TO_PX * ss)
-                content = chr(pua)
+            elif len(content) == 1 and a.get("data-radical"):
+                # Stretchy √ glyph. data-radical="vN" where N = 1..4 selects
+                # a pre-built MATH-table vertical variant (radical.v1..v4);
+                # N = 5..7 selects an assembly piece (top/ext/bottom) drawn
+                # at the same size and baseline. The patched font maps PUA
+                # codepoints to the correct LM Math glyph so the raster draws
+                # XeTeX's shape, not the base √ the browser shows.
+                vi = int(a["data-radical"][1:])
+                if vi in RADICAL_PIECE_PUA:
+                    pua = RADICAL_PIECE_PUA[vi]
+                else:
+                    pua = RADICAL_PUA.get(vi)
+                if pua is not None:
+                    font = _variant_font(find_lm_font(_lm_font_name(a), font_dir),
+                                         size_pt * PT_TO_PX * ss)
+                    content = chr(pua)
             elif len(content) == 1 and (x_pt, y_pt, content) in delim_targets:
                 # Stretched delimiter: draw the MATH size VARIANT (constant
                 # stroke). Paired \left..\right delimiters draw at the declared
@@ -1481,6 +1489,19 @@ def _variant_font(path, size_px):
             for vi, gname in enumerate(radical_gnames, start=1):
                 if gname in tt.getGlyphOrder():
                     mapping[RADICAL_PUA[vi]] = gname
+            # Radical assembly pieces (data-radical="v5/v6/v7"): map the
+            # layout's piece PUA chars to the actual MATH-table assembly
+            # glyphs so the raster draws the constant-stroke vertical radical
+            # matching XeTeX's make_radical assembly, not the pre-built
+            # variant shape.
+            radical_piece_gnames = {
+                5: "radical.tp",  # top hook
+                6: "radical.ex",  # extender (vertical bar)
+                7: "uni23B7",     # bottom foot + bar
+            }
+            for piece_vi, gname in radical_piece_gnames.items():
+                if piece_vi in RADICAL_PIECE_PUA and gname in tt.getGlyphOrder():
+                    mapping[RADICAL_PIECE_PUA[piece_vi]] = gname
             for table in tt["cmap"].tables:
                 if table.isUnicode():
                     table.cmap.update(mapping)
@@ -1539,12 +1560,18 @@ def _glyph_ink_boxes(attrs, content, font_dir, delim_targets=None):
         # the PIL raster draws — not the base √ the browser renders. The
         # variant draws at the declared font-size (same as the SVG says), so
         # scale_ch stays `scale`.
-        elif (len(ch) == 1 and ord(ch) in RADICAL_CPS
-                and attrs.get("data-radical")):
+        elif (len(ch) == 1 and attrs.get("data-radical")):
             vi = int(attrs["data-radical"][1:])
-            vname = f"radical.v{vi}"
-            if vname in font.getGlyphOrder():
-                gname = vname
+            if vi in RADICAL_PIECE_PUA:
+                # Assembly piece: map the piece index to the LM Math glyph
+                # name (top/ext/bottom) so the verifier measures the
+                # assembly piece ink, not the base √ or a .notdef.
+                _piece_names = {5: "radical.tp", 6: "radical.ex", 7: "uni23B7"}
+                gname = _piece_names.get(vi)
+            else:
+                vname = f"radical.v{vi}"
+                if vname in font.getGlyphOrder():
+                    gname = vname
         scale_ch, shift = scale, 0.0
         if len(ch) == 1 and ord(ch) in DELIMITER_CPS and delim_targets:
             # Stretched delimiter: the raster draws the MATH size variant at
