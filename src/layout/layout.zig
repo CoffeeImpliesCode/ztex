@@ -2014,7 +2014,7 @@ fn layoutEnv(
     // axis-centered; the array sits flush between them (the amsmath
     // -\arraycolsep pads cancel the array's edge pads, measured 0pt).
     const delta = @max(arr_h - axis, arr_d + axis);
-    const minh_pt = @max(2 * delta * 0.901, 2 * delta - 0.1 * size_pt);
+    const minh_pt = @max(2 * delta * 0.901, 2 * delta - 5.0);
     const req_em = minh_pt / size_pt;
     const h_saved = list.scratch.items.len;
     defer list.scratch.items.len = h_saved;
@@ -2156,7 +2156,7 @@ fn layoutLeftRight(
     // floor is 87.0pt → parenleft.v6 (2.392em ink) — the exact variant the
     // reference draws (measured ink span 2.392em at its drawn size).
     const delta = @max(ib.height - axis, ib.depth + axis);
-    const minh_pt = @max(2 * delta * 0.901, 2 * delta - 0.1 * size_pt);
+    const minh_pt = @max(2 * delta * 0.901, 2 * delta - 5.0);
     // amsc `\binom`/`\genfrac{..}{..}` (inner fraction marked fixed_delim):
     // amsc sizes the `\left(` `)` parens to its FIXED fraction-delimiter
     // rule, not TeX's content-`\left` delta — ztex's content floor
@@ -2227,7 +2227,7 @@ fn layoutLeftRight(
     var mid_req_em = req_em;
     if (fence_asc > 0) {
         const fdelta = @max(fence_asc - axis, fence_desc + axis);
-        mid_req_em = @max(2 * fdelta * 0.901, 2 * fdelta - 0.1 * size_pt) / size_pt;
+        mid_req_em = @max(2 * fdelta * 0.901, 2 * fdelta - 5.0) / size_pt;
     }
     const mid_ext = try sizeMiddleDelims(list, ast, inner, fm, mid_req_em, size_pt, cstyle);
     height = @max(height, mid_ext.asc_pt);
