@@ -169,4 +169,20 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench_exe);
     run_bench.step.dependOn(b.getInstallStep());
     bench_step.dependOn(&run_bench.step);
+
+    // ── golden generator (prints ready-to-paste regression.zig tables) ──
+    const gen_exe = b.addExecutable(.{
+        .name = "gen-goldens",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gen_goldens.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ztex", .module = ztex },
+            },
+        }),
+    });
+    const gen_step = b.step("gen-goldens", "Print golden tables for the breadth corpus");
+    const run_gen = b.addRunArtifact(gen_exe);
+    gen_step.dependOn(&run_gen.step);
 }

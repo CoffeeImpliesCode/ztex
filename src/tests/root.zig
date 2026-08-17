@@ -23,3 +23,4 @@ test {
     std.testing.refAllDecls(@This());
 }
 pub const sanity_dagger = @import("sanity_dagger.zig");
+pub const goldens = @import("goldens.zig");
