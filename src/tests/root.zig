@@ -17,7 +17,9 @@ pub const regression = @import("regression.zig");
 pub const sanity = @import("sanity.zig");
 pub const sanity_delim_form = @import("sanity_delim_form.zig");
 pub const sanity_bb = @import("sanity_bb.zig");
+pub const sanity_cfrac = @import("sanity_cfrac.zig");
 
 test {
     std.testing.refAllDecls(@This());
 }
+pub const sanity_dagger = @import("sanity_dagger.zig");

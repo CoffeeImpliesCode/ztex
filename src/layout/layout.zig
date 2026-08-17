@@ -2979,7 +2979,15 @@ fn layoutScript(
     // 2.4722pt (tftopl SUPDROP 0.353171 em × 7) and cmsy5's is 2.47223 —
     // NOT the 10pt 3.86108 (audit-scripts residual #3; the audit's
     // "2.88889" is cmsy10's SUP3, not sup_drop).
-    const base_is_char = base_u_atom.tag == .char;
+    // A CHAR nucleus (incl. an ACCENT base) starts shift_up/shift_down at 0
+    // — only the sup1|sup2|sup3 / sub1|sub2 floors apply. \hat{A}^{\dagger}
+    // is parsed by XeTeX as the hat over A^{\dagger}: the dagger scripts
+    // on the BARE char, so its raise is the char floor (sup1 3.63em =
+    // 10.89pt at 30pt), NOT the accent-box height (inflated by the hat on
+    // top → ~25pt, the "dagger sits too high" defect). Treat an accent row
+    // as a char nucleus for the script floors.
+    const is_accent_base = base_u_atom.tag == .row and base_u_atom.data == accent_row_data;
+    const base_is_char = base_u_atom.tag == .char or is_accent_base;
     // sup_drop/sub_drop for a BOX base (op, fraction, braced list,
     // \left..\right): TeX reads \fontdimen20/21 of family 2; XeTeX+LM uses
     // the MATH-table baseline-drop constants at the SCRIPT size — measured
@@ -3718,6 +3726,26 @@ fn layoutFraction(
     const nb = list.get(num);
     const db = list.get(den);
 
+    // \cfrac (amsmath): the NUMERATOR is `\strut #2` — an invisible
+    // display-size strut that carries DEPTH below the numerator baseline.
+    // TeX make_fraction's clearance check
+    //   kern1 = num1 − numerator_depth − (axis + rt/2) ≥ 3·rt
+    // uses that depth; a bare digit '1' has depth 0, so no bump fires and
+    // the numerator sits ~2pt too low (measured: \cfrac{1}{a} at 30pt
+    // numerator-to-rule 12.75pt vs XeTeX 14.62pt; the shortfall compounds
+    // over a nested continuation to ~7.5pt). The strut is the \strutbox
+    // at the effective size: height 0.84em, depth 0.36em (with the \cfrac
+    // context's \baselineskip 1.2× the size, 0.7/0.3 × 1.2 = 0.84/0.36).
+    // Apply the strut DEPTH to the numerator box so the clearance bump
+    // raises the numerator exactly like XeTeX. Only \cfrac does this:
+    // \dfrac = \frac in display style (NO strut).
+    var num_height = nb.height;
+    var num_depth = nb.depth;
+    if (parts_display) {
+        num_height = @max(num_height, 0.84 * eff_size);
+        num_depth = @max(num_depth, 0.36 * eff_size);
+    }
+
     const vbox_w = @max(nb.width, db.width);
 
     // Gap parameters and clearance (MicroTeX FractionAtom::createBox),
@@ -3761,7 +3789,7 @@ fn layoutFraction(
         // Rule is centered on the axis; enforce the clearance on both sides
         // by raising the shift amounts (MicroTeX kern1/kern2 adjustment).
         const delta = rt / 2;
-        const kern1 = shift_up - nb.depth - (axis + delta);
+        const kern1 = shift_up - num_depth - (axis + delta);
         const kern2 = (axis - delta) - (db.height - shift_down);
         if (kern1 < clr) shift_up += clr - kern1;
         if (kern2 < clr) shift_down += clr - kern2;
@@ -3769,7 +3797,7 @@ fn layoutFraction(
         den_shift = shift_down;
     } else {
         // \atop: split any clearance deficit evenly between both parts.
-        const kern = shift_up - nb.depth - (db.height - shift_down);
+        const kern = shift_up - num_depth - (db.height - shift_down);
         const delta = (clr - kern) / 2;
         if (delta > 0) {
             shift_up += delta;
@@ -3778,7 +3806,7 @@ fn layoutFraction(
         num_shift = -shift_up;
         den_shift = shift_down;
     }
-    const height = shift_up + nb.height;
+    const height = shift_up + num_height;
     const depth = shift_down + db.depth;
 
     // TeX wraps a delimiter-less generalized fraction (\over, \atop) in two
@@ -4787,7 +4815,14 @@ test "layout: cfrac sets both parts in display style (uncramped, display gaps)" 
     // parts in DISPLAY style: same text size but the box carries display
     // style semantics (uncramped; gap params num1/denom1 like display)
     try testing.expectApproxEqAbs(@as(f32, 10.0), list.charData(ch[0].idx).size, 0.01);
-    try testing.expectApproxEqAbs(@as(f32, 6.765 + list.get(ch[0].idx).height), list.get(b).height, 0.01);
+    // The cfrac NUMERATOR is \strut #2 (amsmath): a display-size strut
+    // forces the numerator box to height 0.84em (a char with height 1pt
+    // gets strutted up to 0.84×10 = 8.4) and depth 0.36em. So the vbox
+    // height = num1 (6.765) + max(1, 8.4) = 15.165, not the bare char's.
+    // num1 6.765 + clearance bump (clr 3*rt=1.2 - kern1, where
+    // kern1 = 6.765 - strut_depth 3.6 - (axis 2.5 + rt/2 0.2) = 0.465
+    // → bump 0.735) + strut height 0.84*10=8.4 = 15.9.
+    try testing.expectApproxEqAbs(@as(f32, 15.9), list.get(b).height, 0.01);
 }
 
 test "layout: mathstyle wrapper forces style and rescales size" {
