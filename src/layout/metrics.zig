@@ -563,6 +563,79 @@ const table = [_]Entry{
     .{ .cp = 0x1D715, .w = 5.31, .h = 6.94445, .d = 0, .ic = 0.55555 }, // 𝜕
 };
 
+/// Blackboard (`\mathbb`) double-struck metrics: LM Math advances/ink for
+/// the U+1D538..U+1D56B (double-struck capitals/smalls) and U+1D7D8..U+1D7E1
+/// (double-struck digits) series plus the Letterlike ℂ/ℍ/ℕ/ℙ/ℚ/ℝ/ℤ. layout
+/// maps `.bb` style chars to these codepoints (layout.mathBb); this table
+/// lets the no-font static path validate the mapped cp (hasGlyph) and box
+/// it by the real LM Math advance. Values em × 10 (10pt-base convention),
+/// sorted by `cp` (binary-search invariant); measured on latinmodern-math.otf
+/// 2.005 with fontTools (hmtx advance, BoundsPen ink h/d).
+const table_bb = [_]Entry{
+    .{ .cp = 0x2102, .w = 6.70, .h = 7.00, .d = 0.20, .ic = 0 }, // bb C
+    .{ .cp = 0x210D, .w = 7.20, .h = 6.80, .d = 0.00, .ic = 0 }, // bb H
+    .{ .cp = 0x2115, .w = 7.20, .h = 6.80, .d = 0.00, .ic = 0 }, // bb N
+    .{ .cp = 0x2119, .w = 6.40, .h = 6.80, .d = 0.00, .ic = 0 }, // bb P
+    .{ .cp = 0x211A, .w = 6.70, .h = 7.00, .d = 1.90, .ic = 0 }, // bb Q
+    .{ .cp = 0x211D, .w = 6.40, .h = 6.80, .d = 0.00, .ic = 0 }, // bb R
+    .{ .cp = 0x2124, .w = 6.70, .h = 6.80, .d = 0.00, .ic = 0 }, // bb Z
+    .{ .cp = 0x1D538, .w = 6.10, .h = 6.80, .d = 0.00, .ic = 0 }, // bb A
+    .{ .cp = 0x1D539, .w = 6.40, .h = 6.80, .d = 0.00, .ic = 0 }, // bb B
+    .{ .cp = 0x1D53B, .w = 6.90, .h = 6.80, .d = 0.00, .ic = 0 }, // bb D
+    .{ .cp = 0x1D53C, .w = 6.10, .h = 6.80, .d = 0.00, .ic = 0 }, // bb E
+    .{ .cp = 0x1D53D, .w = 6.10, .h = 6.80, .d = 0.00, .ic = 0 }, // bb F
+    .{ .cp = 0x1D53E, .w = 6.70, .h = 7.00, .d = 0.20, .ic = 0 }, // bb G
+    .{ .cp = 0x1D540, .w = 3.30, .h = 6.80, .d = 0.00, .ic = 0 }, // bb I
+    .{ .cp = 0x1D541, .w = 6.40, .h = 6.80, .d = 0.20, .ic = 0 }, // bb J
+    .{ .cp = 0x1D542, .w = 6.40, .h = 6.80, .d = 0.00, .ic = 0 }, // bb K
+    .{ .cp = 0x1D543, .w = 6.10, .h = 6.80, .d = 0.00, .ic = 0 }, // bb L
+    .{ .cp = 0x1D544, .w = 7.20, .h = 6.80, .d = 0.00, .ic = 0 }, // bb M
+    .{ .cp = 0x1D546, .w = 6.70, .h = 7.00, .d = 0.20, .ic = 0 }, // bb O
+    .{ .cp = 0x1D54A, .w = 6.10, .h = 7.00, .d = 0.20, .ic = 0 }, // bb S
+    .{ .cp = 0x1D54B, .w = 6.10, .h = 6.80, .d = 0.00, .ic = 0 }, // bb T
+    .{ .cp = 0x1D54C, .w = 7.20, .h = 6.80, .d = 0.20, .ic = 0 }, // bb U
+    .{ .cp = 0x1D54D, .w = 6.10, .h = 6.80, .d = 0.00, .ic = 0 }, // bb V
+    .{ .cp = 0x1D54E, .w = 8.30, .h = 6.80, .d = 0.00, .ic = 0 }, // bb W
+    .{ .cp = 0x1D54F, .w = 6.70, .h = 6.80, .d = 0.00, .ic = 0 }, // bb X
+    .{ .cp = 0x1D550, .w = 6.10, .h = 6.80, .d = 0.00, .ic = 0 }, // bb Y
+    .{ .cp = 0x1D552, .w = 5.00, .h = 4.50, .d = 0.20, .ic = 0 }, // bb a
+    .{ .cp = 0x1D553, .w = 6.30, .h = 6.90, .d = 0.20, .ic = 0 }, // bb b
+    .{ .cp = 0x1D554, .w = 4.70, .h = 4.50, .d = 0.20, .ic = 0 }, // bb c
+    .{ .cp = 0x1D555, .w = 5.00, .h = 6.90, .d = 0.20, .ic = 0 }, // bb d
+    .{ .cp = 0x1D556, .w = 4.70, .h = 4.50, .d = 0.20, .ic = 0 }, // bb e
+    .{ .cp = 0x1D557, .w = 3.90, .h = 7.20, .d = 0.00, .ic = 0 }, // bb f
+    .{ .cp = 0x1D558, .w = 5.00, .h = 4.50, .d = 2.20, .ic = 0 }, // bb g
+    .{ .cp = 0x1D559, .w = 5.70, .h = 6.90, .d = 0.00, .ic = 0 }, // bb h
+    .{ .cp = 0x1D55A, .w = 2.80, .h = 6.90, .d = 0.00, .ic = 0 }, // bb i
+    .{ .cp = 0x1D55B, .w = 3.90, .h = 6.90, .d = 2.20, .ic = 0 }, // bb j
+    .{ .cp = 0x1D55C, .w = 5.40, .h = 6.90, .d = 0.00, .ic = 0 }, // bb k
+    .{ .cp = 0x1D55D, .w = 2.80, .h = 6.90, .d = 0.00, .ic = 0 }, // bb l
+    .{ .cp = 0x1D55E, .w = 7.20, .h = 4.50, .d = 0.00, .ic = 0 }, // bb m
+    .{ .cp = 0x1D55F, .w = 5.70, .h = 4.50, .d = 0.00, .ic = 0 }, // bb n
+    .{ .cp = 0x1D560, .w = 4.70, .h = 4.50, .d = 0.20, .ic = 0 }, // bb o
+    .{ .cp = 0x1D561, .w = 6.30, .h = 4.50, .d = 1.90, .ic = 0 }, // bb p
+    .{ .cp = 0x1D562, .w = 5.00, .h = 4.50, .d = 1.90, .ic = 0 }, // bb q
+    .{ .cp = 0x1D563, .w = 5.40, .h = 4.50, .d = 0.00, .ic = 0 }, // bb r
+    .{ .cp = 0x1D564, .w = 3.90, .h = 4.50, .d = 0.20, .ic = 0 }, // bb s
+    .{ .cp = 0x1D565, .w = 4.20, .h = 6.90, .d = 0.20, .ic = 0 }, // bb t
+    .{ .cp = 0x1D566, .w = 5.30, .h = 4.30, .d = 0.20, .ic = 0 }, // bb u
+    .{ .cp = 0x1D567, .w = 4.70, .h = 4.30, .d = 0.00, .ic = 0 }, // bb v
+    .{ .cp = 0x1D568, .w = 6.70, .h = 4.30, .d = 0.00, .ic = 0 }, // bb w
+    .{ .cp = 0x1D569, .w = 4.70, .h = 4.30, .d = 0.00, .ic = 0 }, // bb x
+    .{ .cp = 0x1D56A, .w = 4.70, .h = 4.30, .d = 2.20, .ic = 0 }, // bb y
+    .{ .cp = 0x1D56B, .w = 4.70, .h = 4.30, .d = 0.00, .ic = 0 }, // bb z
+    .{ .cp = 0x1D7D8, .w = 5.60, .h = 6.70, .d = 0.20, .ic = 0 }, // bb 0
+    .{ .cp = 0x1D7D9, .w = 5.60, .h = 6.40, .d = 0.00, .ic = 0 }, // bb 1
+    .{ .cp = 0x1D7DA, .w = 5.60, .h = 6.70, .d = 0.00, .ic = 0 }, // bb 2
+    .{ .cp = 0x1D7DB, .w = 5.60, .h = 6.70, .d = 0.20, .ic = 0 }, // bb 3
+    .{ .cp = 0x1D7DC, .w = 5.60, .h = 6.40, .d = 0.00, .ic = 0 }, // bb 4
+    .{ .cp = 0x1D7DD, .w = 5.60, .h = 6.40, .d = 0.20, .ic = 0 }, // bb 5
+    .{ .cp = 0x1D7DE, .w = 5.60, .h = 6.70, .d = 0.20, .ic = 0 }, // bb 6
+    .{ .cp = 0x1D7DF, .w = 5.60, .h = 6.40, .d = 0.00, .ic = 0 }, // bb 7
+    .{ .cp = 0x1D7E0, .w = 5.60, .h = 6.70, .d = 0.20, .ic = 0 }, // bb 8
+    .{ .cp = 0x1D7E1, .w = 5.60, .h = 6.70, .d = 0.20, .ic = 0 }, // bb 9
+};
+
 /// Roman-style metrics for Latin letters A-Z a-z, used when `style`
 /// is `.roman` (`\text`, `\mathrm`). TeX typesets roman text in family 0 =
 /// cmr10; the main `table` stores the math-italic rows for the same
@@ -1881,6 +1954,9 @@ fn tableFor(cp: u21, style: atom.CharStyle, size_pt: f32) []const Entry {
     }
     if (isRomanLetter(cp) and style == .roman) {
         return if (band7) &table_roman7 else if (band5) &table_roman5 else &table_roman;
+    }
+    if (style == .bb and search(&table_bb, cp) != null) {
+        return &table_bb;
     }
     return if (band7) &table7 else if (band5) &table5 else &table;
 }

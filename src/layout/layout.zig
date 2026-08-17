@@ -556,6 +556,35 @@ inline fn mathItalic(cp: u21) ?u21 {
     };
 }
 
+/// Blackboard (`\mathbb`) codepoint of a char, or null when it has none.
+/// Maps:
+///  · A–Z → U+1D538.. (math double-struck capitals);
+///  · a–z → U+1D552.. (math double-struck smalls);
+///  · 0–9 → U+1D7D8.. (math double-struck digits — \mathbb{1} → 𝟙 U+1D7D9);
+///  · C/H/N/P/Q/R/Z → the Letterlike double-struck ℂ U+2102, ℍ U+210D,
+///    ℕ U+2115, ℙ U+2119, ℚ U+211A, ℝ U+211D, ℤ U+2124 (unicode-math maps
+///    these to the Letterlike codepoints, NOT the U+1D538 series — the
+///    U+1D53B/1D53D/1D540..1D544/1D546/1D54A slots are unused gaps in the
+///    math-double-struck run).
+/// Callers gate on `.bb`; other styles never reach here.
+inline fn mathBb(cp: u21) ?u21 {
+    if (cp >= 0x41 and cp <= 0x5A) {
+        return switch (cp) {
+            0x43 => 0x2102, // C → ℂ
+            0x48 => 0x210D, // H → ℍ
+            0x4E => 0x2115, // N → ℕ
+            0x50 => 0x2119, // P → ℙ
+            0x51 => 0x211A, // Q → ℚ
+            0x52 => 0x211D, // R → ℝ
+            0x5A => 0x2124, // Z → ℤ
+            else => cp - 0x41 + 0x1D538,
+        };
+    }
+    if (cp >= 0x61 and cp <= 0x7A) return cp - 0x61 + 0x1D552;
+    if (cp >= 0x30 and cp <= 0x39) return cp - 0x30 + 0x1D7D8;
+    return null;
+}
+
 fn layoutChar(
     list: *box.BoxList,
     ast: *const atom.Ast,
@@ -593,6 +622,14 @@ fn layoutChar(
     if (cp == 0x2D) mcp = 0x2212;
     if (cstyle == .italic) {
         if (mathItalic(cp)) |m| {
+            if (metrics.hasGlyph(fm, m, cstyle)) mcp = m;
+        }
+    } else if (cstyle == .bb) {
+        // \mathbb: map to the double-struck glyph (letters/digits → the
+        // U+1D5xx/U+1D7Dx math-double-struck codepoints, C/H/N/P/Q/R/Z →
+        // the Letterlike ℂ/ℍ/ℕ/ℙ/ℚ/ℝ/ℤ). Without this, \mathbb{R} drew a
+        // plain R and \mathbb{1} a plain 1 — not the double-struck ℝ/𝟙.
+        if (mathBb(cp)) |m| {
             if (metrics.hasGlyph(fm, m, cstyle)) mcp = m;
         }
     }
