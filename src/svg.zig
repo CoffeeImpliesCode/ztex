@@ -145,6 +145,16 @@ pub fn render(gpa: std.mem.Allocator, dl: *const draw.DrawList, opts: Options) e
                     // 20pt — too short for 4 rows of content).
                     try buf.print(gpa, " data-delim-form=\"v{d}\"", .{t.delim_form});
                 }
+                if (t.delim_req > 0) {
+                    // A content-sized fence whose required ink EXCEEDS the
+                    // largest MATH-table variant (delim_form capped at v7
+                    // but the content — e.g. a 4-row pmatrix — is taller):
+                    // the exact required height in em of the base size, so
+                    // the rasterizer assembles the XeTeX GlyphAssembly
+                    // (top + N extenders + bottom) to exactly this height
+                    // instead of drawing v7 too short.
+                    try buf.print(gpa, " data-delim-req=\"{d:.3}\"", .{t.delim_req});
+                }
                 if (fs.weight.len > 0) {
                     try buf.print(gpa, " font-weight=\"{s}\"", .{fs.weight});
                 }

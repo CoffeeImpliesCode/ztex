@@ -68,6 +68,13 @@ pub const Text = struct {
     /// base size, not the base glyph scaled up — the variant ladder
     /// keeps the stroke constant; scaling thickens it).
     delim_form: u8 = 0,
+    /// content-sized `\left`/`\right` fence required ink in em (TeX
+    /// make_delim's 2δ·901/1000), carried from the box when the content is
+    /// TALLER than the largest MATH-table variant (delim_form == 7 but the
+    /// content still exceeds v7's ink). svg.zig emits `data-delim-req` so
+    /// the rasterizer assembles the XeTeX GlyphAssembly (top + extenders +
+    /// bottom) to exactly this height. 0 = the variant covers the content.
+    delim_req: f32 = 0,
     // provenance
     src_start: u32,
     src_end: u32,
@@ -229,6 +236,7 @@ pub fn flatten(
                 .bigop_form = ch.bigop_form,
                 .delim_fixed = ch.delim_fixed,
                 .delim_form = ch.delim_form,
+                .delim_req = ch.delim_req,
                 .src_start = b.src_start,
                 .src_end = b.src_end,
             } });

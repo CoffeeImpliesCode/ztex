@@ -129,6 +129,16 @@ pub const CharData = struct {
     /// at 20pt needs v6+, otherwise the paren is drawn at 20pt — too
     /// short for 4 rows of content).
     delim_form: u8 = 0,
+    /// For a content-sized `\left`/`\right` fence whose required ink
+    /// EXCEEDS the largest MATH-table variant (e.g. a 4-row pmatrix at
+    /// 20pt needs ~4em > parenleft.v7's 2.99em): the exact required height
+    /// in em of `size_pt`, carried so svg.zig can emit `data-delim-req`
+    /// and the rasterizer build an XeTeX-style GlyphAssembly (top + N
+    /// extenders + bottom) to that height instead of capping at the
+    /// smallest variant (v7), which would leave the fence too short to
+    /// cover the content. 0 when `delim_form`'s variant already covers
+    /// `req_em` — the common, non-exhausted-ladder case.
+    delim_req: f32 = 0,
 };
 
 /// The flat box pool.

@@ -578,6 +578,29 @@ def rasterize_svg(svg_path, png_path, font_dir=DEFAULT_FONT_DIR, scale=1.0):
                 # the layout reserved).
                 vi = int(a["data-delim-form"][1:])
                 cp_i = ord(content)
+                # The content EXCEEDS the largest MATH-table variant (a 4-row
+                # pmatrix at 20pt needs ~4em > parenleft.v7's 2.99em): the
+                # layout boxed the delimiter by the largest variant (its
+                # width for the following atoms) and carried the exact
+                # required height in data-delim-req. Assemble the XeTeX
+                # GlyphAssembly (top + N extenders + bottom) to that height
+                # — constant stroke, covers the content — instead of drawing
+                # v7, which would be too short.
+                if a.get("data-delim-req") and cp_i in DELIMITER_CPS:
+                    need_pt = float(a["data-delim-req"]) * size_pt
+                    plan = _delimiter_piece_plan(
+                        find_lm_font(_lm_font_name(a), font_dir),
+                        cp_i, size_pt, need_pt)
+                    if plan is not None:
+                        font = _variant_font(find_lm_font(_lm_font_name(a), font_dir),
+                                             size_pt * PT_TO_PX * ss)
+                        for _cp_i, _gname, dy in plan["pieces"]:
+                            draw.text(((x_pt) * PT_TO_PX * ss,
+                                       (y_pt + dy) * PT_TO_PX * ss),
+                                      chr(_cp_i), font=font, fill=fill,
+                                      anchor="ls")
+                        content = ""   # the pieces are drawn; skip the base char
+                        continue
                 if cp_i in DELIMITER_CPS and 1 <= vi <= 7:
                     pua = _delim_pua(cp_i, vi)
                     font = _variant_font(find_lm_font(_lm_font_name(a), font_dir),

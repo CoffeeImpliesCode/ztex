@@ -2297,6 +2297,16 @@ fn layoutDelimChar(
         // Tag the variant index so svg.zig can emit data-delim-form="vN"
         // (rasterizer resolves the same MATH-table glyph the layout boxed).
         cd.delim_form = @intCast(best_idx);
+        // When the required ink EXCEEDS the largest variant (the ladder is
+        // exhausted — e.g. a 4-row pmatrix at 20pt needs ~4em > parenleft.v7's
+        // 2.99em), the layout still boxes the delimiter by the largest
+        // variant (its width for the following atoms) but ALSO carries the
+        // exact required height so svg.zig can emit data-delim-req and the
+        // rasterizer assemble an XeTeX-style GlyphAssembly (top + N extenders
+        // + bottom) to that height. Without it the fence would be drawn at
+        // the largest variant — too short to cover the content.
+        const largest_ink = ladder[ladder.len - 1].asc + ladder[ladder.len - 1].desc;
+        if (req_em > largest_ink) cd.delim_req = req_em;
         return box_idx;
     }
     const ink = metrics.glyphInk(cp);
