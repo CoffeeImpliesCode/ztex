@@ -234,6 +234,7 @@ pub fn flatten(
                 .color = black,
                 .synthetic = ch.synthetic,
                 .bigop_form = ch.bigop_form,
+                .radical_form = ch.radical_form,
                 .delim_fixed = ch.delim_fixed,
                 .delim_form = ch.delim_form,
                 .delim_req = ch.delim_req,
