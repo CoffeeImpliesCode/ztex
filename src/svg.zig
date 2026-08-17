@@ -132,6 +132,19 @@ pub fn render(gpa: std.mem.Allocator, dl: *const draw.DrawList, opts: Options) e
                     // cannot tell it from a content-sized fence.
                     try buf.print(gpa, " data-fixed-req=\"{d:.3}\"", .{t.delim_fixed});
                 }
+                if (t.delim_form > 0) {
+                    // A \left/\right delimiter sized by content (TeX
+                    // make_delim, layoutDelimChar): the layout picked the
+                    // SMALLEST MATH-table variant whose asc+desc ink
+                    // covered the inner box's extent and tagged it as the
+                    // 1..7 ladder index. The rasterizer resolves the same
+                    // variant glyph (critique.py maps to a PUA codepoint);
+                    // the base font-size alone cannot tell it apart from
+                    // a plain `\left(x\right)` (a tall pmatrix fence at
+                    // 20pt needs v6+, otherwise the paren is drawn at
+                    // 20pt — too short for 4 rows of content).
+                    try buf.print(gpa, " data-delim-form=\"v{d}\"", .{t.delim_form});
+                }
                 if (fs.weight.len > 0) {
                     try buf.print(gpa, " font-weight=\"{s}\"", .{fs.weight});
                 }

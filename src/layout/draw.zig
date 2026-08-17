@@ -55,6 +55,19 @@ pub const Text = struct {
     /// svg.zig can emit data-fixed-req and the rasterizer resolve the same
     /// variant the layout boxed. 0 = a content-`\left` fence.
     delim_fixed: f32 = 0,
+    /// content-sized `\left`/`\right` fence MATH-table variant index
+    /// (0 = the BASE glyph was sufficient — plain `\left(x\right)`-style
+    /// fences, or non-fence char boxes; 1..7 = the SMALLEST MATH-table
+    /// variant whose asc+desc ink covered the inner box's extent, e.g.
+    /// parenleft.v6 for a 4-row pmatrix at 20pt). Carried from the box's
+    /// `delim_form` in `flatten`. svg.zig emits `data-delim-form="vN"`
+    /// so the rasterizer resolves the same variant glyph the layout
+    /// boxed — the declared base font-size alone cannot tell a stretched
+    /// fence apart from a plain one (a content-sized `\left..\right`
+    /// fence with `delim_form > 0` MUST be drawn as a variant glyph at
+    /// base size, not the base glyph scaled up — the variant ladder
+    /// keeps the stroke constant; scaling thickens it).
+    delim_form: u8 = 0,
     // provenance
     src_start: u32,
     src_end: u32,
@@ -214,8 +227,8 @@ pub fn flatten(
                 .color = black,
                 .synthetic = ch.synthetic,
                 .bigop_form = ch.bigop_form,
-                .radical_form = ch.radical_form,
                 .delim_fixed = ch.delim_fixed,
+                .delim_form = ch.delim_form,
                 .src_start = b.src_start,
                 .src_end = b.src_end,
             } });

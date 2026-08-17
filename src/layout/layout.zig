@@ -2272,10 +2272,12 @@ fn layoutDelimChar(
     const span = ast.span(idx);
     const cp = delimiterCp(ast, idx);
     if (metrics.delimVariants(cp)) |ladder| {
-        var best = ladder[ladder.len - 1];
-        for (ladder) |v| {
+        var best_idx: usize = ladder.len - 1;
+        var best = ladder[best_idx];
+        for (ladder, 0..) |v, i| {
             if (v.asc + v.desc >= req_em) {
                 best = v;
+                best_idx = i;
                 break;
             }
         }
@@ -2290,12 +2292,13 @@ fn layoutDelimChar(
             size_pt,
             span,
         );
-        if (n.data != 0) list.charDataPtr(box_idx).synthetic = true;
+        const cd = list.charDataPtr(box_idx);
+        if (n.data != 0) cd.synthetic = true;
+        // Tag the variant index so svg.zig can emit data-delim-form="vN"
+        // (rasterizer resolves the same MATH-table glyph the layout boxed).
+        cd.delim_form = @intCast(best_idx);
         return box_idx;
     }
-    // No variant ladder: continuous scaled base glyph (previous behavior;
-    // req_em × size / (2·half) = the old max(total_need/(2·half),
-    // (h−axis)/half, (d+axis)/half) floor).
     const ink = metrics.glyphInk(cp);
     const half = (ink.asc + ink.desc) / 2;
     const del_size = @max(size_pt, req_em * size_pt / (2 * half));

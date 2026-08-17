@@ -115,6 +115,20 @@ pub const CharData = struct {
     /// (a display `\binom{n}{k}` needs v6, which the ink-derived extent
     /// undershoots).
     delim_fixed: f32 = 0,
+    /// content-sized `\left`/`\right` fence MATH-table variant index
+    /// (0 = no fence sizing, the layout picked the BASE glyph; 1..7 =
+    /// parenleft.vN etc. — the SMALLEST variant whose asc+desc ink covers
+    /// `req_em`, with 7 as the ceiling when content exceeds every variant).
+    /// Set in layout.layoutDelimChar for paired `\left..\right` fences;
+    /// 0 for every `\big`/fixed/binom box (those carry `delim_fixed`
+    /// instead — the FIXED req from amsmath's fraction-delim rule).
+    /// svg.zig emits `data-delim-form="vN"` so the rasterizer resolves
+    /// the same variant glyph the layout boxed — the declared base
+    /// font-size alone cannot tell a stretched paren apart from a plain
+    /// one (a `\left( \begin{pmatrix} ... \\ ... \\ ... \\ ... \end{pmatrix} \right)`
+    /// at 20pt needs v6+, otherwise the paren is drawn at 20pt — too
+    /// short for 4 rows of content).
+    delim_form: u8 = 0,
 };
 
 /// The flat box pool.

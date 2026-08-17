@@ -564,6 +564,27 @@ def rasterize_svg(svg_path, png_path, font_dir=DEFAULT_FONT_DIR, scale=1.0):
                     font = _variant_font(find_lm_font(_lm_font_name(a), font_dir),
                                          size_pt * PT_TO_PX * ss)
                     content = chr(pua)
+            elif len(content) == 1 and a.get("data-delim-form"):
+                # A \left/\right delimiter sized by content (TeX make_delim,
+                # layoutDelimChar): the layout picked the SMALLEST MATH-table
+                # variant whose asc+desc ink covered the inner box's extent
+                # and tagged it as the 1..7 ladder index. The patched font
+                # maps the PUA char to the same variant glyph the layout
+                # boxed (constant stroke at any size — drawing the BASE
+                # glyph at the declared size would not stretch to cover the
+                # content; scaling it would thicken the stroke). The variant
+                # is drawn at the BASE math size (same as the SVG font-size
+                # — the variant glyph's own hmtx × size gives the box width
+                # the layout reserved).
+                vi = int(a["data-delim-form"][1:])
+                cp_i = ord(content)
+                if cp_i in DELIMITER_CPS and 1 <= vi <= 7:
+                    pua = _delim_pua(cp_i, vi)
+                    font = _variant_font(find_lm_font(_lm_font_name(a), font_dir),
+                                         size_pt * PT_TO_PX * ss)
+                    content = chr(pua)
+                else:
+                    font = _face_for(a, font_dir, size_pt * PT_TO_PX * ss)
             elif len(content) == 1 and (x_pt, y_pt, content) in delim_targets:
                 # Stretched delimiter: draw the MATH size VARIANT (constant
                 # stroke). Paired \left..\right delimiters draw at the declared

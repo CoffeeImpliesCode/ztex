@@ -15,6 +15,7 @@ const std = @import("std");
 pub const integration = @import("integration.zig");
 pub const regression = @import("regression.zig");
 pub const sanity = @import("sanity.zig");
+pub const sanity_delim_form = @import("sanity_delim_form.zig");
 
 test {
     std.testing.refAllDecls(@This());
