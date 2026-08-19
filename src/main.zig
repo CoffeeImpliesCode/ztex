@@ -2,12 +2,16 @@ const std = @import("std");
 const ztex = @import("ztex");
 
 const usage =
-    \\ztex — render LaTeX math to an SVG.
+    \\ztex — render LaTeX math to an SVG or raster image (PPM/PGM).
     \\
     \\  -i <latex>   input formula (default: a sample)
-    \\  -o <file>    write SVG to file (default: stdout)
+    \\  -o <file>    write SVG or image to file (default: stdout)
     \\  -s <pt>      font size in points (default 20)
-    \\  -p <px>      SVG padding (default 0)
+    \\  -p <px>      padding in px / pt (default 0)
+    \\  --dpi <num>  raster resolution in DPI (default 96)
+    \\  --png        write PNG bitmap (auto-detected if -o ends in .png)
+    \\  --ppm        write PPM (P6) 24-bit image
+    \\  --pgm        write PGM (P5) 8-bit alpha mask
     \\  -b <color>   background: name or #RRGGBB[AA] (default: white; use
     \\               'none'/'transparent' for no background)
     \\  --bg <color>  alias for -b
@@ -27,7 +31,9 @@ pub fn main(init: std.process.Init) !void {
     var out_path: ?[]const u8 = null;
     var size: f32 = 20;
     var pad: f32 = 0;
-    var bg: ?ztex.draw.Color = .{ .r = 255, .g = 255, .b = 255 }; // white
+    var dpi: f32 = 96.0;
+    var bg: ?ztex.draw.Color = .{ .r = 255, .g = 255, .b = 255, .a = 255 }; // white
+    var raster_format: ?ztex.raster.Format = null;
 
     var arg_it = std.process.Args.Iterator.init(init.minimal.args);
     _ = arg_it.next(); // skip argv[0]
@@ -42,11 +48,15 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "-p")) {
             pad = std.fmt.parseFloat(f32, arg_it.next() orelse return error.MissingValue) catch
                 return error.BadPadding;
+        } else if (std.mem.eql(u8, arg, "--dpi")) {
+            dpi = std.fmt.parseFloat(f32, arg_it.next() orelse return error.MissingValue) catch
+                return error.BadDpi;
+        } else if (std.mem.eql(u8, arg, "--ppm")) {
+            raster_format = .rgba32;
+        } else if (std.mem.eql(u8, arg, "--pgm")) {
+            raster_format = .alpha8;
         } else if (std.mem.eql(u8, arg, "-b") or std.mem.eql(u8, arg, "--bg")) {
             const v = arg_it.next() orelse return error.MissingValue;
-            // parseColorChecked distinguishes the valid "no background"
-            // values (none/transparent → null) from a typo, which is a real
-            // CLI error instead of a silent transparent background.
             bg = ztex.svg.parseColorChecked(v) catch |e| switch (e) {
                 error.UnrecognizedColor => {
                     try std.Io.File.stderr().writeStreamingAll(
@@ -69,6 +79,15 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    if (out_path) |p| {
+        if (raster_format == null) {
+            if (std.mem.endsWith(u8, p, ".ppm") or std.mem.endsWith(u8, p, ".pnm")) {
+                raster_format = .rgba32;
+            } else if (std.mem.endsWith(u8, p, ".pgm")) {
+                raster_format = .alpha8;
+            }
+        }
+    }
     var ctx = try ztex.Context.init(gpa);
     defer ctx.deinit();
 
@@ -90,6 +109,25 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         },
     };
+
+    if (raster_format) |fmt| {
+        const pad_u: u32 = @intFromFloat(@max(0.0, pad));
+        var pix = try ztex.raster.rasterize(gpa, &ctx, &dl, .{
+            .dpi = dpi,
+            .padding = pad_u,
+            .format = fmt,
+            .bg = bg,
+        });
+        if (out_path) |path| {
+            var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+            defer file.close(io);
+            try pix.writePnm(io, file);
+        } else {
+            try pix.writePnm(io, std.Io.File.stdout());
+        }
+        return;
+    }
+
     const opts: ztex.svg.Options = .{ .padding = pad, .background = bg };
 
     if (out_path) |path| {

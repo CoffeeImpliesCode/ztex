@@ -11,6 +11,10 @@ pub const parse = @import("ztex.parse");
 pub const layout = @import("ztex.layout");
 pub const draw = layout.draw;
 pub const svg = @import("ztex.svg");
+pub const font = @import("font.zig");
+pub const raster = @import("raster.zig");
+pub const PixelBuffer = raster.PixelBuffer;
+pub const RasterOptions = raster.Options;
 // Imported by path, not re-exported: hosts reach the font-backed context
 // through `ztex.Context` below.
 const context = @import("context.zig");
@@ -18,7 +22,6 @@ const context = @import("context.zig");
 /// Font-backed rendering context: owns a FontContext and a FontMetrics
 /// wired to it — "initialize once, render many" (see context.zig).
 pub const Context = context.Context;
-
 /// Shared parse+layout pipeline behind both facades. Internal — not part of
 /// the host-facing API: `ztex.render` and `Context.render` are the public
 /// entry points, differing only in the metric source (`&metrics.default`
@@ -59,6 +62,20 @@ pub fn render(
     return renderPipeline(gpa, &layout.metrics.default, src, size_pt, err_info);
 }
 
+/// One-shot rasterization: initializes a temporary FontContext and rasterizes
+/// the formula to a PixelBuffer. For batch rendering, prefer initializing a
+/// persistent `ztex.Context` and calling `ctx.renderPixels`.
+pub fn renderPixels(
+    gpa: std.mem.Allocator,
+    src: []const u8,
+    size_pt: f32,
+    opts: RasterOptions,
+    err_info: ?*parse.Info,
+) !PixelBuffer {
+    var ctx = try Context.init(gpa);
+    defer ctx.deinit();
+    return ctx.renderPixels(src, size_pt, opts, err_info);
+}
 test {
     std.testing.refAllDecls(@This());
 }
@@ -117,4 +134,40 @@ test "facade: text renders glyphs with source spans" {
     try testing.expectEqualStrings("i", t1.bytes);
     try testing.expectEqual(@as(u32, 7), t1.src_start);
     try testing.expectEqual(@as(u32, 8), t1.src_end);
+}
+
+test "facade: renderPixels produces non-empty RGBA pixel buffer" {
+    var pix = try renderPixels(testing.allocator, "x^2 + 1", 20.0, .{}, null);
+    defer pix.deinit();
+    try testing.expect(pix.width > 0);
+    try testing.expect(pix.height > 0);
+    try testing.expectEqual(@as(usize, pix.width * pix.height * 4), pix.pixels.len);
+
+    // Check that some ink was actually drawn (alpha > 0)
+    var has_ink = false;
+    var i: usize = 0;
+    while (i < pix.pixels.len) : (i += 4) {
+        if (pix.pixels[i + 3] > 0) {
+            has_ink = true;
+            break;
+        }
+    }
+    try testing.expect(has_ink);
+}
+
+test "facade: renderPixels produces alpha8 mask" {
+    var pix = try renderPixels(testing.allocator, "\\frac{a}{b}", 20.0, .{ .format = .alpha8 }, null);
+    defer pix.deinit();
+    try testing.expect(pix.width > 0);
+    try testing.expect(pix.height > 0);
+    try testing.expectEqual(@as(usize, pix.width * pix.height), pix.pixels.len);
+
+    var has_ink = false;
+    for (pix.pixels) |a| {
+        if (a > 0) {
+            has_ink = true;
+            break;
+        }
+    }
+    try testing.expect(has_ink);
 }

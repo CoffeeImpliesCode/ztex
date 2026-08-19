@@ -39,6 +39,9 @@ const parse = @import("ztex.parse");
 const layout = @import("ztex.layout");
 const metrics = layout.metrics;
 const draw = layout.draw;
+pub const raster = @import("raster.zig");
+pub const PixelBuffer = raster.PixelBuffer;
+pub const RasterOptions = raster.Options;
 // The root module hosts the shared `renderPipeline` this facade delegates
 // to (same module directory, so the relative import stays inside the ztex
 // module; root.zig imports this file back — Zig resolves the cycle lazily).
@@ -118,6 +121,19 @@ pub const Context = struct {
         err_info: ?*parse.Info,
     ) (parse.Error || error{InvalidAst})!draw.DrawList {
         return root.renderPipeline(self.gpa, &self.fm, src, size_pt, err_info);
+    }
+
+    /// Render a formula directly to a raster PixelBuffer (RGBA or Alpha mask).
+    pub fn renderPixels(
+        self: *Context,
+        src: []const u8,
+        size_pt: f32,
+        opts: RasterOptions,
+        err_info: ?*parse.Info,
+    ) !PixelBuffer {
+        var dl = try self.render(src, size_pt, err_info);
+        defer dl.deinit();
+        return raster.rasterize(self.gpa, self, &dl, opts);
     }
 };
 
