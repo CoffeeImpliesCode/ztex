@@ -1949,13 +1949,10 @@ fn band17(size_pt: f32) bool {
 fn tableFor(cp: u21, style: atom.CharStyle, size_pt: f32) []const Entry {
     const band7 = size_pt > 6.4 and size_pt < 7.6;
     const band5 = size_pt > 4.5 and size_pt < 5.5;
-    if (style == .roman and band17(size_pt) and search(&table_roman17, cp) != null) {
-        return &table_roman17;
-    }
     if (isRomanLetter(cp) and style == .roman) {
         return if (band7) &table_roman7 else if (band5) &table_roman5 else &table_roman;
     }
-    if (style == .bb and search(&table_bb, cp) != null) {
+    if (style == .bb) {
         return &table_bb;
     }
     return if (band7) &table7 else if (band5) &table5 else &table;
@@ -1997,6 +1994,13 @@ pub fn glyphAt(fm: *const FontMetrics, cp: u21, style: atom.CharStyle, size_pt: 
     if (search(tableFor(cp, style, size_pt), cp)) |e| {
         return .{ .width = e.w, .height = e.h, .depth = e.d, .italic_correction = e.ic };
     }
+    if (style == .bb) {
+        // Fallback to standard table if not found in table_bb
+        const tbl = if (band7) &table7 else if (band5) &table5 else &table;
+        if (search(tbl, cp)) |e| {
+            return .{ .width = e.w, .height = e.h, .depth = e.d, .italic_correction = e.ic };
+        }
+    }
     return null;
 }
 
@@ -2010,7 +2014,21 @@ pub fn glyphAt(fm: *const FontMetrics, cp: u21, style: atom.CharStyle, size_pt: 
 /// that box (digits 0.666em vs 0.644em, ∫ sup '1' 9.32pt of ink in a
 /// 9.02pt box at 14pt) — the frame/viewBox then clips the ink. The box
 /// width stays the metric-table advance; only height/depth change.
+const ascii_ink_lut = blk: {
+    var lut: [128]?GlyphInk = undefined;
+    for (&lut) |*slot| slot.* = null;
+    for (ink_table) |e| {
+        if (e.cp < 128) {
+            lut[e.cp] = .{ .asc = e.a, .desc = e.d };
+        }
+    }
+    break :blk lut;
+};
+
 pub fn glyphInk(cp: u21) GlyphInk {
+    if (cp < 128) {
+        if (ascii_ink_lut[cp]) |ink| return ink;
+    }
     var lo: usize = 0;
     var hi: usize = ink_table.len;
     while (lo < hi) {
@@ -2584,6 +2602,13 @@ fn glyphImpl(fm: *const FontMetrics, cp: u21, style: atom.CharStyle) ?Glyph {
 /// cmsy10/cmr10 symbols). Public so callers can reuse the rows' italic
 /// corrections (LM Math's MATH table is not parsed yet).
 pub fn staticGlyph(cp: u21, style: atom.CharStyle) ?Glyph {
+    if (cp < 128) {
+        if (isRomanLetter(cp) and style == .roman) {
+            if (roman_ascii_lut[cp]) |g| return g;
+        } else {
+            if (ascii_lut[cp]) |g| return g;
+        }
+    }
     const tbl = tableFor(cp, style, 0);
     var lo: usize = 0;
     var hi: usize = tbl.len;

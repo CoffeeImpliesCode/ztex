@@ -219,12 +219,11 @@ pub fn flatten(
             // its glyph is duped into the glyph arena. Synthetic is the sole
             // non-alias case — no byte comparison needed.
             const ch = list.charData(root);
-            var buf: [4]u8 = undefined;
-            const n = std.unicode.utf8Encode(ch.cp, &buf) catch 0;
-            const bytes = if (ch.synthetic)
-                try out.glyph_arena.allocator().dupe(u8, buf[0..n])
-            else
-                src[b.src_start..b.src_end];
+            const bytes = if (ch.synthetic) blk: {
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(ch.cp, &buf) catch 0;
+                break :blk try out.glyph_arena.allocator().dupe(u8, buf[0..n]);
+            } else src[b.src_start..b.src_end];
             try out.add(.{ .text = .{
                 .bytes = bytes,
                 .x = x,

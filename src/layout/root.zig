@@ -43,9 +43,11 @@ pub fn render(
     // placement scratch. These are capacity-only hints; they remove the
     // geometric realloc/copy churn in BoxList.create without touching any
     // geometry. Under-reserving is graceful (the pool grows on demand).
-    try list.boxes.ensureTotalCapacity(gpa, ast.nodes.items.len);
-    try list.childrefs.ensureTotalCapacity(gpa, ast.nodes.items.len);
-    try list.scratch.ensureTotalCapacity(gpa, ast.nodes.items.len);
+    const est_boxes = @max(16, ast.nodes.items.len * 2);
+    try list.boxes.ensureTotalCapacity(gpa, est_boxes);
+    try list.chars.ensureTotalCapacity(gpa, est_boxes);
+    try list.childrefs.ensureTotalCapacity(gpa, est_boxes);
+    try list.scratch.ensureTotalCapacity(gpa, est_boxes);
     const root_box = try layout.layout(&list, ast, root, fm, .display, size_pt, .italic);
     var out = draw.DrawList.init(gpa);
     errdefer out.deinit();
@@ -96,28 +98,58 @@ fn validateAst(
     ast: *const atom.Ast,
     root: u32,
 ) error{ OutOfMemory, InvalidAst }!void {
-    if (root >= ast.nodes.items.len) return error.InvalidAst;
-    const seen = try gpa.alloc(bool, ast.nodes.items.len);
-    defer gpa.free(seen);
+    const count = ast.nodes.items.len;
+    if (root >= count) return error.InvalidAst;
+
+    var seen_buf: [128]bool = undefined;
+    var work_buf: [128]u32 = undefined;
+
+    const seen = if (count <= seen_buf.len)
+        seen_buf[0..count]
+    else
+        try gpa.alloc(bool, count);
+    defer if (count > seen_buf.len) gpa.free(seen);
+
     @memset(seen, false);
     seen[root] = true;
-    var worklist: std.ArrayList(u32) = .empty;
-    defer worklist.deinit(gpa);
-    try worklist.append(gpa, root);
-    while (worklist.pop()) |idx| {
+
+    var work_len: usize = 1;
+    var dyn_work: ?std.ArrayList(u32) = null;
+    defer if (dyn_work) |*w| w.deinit(gpa);
+
+    work_buf[0] = root;
+
+    while (work_len > 0) {
+        work_len -= 1;
+        const idx = if (dyn_work) |*w|
+            w.pop().?
+        else
+            work_buf[work_len];
+
         const n = ast.nodes.items[idx];
         if (!arityOk(n.tag, n)) return error.InvalidAst;
         if (n.num_children == 0) continue;
-        // first_child + num_children must not overflow u32 (a hand-built
-        // node could set first_child near maxInt).
         if (n.first_child > std.math.maxInt(u32) - @as(u32, n.num_children)) return error.InvalidAst;
         const end = n.first_child + n.num_children;
         var c = n.first_child;
         while (c < end) : (c += 1) {
-            if (c >= ast.nodes.items.len) return error.InvalidAst;
+            if (c >= count) return error.InvalidAst;
             if (seen[c]) return error.InvalidAst;
             seen[c] = true;
-            try worklist.append(gpa, c);
+            if (dyn_work) |*w| {
+                try w.append(gpa, c);
+                work_len += 1;
+            } else if (work_len < work_buf.len) {
+                work_buf[work_len] = c;
+                work_len += 1;
+            } else {
+                var w: std.ArrayList(u32) = .empty;
+                try w.ensureTotalCapacity(gpa, count);
+                try w.appendSlice(gpa, work_buf[0..work_len]);
+                try w.append(gpa, c);
+                dyn_work = w;
+                work_len += 1;
+            }
         }
     }
 }

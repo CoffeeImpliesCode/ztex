@@ -16,8 +16,17 @@ const corpus = [_][]const u8{
     "\\frac{\\frac{a}{b}}{\\frac{c}{d}}",
     "\\text{The quick brown fox jumps over the lazy dog.}",
     "\\mathbf{x}+\\mathrm{abc}+\\text{\u{03b1}\u{03b2}}",
+    "\\cfrac{1}{a_1+\\cfrac{1}{a_2}}",
+    "\\binom{n}{k}",
+    "\\sqrt{a^2+b^2}",
+    "\\sqrt[3]{\\frac{a}{b}}",
+    "\\left( \\frac{x+1}{x-1} \\right)",
+    "\\left\\{ \\frac{a}{b} \\right\\}",
+    "\\int_0^1 x^2\\,dx",
+    "\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}",
+    "\\begin{cases} x & x>0 \\\\ -x & x\\le 0 \\end{cases}",
+    "\\alpha + \\beta \\le \\gamma",
 };
-
 const default_iters: usize = 100_000;
 
 /// Monotonic clock in nanoseconds. `std.time.Timer` was removed in Zig 0.16;

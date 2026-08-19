@@ -472,7 +472,7 @@ pub const Ast = struct {
         });
     }
 
-    pub fn node(self: *const Ast, idx: u32) Node {
+    pub inline fn node(self: *const Ast, idx: u32) Node {
         return self.nodes.items[idx];
     }
 
@@ -480,7 +480,7 @@ pub const Ast = struct {
     /// (callers must check `num_children` first; an empty node has
     /// `num_children == 0` — never probe `first_child == 0`, which is a
     /// valid index).
-    pub fn child(self: *const Ast, idx: u32, i: usize) u32 {
+    pub inline fn child(self: *const Ast, idx: u32, i: usize) u32 {
         const n = self.node(idx);
         if (i >= n.num_children) @panic("Ast.child: child index out of bounds");
         return n.first_child + @as(u32, @intCast(i));
@@ -490,7 +490,7 @@ pub const Ast = struct {
     ///
     /// O(1): `src[tokens[first].start .. tokens[last].end]`. Only meaningful
     /// for nodes whose token range is non-empty.
-    pub fn span(self: *const Ast, idx: u32) Span {
+    pub inline fn span(self: *const Ast, idx: u32) Span {
         const n = self.node(idx);
         if (n.num_tokens == 0) return .{ .start = 0, .end = 0 };
         const first_t = self.tokens.items[n.first_token];
