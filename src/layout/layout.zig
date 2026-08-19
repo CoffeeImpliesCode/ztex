@@ -3329,7 +3329,7 @@ fn bigOpCodepoint(op: atom.BigOp) u21 {
         .oint => 0x222E, // ∮
         .oiint => 0x222F, // ∯
         .oiiint => 0x2230, // ∰
-        .ointctrclockwise => 0x2A11, // ⨑
+        .ointctrclockwise => 0x222E, // ∮ (contourintegral)
     };
 }
 

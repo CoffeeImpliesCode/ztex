@@ -178,11 +178,63 @@ fn drawGlyph(
     };
 
     const face = switch (t.style) {
-        .italic => ctx.fonts.mathFace(),
-        else => ctx.fonts.romanFace(false),
+        .roman => ctx.fonts.romanFace(false),
+        else => ctx.fonts.mathFace(),
     };
 
-    const gid = face.glyphIndex(cp) orelse return;
+    // Resolve OpenType MATH variants for big operators, radicals, and delimiters
+    const gid = blk: {
+        if (t.bigop_form == .variant) {
+            if (cp == 0x2211) break :blk @as(u32, 3074); // summation.v1
+            if (cp == 0x220F) break :blk @as(u32, 3075); // product.v1
+            if (cp == 0x222B) break :blk @as(u32, 3063); // integral.v1
+            if (cp == 0x222E or cp == 0x2A11) break :blk @as(u32, 3067); // contourintegral.v1
+        }
+        if (t.radical_form > 0) {
+            switch (t.radical_form) {
+                1 => break :blk @as(u32, 3081), // radical.v1
+                2 => break :blk @as(u32, 3082), // radical.v2
+                3 => break :blk @as(u32, 3083), // radical.v3
+                4 => break :blk @as(u32, 3084), // radical.v4
+                5 => break :blk @as(u32, 3080), // radical.tp
+                6 => break :blk @as(u32, 3079), // radical.ex
+                else => {},
+            }
+        }
+        if (t.delim_form > 0 or t.delim_fixed > 0) {
+            const vi = if (t.delim_form > 0) t.delim_form else blk_fix: {
+                if (t.delim_fixed >= 2.8) break :blk_fix @as(u8, 7);
+                if (t.delim_fixed >= 2.3) break :blk_fix @as(u8, 6);
+                if (t.delim_fixed >= 1.9) break :blk_fix @as(u8, 5);
+                if (t.delim_fixed >= 1.5) break :blk_fix @as(u8, 4);
+                if (t.delim_fixed >= 1.2) break :blk_fix @as(u8, 3);
+                if (t.delim_fixed >= 0.9) break :blk_fix @as(u8, 2);
+                break :blk_fix @as(u8, 1);
+            };
+            if (cp == '(') {
+                switch (vi) {
+                    1 => break :blk @as(u32, 2367), // parenleft.v1
+                    2 => break :blk @as(u32, 2389), // parenleft.v2
+                    3 => break :blk @as(u32, 2411), // parenleft.v3
+                    4 => break :blk @as(u32, 2433), // parenleft.v4
+                    5 => break :blk @as(u32, 2455), // parenleft.v5
+                    6 => break :blk @as(u32, 2477), // parenleft.v6
+                    else => break :blk @as(u32, 2499), // parenleft.v7
+                }
+            } else if (cp == ')') {
+                switch (vi) {
+                    1 => break :blk @as(u32, 2368), // parenright.v1
+                    2 => break :blk @as(u32, 2390), // parenright.v2
+                    3 => break :blk @as(u32, 2412), // parenright.v3
+                    4 => break :blk @as(u32, 2434), // parenright.v4
+                    5 => break :blk @as(u32, 2456), // parenright.v5
+                    6 => break :blk @as(u32, 2478), // parenright.v6
+                    else => break :blk @as(u32, 2500), // parenright.v7
+                }
+            }
+        }
+        break :blk face.glyphIndex(cp) orelse return;
+    };
     var outline = try face.glyphOutline(gpa, gid);
     defer outline.deinit();
     if (outline.curves.items.len == 0) return;
