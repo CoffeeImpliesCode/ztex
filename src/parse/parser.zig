@@ -83,6 +83,9 @@ const Command = enum {
     op_bigcap,
     op_bigsqcup,
     op_oint,
+    op_oiint,
+    op_oiiint,
+    op_ointctrclockwise,
     /// an operator word (\sin \lim \log ...): roman styled run of the name
     opname,
     /// \left ... \right delimited construct
@@ -188,6 +191,10 @@ const cmd_map = std.StaticStringMap(Command).initComptime(&[_]struct { []const u
     .{ "bigcap", .op_bigcap },
     .{ "bigsqcup", .op_bigsqcup },
     .{ "oint", .op_oint },
+    .{ "oiint", .op_oiint },
+    .{ "oiiint", .op_oiiint },
+    .{ "ointctrclockwise", .op_ointctrclockwise },
+    .{ "ointctrclockwisectr", .op_ointctrclockwise },
     .{ "left", .left },
     .{ "right", .right },
     .{ "big", .big },
@@ -945,15 +952,9 @@ pub const Parser = struct {
     /// as a row-leading script.
     ///
     /// A trailing prime on an ALREADY-SCRIPTED atom merges into the SAME
-    /// script node (TeX: `f_2'` is one noad with sub 2 AND sup ′, so the
-    /// prime raises by the char-nucleus sup1 floor, not by the script
-    /// box's height − supdrop). A script that already has a superscript
-    /// (`x^2'`, `x_2^3'`) errors — TeX's "Double superscript". The
-    /// merge rewrites the script node with children [base, prime, sub]
-    /// (superflat contiguity: the new node is a fresh pool entry).
     fn parseAtom(self: *Parser, ast: *atom.Ast) Error!u32 {
         const base = try self.parseSingleAtom(ast);
-        const result = try self.parseScripts(ast, base);
+        var result = try self.parseScripts(ast, base);
         var prime_count: usize = 0;
         const first_prime_tok: u32 = @intCast(self.pos);
         while (self.peek()) |t| {
@@ -978,17 +979,21 @@ pub const Parser = struct {
             const children = [_]atom.Node{ ast.node(sb), pn, ast.node(sub) };
             const num_tokens = (first_prime_tok + @as(u32, @intCast(prime_count))) -
                 ast.node(sb).first_token;
-            return ast.createNode(
+            result = try ast.createNode(
                 .script,
                 ast.node(sb).first_token,
                 num_tokens,
                 &children,
                 atom.ScriptBits.sup | atom.ScriptBits.sub,
             );
+        } else {
+            const children = [_]atom.Node{ rn, pn };
+            const num_tokens = (first_prime_tok + @as(u32, @intCast(prime_count))) - rn.first_token;
+            result = try ast.createNode(.script, rn.first_token, num_tokens, &children, atom.ScriptBits.sup);
         }
-        const children = [_]atom.Node{ rn, pn };
-        const num_tokens = (first_prime_tok + @as(u32, @intCast(prime_count))) - rn.first_token;
-        return ast.createNode(.script, rn.first_token, num_tokens, &children, atom.ScriptBits.sup);
+
+        // After prime merging, any subsequent ^ or _ attaches to the script/base (e.g. x_0'^2 or f'(x))
+        return self.parseScripts(ast, result);
     }
 
     /// Parse exactly one base atom (no scripts).
@@ -1198,6 +1203,9 @@ pub const Parser = struct {
             .op_bigcap => self.op(ast, cmd_tok, .bigcap),
             .op_bigsqcup => self.op(ast, cmd_tok, .bigsqcup),
             .op_oint => self.op(ast, cmd_tok, .oint),
+            .op_oiint => self.op(ast, cmd_tok, .oiint),
+            .op_oiiint => self.op(ast, cmd_tok, .oiiint),
+            .op_ointctrclockwise => self.op(ast, cmd_tok, .ointctrclockwise),
             .opname => self.opname(ast, cmd_tok, name),
             .left => self.parseLeftRight(ast, cmd_tok),
             .right => self.fail(.unexpected_r_group, self.spanAt(cmd_tok)),

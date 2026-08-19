@@ -581,6 +581,54 @@ inline fn mathBb(cp: u21) ?u21 {
     return null;
 }
 
+/// Mathematical Calligraphic / Script mapping (\mathcal):
+///  · Latin letters A–Z → U+1D49C.. (Mathematical Script Capital)
+///  · Exceptions with reserved legacy codepoints:
+///    B → U+212C, E → U+2130, F → U+2131, H → U+210B, I → U+2110, L → U+2112,
+///    M → U+2133, R → U+211B, e → U+212F, g → U+210A, o → U+2134.
+inline fn mathCal(cp: u21) ?u21 {
+    if (cp >= 0x41 and cp <= 0x5A) {
+        return switch (cp) {
+            0x42 => 0x212C, // B → ℬ
+            0x45 => 0x2130, // E → ℰ
+            0x46 => 0x2131, // F → ℱ
+            0x48 => 0x210B, // H → ℋ
+            0x49 => 0x2110, // I → ℐ
+            0x4C => 0x2112, // L → ℒ
+            0x4D => 0x2133, // M → ℳ
+            0x52 => 0x211B, // R → ℛ
+            else => cp - 0x41 + 0x1D49C,
+        };
+    }
+    if (cp >= 0x61 and cp <= 0x7A) {
+        return switch (cp) {
+            0x65 => 0x212F, // e → ℯ
+            0x67 => 0x210A, // g → ℊ
+            0x6F => 0x2134, // o → ℴ
+            else => cp - 0x61 + 0x1D4B6,
+        };
+    }
+    return null;
+}
+
+/// Mathematical Fraktur mapping (\mathfrak):
+///  · Latin letters A–Z → U+1D504..
+///  · Exceptions: C → U+212D, H → U+210C, I → U+2111, R → U+211C, Z → U+2128
+inline fn mathFrak(cp: u21) ?u21 {
+    if (cp >= 0x41 and cp <= 0x5A) {
+        return switch (cp) {
+            0x43 => 0x212D, // C → ℭ
+            0x48 => 0x210C, // H → ℌ
+            0x49 => 0x2111, // I → ℑ
+            0x52 => 0x211C, // R → ℜ
+            0x5A => 0x2128, // Z → ℨ
+            else => cp - 0x41 + 0x1D504,
+        };
+    }
+    if (cp >= 0x61 and cp <= 0x7A) return cp - 0x61 + 0x1D51E;
+    return null;
+}
+
 fn layoutChar(
     list: *box.BoxList,
     ast: *const atom.Ast,
@@ -626,6 +674,14 @@ fn layoutChar(
         // the Letterlike ℂ/ℍ/ℕ/ℙ/ℚ/ℝ/ℤ). Without this, \mathbb{R} drew a
         // plain R and \mathbb{1} a plain 1 — not the double-struck ℝ/𝟙.
         if (mathBb(cp)) |m| {
+            if (metrics.hasGlyph(fm, m, cstyle)) mcp = m;
+        }
+    } else if (cstyle == .cal) {
+        if (mathCal(cp)) |m| {
+            if (metrics.hasGlyph(fm, m, cstyle)) mcp = m;
+        }
+    } else if (cstyle == .frak) {
+        if (mathFrak(cp)) |m| {
             if (metrics.hasGlyph(fm, m, cstyle)) mcp = m;
         }
     }
@@ -2755,7 +2811,10 @@ fn layoutSqrt(
         const deg_size = size_pt * gl.scriptscriptfactor;
         const db = try layoutInner(list, ast, d, fm, .script_script, deg_size, cstyle, true);
         const gb = list.get(db);
-        const deg_x = 0.073 * rad_ink_height + 0.278 * deg_size;
+        // TeX places the radical index at the upper-left of the radical stem.
+        // The degree x-offset should NOT scale with total radical height;
+        // anchor it consistently near the radical left overhang.
+        const deg_x = 0.20 * deg_size;
         const raise = if (use_assembly) 0.6 * rule_top else 0.6 * (height - hbox_depth);
         try list.scratch.append(list.gpa, .{ .idx = db, .x_shift = deg_x, .shift = -raise });
         height = @max(height, raise + gb.height);
@@ -3268,6 +3327,9 @@ fn bigOpCodepoint(op: atom.BigOp) u21 {
         .bigcap => 0x22C2, // ⋂
         .bigsqcup => 0x2A06, // ⨆
         .oint => 0x222E, // ∮
+        .oiint => 0x222F, // ∯
+        .oiiint => 0x2230, // ∰
+        .ointctrclockwise => 0x2A11, // ⨑
     };
 }
 
@@ -3283,6 +3345,9 @@ fn bigOpByCp(cp: u21) ?atom.BigOp {
         0x22C2 => .bigcap,
         0x2A06 => .bigsqcup,
         0x222E => .oint,
+        0x222F => .oiint,
+        0x2230 => .oiiint,
+        0x2A11 => .ointctrclockwise,
         else => null,
     };
 }
@@ -3295,7 +3360,7 @@ fn bigOpByCp(cp: u21) ?atom.BigOp {
 fn bigOpLimits(op: atom.BigOp) bool {
     return switch (op) {
         .sum, .prod, .coprod, .bigcup, .bigcap, .bigsqcup => true,
-        .int, .oint => false,
+        .int, .oint, .oiint, .oiiint, .ointctrclockwise => false,
     };
 }
 
@@ -3390,20 +3455,13 @@ fn bigOpInk(op: atom.BigOp, display: bool) BigOpInk {
             .desc = 0.264,
             .ic = 0,
         }, // U+2A06 ⨆
-        .int => BigOpInk{
+        .int, .oint, .oiint, .oiiint, .ointctrclockwise => BigOpInk{
             .advance = 0.665,
             .disp_advance = 0.665,
             .asc = 0.805,
             .desc = 0.306,
             .ic = 3.32,
-        }, // U+222B ∫
-        .oint => BigOpInk{
-            .advance = 0.665,
-            .disp_advance = 0.665,
-            .asc = 0.805,
-            .desc = 0.306,
-            .ic = 3.32,
-        }, // U+222E ∮
+        },
     };
     if (!display) return base;
     // Display variants (summation.v1, integral.v1, ... — hmtx advances and
@@ -3417,18 +3475,9 @@ fn bigOpInk(op: atom.BigOp, display: bool) BigOpInk {
         .bigcup => BigOpInk{ .advance = 1.111, .disp_advance = 1.111, .asc = 0.917, .desc = 0.439, .ic = 0 },
         .bigcap => BigOpInk{ .advance = 1.111, .disp_advance = 1.111, .asc = 0.939, .desc = 0.417, .ic = 0 },
         .bigsqcup => BigOpInk{ .advance = 1.111, .disp_advance = 1.111, .asc = 0.936, .desc = 0.436, .ic = 0 },
-        // ∫/∮ nolimits: the row box keeps the base advance (measured: the
-        // scripted \int_0^1 row advances by 0.665em + scripts, and the bare
-        // \int x by 0.665 + 0.334 + thin) but the box height/depth and the
-        // beside-script attachment come from the display variant: the sup
-        // lands at the variant ADVANCE (0.999em — measured \int_0^1 sup at
-        // 9.988pt) and the sub at variant advance − variant italic
-        // (0.408em — measured \int_0^1 sub at 4.078pt).
-        .int => BigOpInk{ .advance = 0.665, .disp_advance = 0.999, .asc = 1.361, .desc = 0.861, .ic = 5.91 },
-        .oint => BigOpInk{ .advance = 0.665, .disp_advance = 0.999, .asc = 1.361, .desc = 0.861, .ic = 5.91 },
+        .int, .oint, .oiint, .oiiint, .ointctrclockwise => BigOpInk{ .advance = 0.665, .disp_advance = 0.999, .asc = 1.361, .desc = 0.861, .ic = 5.91 },
     };
 }
-
 /// A big operator glyph: a char box at the operator codepoint, BOXED BY THE
 /// DRAWN FONT'S INK (bigOpInk × drawn size) — the box WIDTH is the hmtx
 /// ADVANCE and the height/depth the ink asc/desc, so the box bounds exactly

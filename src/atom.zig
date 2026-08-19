@@ -82,6 +82,9 @@ pub const BigOp = enum(u8) {
     bigcap,
     bigsqcup,
     oint,
+    oiint,
+    oiiint,
+    ointctrclockwise,
 };
 
 /// TeX math style. Layout's `Style` is an alias of this, so the parser can
