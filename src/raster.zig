@@ -91,8 +91,9 @@ pub fn rasterize(
 
     const content_w = @max(1.0, dl.width * pt_to_px);
     const content_h = @max(1.0, (dl.height + dl.depth) * pt_to_px);
-    const width = @as(u32, @intFromFloat(@ceil(content_w))) + 2 * pad;
-    const height = @as(u32, @intFromFloat(@ceil(content_h))) + 2 * pad;
+    // Add 1px minimum bearing headroom to prevent subpixel antialiasing clamp at row 0
+    const width = @as(u32, @intFromFloat(@ceil(content_w))) + 2 * pad + 1;
+    const height = @as(u32, @intFromFloat(@ceil(content_h))) + 2 * pad + 1;
     const bytes_per_pixel: u32 = if (opts.format == .rgba32) 4 else 1;
     const stride = width * bytes_per_pixel;
     const total_bytes = @as(usize, height) * @as(usize, stride);
@@ -231,6 +232,60 @@ fn drawGlyph(
                     6 => break :blk @as(u32, 2478), // parenright.v6
                     else => break :blk @as(u32, 2500), // parenright.v7
                 }
+            } else if (cp == '[') {
+                switch (vi) {
+                    1 => break :blk @as(u32, 2373), // bracketleft.v1
+                    2 => break :blk @as(u32, 2395), // bracketleft.v2
+                    3 => break :blk @as(u32, 2417), // bracketleft.v3
+                    4 => break :blk @as(u32, 2439), // bracketleft.v4
+                    5 => break :blk @as(u32, 2461), // bracketleft.v5
+                    6 => break :blk @as(u32, 2483), // bracketleft.v6
+                    else => break :blk @as(u32, 2525), // bracketleft.v7
+                }
+            } else if (cp == ']') {
+                switch (vi) {
+                    1 => break :blk @as(u32, 2374), // bracketright.v1
+                    2 => break :blk @as(u32, 2396), // bracketright.v2
+                    3 => break :blk @as(u32, 2418), // bracketright.v3
+                    4 => break :blk @as(u32, 2440), // bracketright.v4
+                    5 => break :blk @as(u32, 2462), // bracketright.v5
+                    6 => break :blk @as(u32, 2484), // bracketright.v6
+                    else => break :blk @as(u32, 2526), // bracketright.v7
+                }
+            } else if (cp == '{') {
+                switch (vi) {
+                    1 => break :blk @as(u32, 2371), // braceleft.v1
+                    2 => break :blk @as(u32, 2393), // braceleft.v2
+                    3 => break :blk @as(u32, 2415), // braceleft.v3
+                    4 => break :blk @as(u32, 2437), // braceleft.v4
+                    5 => break :blk @as(u32, 2459), // braceleft.v5
+                    6 => break :blk @as(u32, 2481), // braceleft.v6
+                    else => break :blk @as(u32, 2515), // braceleft.v7
+                }
+            } else if (cp == '}') {
+                switch (vi) {
+                    1 => break :blk @as(u32, 2372), // braceright.v1
+                    2 => break :blk @as(u32, 2394), // braceright.v2
+                    3 => break :blk @as(u32, 2416), // braceright.v3
+                    4 => break :blk @as(u32, 2438), // braceright.v4
+                    5 => break :blk @as(u32, 2460), // braceright.v5
+                    6 => break :blk @as(u32, 2482), // braceright.v6
+                    else => break :blk @as(u32, 2516), // braceright.v7
+                }
+            } else if (cp == '|' or cp == 0x2223) {
+                switch (vi) {
+                    1 => break :blk @as(u32, 2677), // divides.v1
+                    2 => break :blk @as(u32, 2684), // divides.v2
+                    3 => break :blk @as(u32, 2691), // divides.v3
+                    else => break :blk @as(u32, 2698), // divides.v4
+                }
+            } else if (cp == 0x2225) {
+                switch (vi) {
+                    1 => break :blk @as(u32, 2678), // parallel.v1
+                    2 => break :blk @as(u32, 2685), // parallel.v2
+                    3 => break :blk @as(u32, 2692), // parallel.v3
+                    else => break :blk @as(u32, 2699), // parallel.v4
+                }
             }
         }
         break :blk face.glyphIndex(cp) orelse return;
@@ -238,7 +293,6 @@ fn drawGlyph(
     var outline = try face.glyphOutline(gpa, gid);
     defer outline.deinit();
     if (outline.curves.items.len == 0) return;
-
     // Normalization: reverse CCW contours (CFF / Latin Modern convention) to CW (Y-up right-hand rule)
     var run_start: usize = 0;
     var i: usize = 0;
