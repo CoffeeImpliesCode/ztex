@@ -19,3 +19,4 @@ local:
 *.svg.tmp
 result-bin
 __pycache__/
+/agent-notes

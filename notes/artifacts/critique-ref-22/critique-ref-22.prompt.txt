@@ -1,4 +1,0 @@
-\
-Four stacked panes of the same formula: `\begin{array}{cc} a \bmod 2 & b \pod 3 \\ c \pmod{4} & d \mod{56} \\ \displaystyle a\bmod 2 & \displaystyle b \pod 3 \\ \displaystyle c\pmod{4} & \displaystyle d \mod{56} \end{array}`. Top = ztex render (ours), then XeTeX, KaTeX, and MathJax (bottom) — the three web/TeX references.
-
-Compare OURS against ALL THREE references. List EVERY visual nit in OURS vs any reference: inter-term spacing, glyph sizes, superscript/subscript positions, big-op limit centering, baseline alignment, overlaps, anything that differs. Be specific with regions ('the gap after the integral is too wide', 'the upper limit n sits 2px left of center'). Do NOT nit about overall scale (the panes are scaled to the same width). If an element matches the references, say so. Output JSON: {"nits": [{"region": str, "description": str, "severity": "minor|major", "reference": "XeTeX|KaTeX|MathJax"}], "verdict": "PASS|FAIL"}.
