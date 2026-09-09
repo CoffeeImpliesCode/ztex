@@ -60,7 +60,7 @@ pub const PixelBuffer = struct {
                     const row = self.pixels[y * self.stride .. (y + 1) * self.stride];
                     var x: usize = 0;
                     while (x < self.width) {
-                        const chunk = @min(self.width - x, row_buf.len / 3);
+                        const chunk: usize = @min(self.width - x, row_buf.len / 3);
                         for (0..chunk) |i| {
                             const src_px = row[(x + i) * 4 .. (x + i) * 4 + 3];
                             @memcpy(row_buf[i * 3 .. i * 3 + 3], src_px);
@@ -78,6 +78,66 @@ pub const PixelBuffer = struct {
         }
     }
 };
+
+const testing = std.testing;
+
+test "PixelBuffer.writePnm writes wide RGBA rows" {
+    for ([_]u32{ 2730, 2731, 4099 }) |width| {
+        const width_usize: usize = width;
+        const stride = width * 4;
+        var header_buffer: [64]u8 = undefined;
+        const header = try std.fmt.bufPrint(&header_buffer, "P6\n{d} 1\n255\n", .{width});
+
+        const pixels = try testing.allocator.alloc(u8, width_usize * 4);
+        var pixel_buffer: PixelBuffer = .{
+            .gpa = testing.allocator,
+            .pixels = pixels,
+            .width = width,
+            .height = 1,
+            .stride = stride,
+            .format = .rgba32,
+        };
+        defer pixel_buffer.deinit();
+
+        const expected = try testing.allocator.alloc(u8, header.len + width_usize * 3);
+        defer testing.allocator.free(expected);
+        @memcpy(expected[0..header.len], header);
+        for (0..width_usize) |x| {
+            const rgb = [3]u8{
+                @truncate(x),
+                @truncate(x >> 4),
+                @truncate(x >> 8),
+            };
+            const pixel_offset = x * 4;
+            pixels[pixel_offset] = rgb[0];
+            pixels[pixel_offset + 1] = rgb[1];
+            pixels[pixel_offset + 2] = rgb[2];
+            pixels[pixel_offset + 3] = 0xa5;
+
+            const pnm_offset = header.len + x * 3;
+            expected[pnm_offset] = rgb[0];
+            expected[pnm_offset + 1] = rgb[1];
+            expected[pnm_offset + 2] = rgb[2];
+        }
+
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        {
+            const file = try tmp.dir.createFile(testing.io, "chunked.ppm", .{});
+            defer file.close(testing.io);
+            try pixel_buffer.writePnm(testing.io, file);
+        }
+
+        const actual = try tmp.dir.readFileAlloc(
+            testing.io,
+            "chunked.ppm",
+            testing.allocator,
+            .limited(expected.len + 1),
+        );
+        defer testing.allocator.free(actual);
+        try testing.expectEqualSlices(u8, expected, actual);
+    }
+}
 
 /// Rasterize a draw list using the font context's embedded/cached fonts.
 pub fn rasterize(
