@@ -27,5 +27,5 @@ rec {
   # https://devenv.sh/languages/
   # languages.zig.enable = true;
 
-  scripts.gate.exec = "zig-gate";
+  scripts.gate.exec = "bash scripts/gate.sh";
 }

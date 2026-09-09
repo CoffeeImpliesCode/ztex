@@ -1690,9 +1690,6 @@ pub const FontContext = struct {
     /// Embedded Latin Modern Roman italic.
     italic: *FontFace,
 
-    // TODO(macros): F2 will hang a macro table here (name → expansion).
-    // The slot is intentionally reserved; nothing else is needed now.
-
     /// Create a context preloaded with the embedded fallback faces:
     /// LM Math (math), LM Roman regular and italic (text).
     pub fn init(gpa: std.mem.Allocator) !FontContext {
@@ -2036,8 +2033,8 @@ test "font: context loads embedded fallbacks and caches metrics" {
     const g3 = ctx.metrics(math, 'x', 10);
     try testing.expectApproxEqAbs(@as(f32, 5.28), g3.width, 0.001);
     // roman and italic advances differ (real font data)
-    const rx = roman.glyphIndex('x').?;
-    const ix = italic.glyphIndex('x').?;
+    const rx = roman.glyphIndex('x') orelse return error.TestUnexpectedResult;
+    const ix = italic.glyphIndex('x') orelse return error.TestUnexpectedResult;
     try testing.expectApproxEqAbs(@as(f32, 0.528), roman.advanceEm(rx), 0.001);
     try testing.expectApproxEqAbs(@as(f32, 0.464), italic.advanceEm(ix), 0.001);
 }
@@ -2671,9 +2668,11 @@ test "font: glyphOutline — regular and italic CFF 'x' shapes differ" {
         lmroman_italic.lmroman10_italic_otf[0..],
     );
     defer ital.deinit();
-    var a = try reg.glyphOutline(testing.allocator, reg.glyphIndex('x').?);
+    const reg_gid = reg.glyphIndex('x') orelse return error.TestUnexpectedResult;
+    var a = try reg.glyphOutline(testing.allocator, reg_gid);
     defer a.deinit();
-    var b = try ital.glyphOutline(testing.allocator, ital.glyphIndex('x').?);
+    const ital_gid = ital.glyphIndex('x') orelse return error.TestUnexpectedResult;
+    var b = try ital.glyphOutline(testing.allocator, ital_gid);
     defer b.deinit();
     try testing.expect(a.curves.items.len > 0);
     try testing.expect(b.curves.items.len > 0);

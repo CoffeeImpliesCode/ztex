@@ -104,12 +104,16 @@ pub fn build(b: *std.Build) void {
 
     // ── unit tests (one step per module) ───────────────────────
     const test_step = b.step("test", "Run all unit tests");
-    const mods = [_]struct { name: []const u8, module: *std.Build.Module }{
-        .{ .name = "atom", .module = atom },
-        .{ .name = "parse", .module = parse },
-        .{ .name = "layout", .module = layout },
-        .{ .name = "ztex", .module = ztex },
-        .{ .name = "tests", .module = tests },
+    const mods = [_]struct {
+        name: []const u8,
+        module: *std.Build.Module,
+        root: std.Build.LazyPath,
+    }{
+        .{ .name = "atom", .module = atom, .root = b.path("src/atom.zig") },
+        .{ .name = "parse", .module = parse, .root = b.path("src/parse/root.zig") },
+        .{ .name = "layout", .module = layout, .root = b.path("src/layout/root.zig") },
+        .{ .name = "ztex", .module = ztex, .root = b.path("src/root.zig") },
+        .{ .name = "tests", .module = tests, .root = b.path("src/tests/root.zig") },
     };
 
     // Coverage wiring. The test roots below SHARE module instances (atom is
@@ -137,7 +141,7 @@ pub fn build(b: *std.Build) void {
                 imports = arr;
             }
             root_module = b.createModule(.{
-                .root_source_file = m.module.root_source_file.?,
+                .root_source_file = m.root,
                 .target = target,
                 .optimize = optimize,
                 .imports = imports,

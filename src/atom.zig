@@ -382,6 +382,11 @@ pub inline fn fixedToEm(v: u32) f32 {
     return @bitCast(v);
 }
 
+/// Errors returned by AST mutation operations.
+pub const Error = std.mem.Allocator.Error || error{
+    ChildCountOverflow,
+};
+
 /// The superflat AST: source + parallel token table + flat node pool.
 ///
 /// Owns nothing beyond the two ArrayLists; the caller provides `gpa`. Free
@@ -445,7 +450,8 @@ pub const Ast = struct {
         num_tokens: u32,
         children: []const Node,
         data: u32,
-    ) !u32 {
+    ) Error!u32 {
+        if (children.len > std.math.maxInt(u16)) return error.ChildCountOverflow;
         const first = try self.pushNodes(children);
         return self.pushNode(.{
             .tag = tag,
@@ -579,4 +585,41 @@ test "atom: genfrac thickness bits round-trip" {
     try testing.expectApproxEqAbs(@as(f32, 1.5), fracThickness(data), 1e-3);
     // negative clamps to 0 (no explicit thickness)
     try testing.expectEqual(@as(u32, 0), fracThicknessBits(-2));
+}
+
+fn testChildren(count: usize) ![]Node {
+    const children = try testing.allocator.alloc(Node, count);
+    for (children) |*child| {
+        child.* = .{
+            .tag = .char,
+            .first_token = 0,
+            .num_tokens = 0,
+            .first_child = null_node,
+            .num_children = 0,
+            .data = 0,
+        };
+    }
+    return children;
+}
+
+test "ast: createNode rejects more than u16 children" {
+    var a = Ast.init(testing.allocator, "");
+    defer a.deinit();
+
+    const children = try testChildren(@as(usize, std.math.maxInt(u16)) + 1);
+    defer testing.allocator.free(children);
+    try testing.expectError(
+        error.ChildCountOverflow,
+        a.createNode(.row, 0, 0, children, 0),
+    );
+}
+
+test "ast: createNode accepts the maximum u16 child count" {
+    var a = Ast.init(testing.allocator, "");
+    defer a.deinit();
+
+    const children = try testChildren(std.math.maxInt(u16));
+    defer testing.allocator.free(children);
+    const row = try a.createNode(.row, 0, 0, children, 0);
+    try testing.expectEqual(std.math.maxInt(u16), a.node(row).num_children);
 }

@@ -154,19 +154,18 @@ fn isStructural(b: u8) bool {
 fn scanUntilStructural(src: []const u8, pos: usize) usize {
     var i = pos;
     if (std.simd.suggestVectorLength(u8)) |n| {
-        const vector = @Vector(n, u8);
         while (i + n <= src.len) : (i += n) {
-            const v: vector = src[i..][0..n].*;
-            const hit = (v == @as(vector, @splat(' '))) |
-                (v == @as(vector, @splat('\t'))) |
-                (v == @as(vector, @splat('\r'))) |
-                (v == @as(vector, @splat('\n'))) |
-                (v == @as(vector, @splat('%'))) |
-                (v == @as(vector, @splat('\\'))) |
-                (v == @as(vector, @splat('{'))) |
-                (v == @as(vector, @splat('}'))) |
-                (v == @as(vector, @splat('^'))) |
-                (v == @as(vector, @splat('_')));
+            const v: @Vector(n, u8) = src[i..][0..n].*;
+            const hit = (v == @as(@TypeOf(v), @splat(' '))) |
+                (v == @as(@TypeOf(v), @splat('\t'))) |
+                (v == @as(@TypeOf(v), @splat('\r'))) |
+                (v == @as(@TypeOf(v), @splat('\n'))) |
+                (v == @as(@TypeOf(v), @splat('%'))) |
+                (v == @as(@TypeOf(v), @splat('\\'))) |
+                (v == @as(@TypeOf(v), @splat('{'))) |
+                (v == @as(@TypeOf(v), @splat('}'))) |
+                (v == @as(@TypeOf(v), @splat('^'))) |
+                (v == @as(@TypeOf(v), @splat('_')));
             if (@reduce(.Or, hit)) {
                 const mask: @Int(.unsigned, n) = @bitCast(hit);
                 return i + @ctz(mask);

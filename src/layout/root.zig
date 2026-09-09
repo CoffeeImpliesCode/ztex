@@ -121,10 +121,12 @@ fn validateAst(
 
     while (work_len > 0) {
         work_len -= 1;
-        const idx = if (dyn_work) |*w|
-            w.pop().?
-        else
-            work_buf[work_len];
+        const idx = if (dyn_work) |*w| blk: {
+            // `work_len` mirrors `w.items.len`; only malformed worklist state
+            // can make this pop empty, so report the existing AST error.
+            const item = w.pop() orelse return error.InvalidAst;
+            break :blk item;
+        } else work_buf[work_len];
 
         const n = ast.nodes.items[idx];
         if (!arityOk(n.tag, n)) return error.InvalidAst;

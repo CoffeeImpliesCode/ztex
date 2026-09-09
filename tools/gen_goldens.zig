@@ -148,7 +148,7 @@ fn zigEscape(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
 }
 
 pub fn main() !void {
-    var gpa_state = std.heap.DebugAllocator(.{}){};
+    var gpa_state = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 

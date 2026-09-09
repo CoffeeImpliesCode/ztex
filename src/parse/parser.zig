@@ -10,7 +10,7 @@ const atom = @import("ztex.atom");
 const lexer = @import("lexer.zig");
 const parse_err = @import("error.zig");
 
-pub const Error = std.mem.Allocator.Error || error{
+pub const Error = atom.Error || error{
     UnexpectedRGroup,
     UnexpectedScript,
     DoubleScript,
@@ -724,12 +724,14 @@ pub const Parser = struct {
         if (self.err_info) |info| info.* = .{ .kind = kind, .span = span };
     }
 
-    /// Record the error context and return the matching error-set value.
-    /// Every error-return site goes through here, so the error VALUES are
-    /// unchanged (`expectError` still sees error.Xxx) and the Info is always
-    /// filled before the caller's `catch` observes the failure. This switch
-    /// is the parser's kind→error mapping (the lexer's kinds never reach
-    /// the parser — `fail` is only called with the parser kinds).
+    /// Record semantic parser error context and return the matching error-set
+    /// value. Node-construction failures use `createNode` so child-count
+    /// overflow records the construct span before propagating.
+    /// The error VALUES remain unchanged (`expectError` still sees
+    /// `error.Xxx`), and the Info is always filled before the caller's
+    /// `catch` observes a parser error.
+    /// This switch is the parser's kind→error mapping; lexer-only kinds never
+    /// reach the parser because `fail` is called only with parser kinds.
     fn fail(self: *Parser, kind: parse_err.Kind, span: atom.Span) Error {
         self.setErr(kind, span);
         return switch (kind) {
@@ -744,6 +746,7 @@ pub const Parser = struct {
             .unknown_environment => error.UnknownEnvironment,
             .mismatched_end => error.MismatchedEnd,
             .unclosed_environment => error.UnclosedEnvironment,
+            .child_count_overflow => error.ChildCountOverflow,
             .nesting_too_deep => error.NestingTooDeep,
             // The lexer-only kinds have no parser error values (they are
             // returned directly by lex()/parse() at their own sites), so a
@@ -775,6 +778,35 @@ pub const Parser = struct {
     /// Span of a token value (from peek/advance).
     fn spanOf(t: atom.Token) atom.Span {
         return .{ .start = t.start, .end = t.end };
+    }
+
+    /// Create a node and report child-count overflow at the construct span.
+    fn createNode(
+        self: *Parser,
+        ast: *atom.Ast,
+        tag: atom.Tag,
+        first_token: u32,
+        num_tokens: u32,
+        children: []const atom.Node,
+        data: u32,
+    ) Error!u32 {
+        return ast.createNode(tag, first_token, num_tokens, children, data) catch |err| {
+            if (err == error.ChildCountOverflow) {
+                return self.fail(.child_count_overflow, self.nodeSpan(first_token, num_tokens));
+            }
+            return err;
+        };
+    }
+
+    fn nodeSpan(self: *const Parser, first_token: u32, num_tokens: u32) atom.Span {
+        const first: usize = @intCast(first_token);
+        if (num_tokens == 0) return self.spanAt(first);
+        if (first >= self.tokens.len) return self.spanAt(first);
+        const last = @min(
+            first + @as(usize, @intCast(num_tokens)) - 1,
+            self.tokens.len - 1,
+        );
+        return .{ .start = self.tokens[first].start, .end = self.tokens[last].end };
     }
 
     /// Parse the whole token table into a row atom (the root).
@@ -868,7 +900,8 @@ pub const Parser = struct {
                         const rn = ast.node(rest);
                         const num_tokens = (rn.first_token + rn.num_tokens) - cmd_tok;
                         const children_one = [_]atom.Node{rn};
-                        const node = try ast.createNode(
+                        const node = try self.createNode(
+                            ast,
                             .mathstyle,
 
                             cmd_tok,
@@ -917,28 +950,42 @@ pub const Parser = struct {
         }
         const num_tokens = last_tok - start_tok;
         if (frac_line) |line| {
-            const num = try ast.createNode(.row, start_tok, num_end_tok - start_tok, children.items[0..frac_split], 0);
-            const den = try ast.createNode(.row, num_end_tok, last_tok - num_end_tok, children.items[frac_split..], 0);
+            const num = try self.createNode(
+                ast,
+                .row,
+                start_tok,
+                num_end_tok - start_tok,
+                children.items[0..frac_split],
+                0,
+            );
+            const den = try self.createNode(
+                ast,
+                .row,
+                num_end_tok,
+                last_tok - num_end_tok,
+                children.items[frac_split..],
+                0,
+            );
             const nn = ast.node(num);
             const dn = ast.node(den);
             const frac_children = [_]atom.Node{ nn, dn };
-            const frac = try ast.createNode(.fraction, start_tok, num_tokens, &frac_children, @intFromBool(line));
+            const frac = try self.createNode(ast, .fraction, start_tok, num_tokens, &frac_children, @intFromBool(line));
             const result: u32 = if (!frac_choose) frac else blk: {
                 // \choose = \atop wrapped in parentheses
                 const open = try ast.createLeaf(.char, frac_tok, 1, 0x28);
                 const close = try ast.createLeaf(.char, frac_tok, 1, 0x29);
                 const fn_ = ast.node(frac);
                 const choose_children = [_]atom.Node{ ast.node(open), fn_, ast.node(close) };
-                break :blk try ast.createNode(.row, start_tok, num_tokens, &choose_children, 0);
+                break :blk try self.createNode(ast, .row, start_tok, num_tokens, &choose_children, 0);
             };
             // Inside a group the whole content IS the fraction (`{a \atop b}`);
             // at top level the root stays a row per ztex's root convention.
             if (mode != .top) return result;
             const rn = ast.node(result);
             const wrap = [_]atom.Node{rn};
-            return ast.createNode(.row, start_tok, num_tokens, &wrap, 0);
+            return self.createNode(ast, .row, start_tok, num_tokens, &wrap, 0);
         }
-        return ast.createNode(.row, start_tok, num_tokens, children.items, 0);
+        return self.createNode(ast, .row, start_tok, num_tokens, children.items, 0);
     }
 
     /// Parse one atom (base + optional scripts + trailing primes).
@@ -979,7 +1026,8 @@ pub const Parser = struct {
             const children = [_]atom.Node{ ast.node(sb), pn, ast.node(sub) };
             const num_tokens = (first_prime_tok + @as(u32, @intCast(prime_count))) -
                 ast.node(sb).first_token;
-            result = try ast.createNode(
+            result = try self.createNode(
+                ast,
                 .script,
                 ast.node(sb).first_token,
                 num_tokens,
@@ -989,7 +1037,7 @@ pub const Parser = struct {
         } else {
             const children = [_]atom.Node{ rn, pn };
             const num_tokens = (first_prime_tok + @as(u32, @intCast(prime_count))) - rn.first_token;
-            result = try ast.createNode(.script, rn.first_token, num_tokens, &children, atom.ScriptBits.sup);
+            result = try self.createNode(ast, .script, rn.first_token, num_tokens, &children, atom.ScriptBits.sup);
         }
 
         // After prime merging, any subsequent ^ or _ attaches to the script/base (e.g. x_0'^2 or f'(x))
@@ -1021,7 +1069,7 @@ pub const Parser = struct {
         const inode = ast.node(inner);
         const num_tokens = (inode.first_token + inode.num_tokens) - open_tok + 1;
         const children = [_]atom.Node{ast.node(inner)};
-        return ast.createNode(.group, open_tok, num_tokens, &children, 0);
+        return self.createNode(ast, .group, open_tok, num_tokens, &children, 0);
     }
 
     /// Attach `^`/`_` scripts to `base`.
@@ -1085,7 +1133,7 @@ pub const Parser = struct {
         const num_tokens = last_tok - base_node.first_token;
         const data = (@as(u32, @intFromBool(sup != null)) * atom.ScriptBits.sup) |
             (@as(u32, @intFromBool(sub != null)) * atom.ScriptBits.sub);
-        return ast.createNode(.script, base_node.first_token, num_tokens, children.items, data);
+        return self.createNode(ast, .script, base_node.first_token, num_tokens, children.items, data);
     }
 
     /// The content of one script: a single atom, or a braced group.
@@ -1109,7 +1157,7 @@ pub const Parser = struct {
                 const rn = ast.node(rest);
                 const num_tokens = (rn.first_token + rn.num_tokens) - cmd_tok;
                 const children = [_]atom.Node{ast.node(rest)};
-                return ast.createNode(.mathstyle, cmd_tok, num_tokens, &children, @intFromEnum(ms));
+                return self.createNode(ast, .mathstyle, cmd_tok, num_tokens, &children, @intFromEnum(ms));
             }
         }
         return self.parseSingleAtom(ast);
@@ -1268,11 +1316,11 @@ pub const Parser = struct {
             const c = try ast.createLeaf(.char, cmd_tok, 1, b);
             try letters.append(self.gpa, ast.node(c));
         }
-        const word = try ast.createNode(.row, cmd_tok, 1, letters.items, 0);
+        const word = try self.createNode(ast, .row, cmd_tok, 1, letters.items, 0);
         const wn = ast.node(word);
         const child = [_]atom.Node{wn};
         const limits = @intFromBool(limitOpName(name));
-        return ast.createNode(.opname, cmd_tok, 1, &child, limits);
+        return self.createNode(ast, .opname, cmd_tok, 1, &child, limits);
     }
     /// Whether an operator name takes display-style limits in TeX. TeX's
     /// fontmath.ltx defines only these as \mathop with limits by default
@@ -1331,7 +1379,7 @@ pub const Parser = struct {
         // of the braced content — provenance stays exact.
         const num_tokens = (inode.first_token + inode.num_tokens) - cmd_tok;
         const children = [_]atom.Node{ast.node(inner)};
-        return ast.createNode(.opname, cmd_tok, num_tokens, &children, limits);
+        return self.createNode(ast, .opname, cmd_tok, num_tokens, &children, limits);
     }
 
     fn space(_: *Parser, ast: *atom.Ast, cmd_tok: u32, em: f32) Error!u32 {
@@ -1347,7 +1395,7 @@ pub const Parser = struct {
         const inode = ast.node(inner);
         const num_tokens = (inode.first_token + inode.num_tokens) - cmd_tok;
         const children = [_]atom.Node{ast.node(inner)};
-        return ast.createNode(.styled, cmd_tok, num_tokens, &children, @intFromEnum(s));
+        return self.createNode(ast, .styled, cmd_tok, num_tokens, &children, @intFromEnum(s));
     }
 
     /// `\frac` (line, no force), `\dfrac`/`\tfrac` (line + forced style), or
@@ -1355,7 +1403,7 @@ pub const Parser = struct {
     /// line bit + forced-style code + parts flag via atom.fracData; a plain
     /// `\frac` keeps data 0/1 (byte-identical to the pre-feature encoding).
     fn fraction(
-        _: *Parser,
+        self: *Parser,
         ast: *atom.Ast,
         cmd_tok: u32,
         num: u32,
@@ -1368,7 +1416,14 @@ pub const Parser = struct {
         const dn = ast.node(den);
         const num_tokens = (dn.first_token + dn.num_tokens) - cmd_tok;
         const children = [_]atom.Node{ nn, dn };
-        return ast.createNode(.fraction, cmd_tok, num_tokens, &children, atom.fracData(line, forced, parts_display));
+        return self.createNode(
+            ast,
+            .fraction,
+            cmd_tok,
+            num_tokens,
+            &children,
+            atom.fracData(line, forced, parts_display),
+        );
     }
 
     /// \binom{num}{den} = \genfrac{(}{)}{0pt}{}{num}{den}: a ruleless
@@ -1394,7 +1449,7 @@ pub const Parser = struct {
         const close = try ast.createLeaf(.char, cmd_tok, 1, 0x29);
         const children = [_]atom.Node{ ast.node(open), fn_, ast.node(close) };
         const num_tokens = (ast.node(den).first_token + ast.node(den).num_tokens) - cmd_tok;
-        return ast.createNode(.left, cmd_tok, num_tokens, &children, 0);
+        return self.createNode(ast, .left, cmd_tok, num_tokens, &children, 0);
     }
 
     /// \genfrac{left}{right}{thick}{style}{num}{den}: a fraction with
@@ -1436,7 +1491,7 @@ pub const Parser = struct {
         const dn = ast.node(den);
         const num_tokens = (dn.first_token + dn.num_tokens) - cmd_tok;
         const children = [_]atom.Node{ nn, dn };
-        const frac = try ast.createNode(.fraction, cmd_tok, num_tokens, &children, data);
+        const frac = try self.createNode(ast, .fraction, cmd_tok, num_tokens, &children, data);
         if (ld == null and rd == null) return frac;
         const fn_ = ast.node(frac);
         var fence_children: std.ArrayList(atom.Node) = .empty;
@@ -1450,7 +1505,7 @@ pub const Parser = struct {
             const c = try ast.createLeaf(.char, d.tok, 1, d.cp);
             try fence_children.append(self.gpa, ast.node(c));
         }
-        return ast.createNode(.left, cmd_tok, num_tokens, fence_children.items, 0);
+        return self.createNode(ast, .left, cmd_tok, num_tokens, fence_children.items, 0);
     }
 
     /// One \genfrac delimiter argument: a braced group holding either
@@ -1548,7 +1603,7 @@ pub const Parser = struct {
         const ssn = ast.node(ss);
         const num_tokens = (ssn.first_token + ssn.num_tokens) - cmd_tok;
         const children = [_]atom.Node{ dn, tn, sn, ssn };
-        return ast.createNode(.mathchoice, cmd_tok, num_tokens, &children, 0);
+        return self.createNode(ast, .mathchoice, cmd_tok, num_tokens, &children, 0);
     }
 
     fn text(self: *Parser, ast: *atom.Ast, _: u32) Error!u32 {
@@ -1595,7 +1650,7 @@ pub const Parser = struct {
             const dn = ast.node(d);
             const sn = ast.node(surd);
             const deg_span = (dn.first_token + dn.num_tokens) - sn.first_token;
-            const sc = try ast.createNode(.script, sn.first_token, deg_span, &.{ sn, dn }, atom.ScriptBits.sup);
+            const sc = try self.createNode(ast, .script, sn.first_token, deg_span, &.{ sn, dn }, atom.ScriptBits.sup);
             try children.append(self.gpa, ast.node(sc));
         } else {
             try children.append(self.gpa, ast.node(surd));
@@ -1605,7 +1660,7 @@ pub const Parser = struct {
         const num_tokens = (rn.first_token + rn.num_tokens) - cmd_tok;
         // data = sqrt_row_data marks this row as a \sqrt construct; layout
         // routes it through layoutSqrt (stretchy radical + vinculum).
-        return ast.createNode(.row, cmd_tok, num_tokens, children.items, sqrt_row_data);
+        return self.createNode(ast, .row, cmd_tok, num_tokens, children.items, sqrt_row_data);
     }
 
     /// \dot{q} \hat x \vec{v} ...: the accent applies to ONE following atom
@@ -1622,7 +1677,7 @@ pub const Parser = struct {
         const mn = ast.node(mark);
         const children = [_]atom.Node{ bn, mn };
         const num_tokens = (bn.first_token + bn.num_tokens) - cmd_tok;
-        return ast.createNode(.row, cmd_tok, num_tokens, &children, accent_row_data);
+        return self.createNode(ast, .row, cmd_tok, num_tokens, &children, accent_row_data);
     }
 
     /// \not<relation> — the negation prefix (a diagonal slash through the
@@ -1672,7 +1727,7 @@ pub const Parser = struct {
         }
         // Overlay: a row marked `not_row_data`, children [base].
         const children = [_]atom.Node{ast.node(base)};
-        return ast.createNode(.row, cmd_tok, num_tokens, &children, not_row_data);
+        return self.createNode(ast, .row, cmd_tok, num_tokens, &children, not_row_data);
     }
 
     /// \overline{x} / \underline{x}: a rule over/under ONE following atom or
@@ -1688,7 +1743,7 @@ pub const Parser = struct {
         const bn = ast.node(base);
         const num_tokens = (bn.first_token + bn.num_tokens) - cmd_tok;
         const children = [_]atom.Node{ast.node(base)};
-        return ast.createNode(.overline, cmd_tok, num_tokens, &children, @intFromBool(under));
+        return self.createNode(ast, .overline, cmd_tok, num_tokens, &children, @intFromBool(under));
     }
 
     /// \substack{a \\ b \\ c}: amsmath's script-size multi-line stack for
@@ -1726,7 +1781,7 @@ pub const Parser = struct {
             _ = self.advance(); // consume `\\`
         }
         const num_tokens = (close_tok + 1) - cmd_tok;
-        return ast.createNode(.substack, cmd_tok, num_tokens, lines.items, 0);
+        return self.createNode(ast, .substack, cmd_tok, num_tokens, lines.items, 0);
     }
 
     /// \begin{env}...\end{env}: parse the environment name (`{name}` or
@@ -1776,7 +1831,7 @@ pub const Parser = struct {
             return self.fail(.mismatched_end, span);
         }
         const num_tokens = @as(u32, @intCast(self.pos)) - begin_tok;
-        return ast.createNode(.env, begin_tok, num_tokens, children.items, atom.envData(kind, colspec));
+        return self.createNode(ast, .env, begin_tok, num_tokens, children.items, atom.envData(kind, colspec));
     }
 
     /// The environment body: rows split on `\\` (an optional `[dimen]` row
@@ -1850,7 +1905,7 @@ pub const Parser = struct {
         const first = cells.items[0];
         const last = cells.items[cells.items.len - 1];
         const num_tokens = (last.first_token + last.num_tokens) - first.first_token;
-        const row = try ast.createNode(.row, first.first_token, num_tokens, cells.items, 0);
+        const row = try self.createNode(ast, .row, first.first_token, num_tokens, cells.items, 0);
         try rows.append(self.gpa, ast.node(row));
         cells.clearRetainingCapacity();
     }
@@ -1943,7 +1998,14 @@ pub const Parser = struct {
         const close = try ast.createLeaf(.char, cmd_tok, 1, 0x29); // )
         try children.append(self.gpa, ast.node(close));
         const num_tokens = (an.first_token + an.num_tokens) - cmd_tok;
-        return ast.createNode(.row, cmd_tok, num_tokens, children.items, if (with_mod) pmod_row_data else pod_row_data);
+        return self.createNode(
+            ast,
+            .row,
+            cmd_tok,
+            num_tokens,
+            children.items,
+            if (with_mod) pmod_row_data else pod_row_data,
+        );
     }
 
     /// \bmod: amsmath's binary mod. amsmath.sty:
@@ -1963,7 +2025,7 @@ pub const Parser = struct {
         const wn = ast.node(word);
         const gn = ast.node(gap);
         const children = [_]atom.Node{ gn, wn, gn };
-        return ast.createNode(.row, cmd_tok, 1, &children, bmod_row_data);
+        return self.createNode(ast, .row, cmd_tok, 1, &children, bmod_row_data);
     }
 
     /// \mod{arg}: amsmath's mod with its argument. amsmath.sty:
@@ -1989,7 +2051,7 @@ pub const Parser = struct {
         const gap = try ast.createLeaf(.space, cmd_tok, 1, atom.emToFixed(6.0 / 18.0));
         const children = [_]atom.Node{ ast.node(word), ast.node(gap), an };
         const num_tokens = (an.first_token + an.num_tokens) - cmd_tok;
-        return ast.createNode(.row, cmd_tok, num_tokens, &children, mod_row_data);
+        return self.createNode(ast, .row, cmd_tok, num_tokens, &children, mod_row_data);
     }
 
     /// Parse the \sqrt[n] degree: atoms until a `]` char at this row level.
@@ -2005,7 +2067,7 @@ pub const Parser = struct {
             try children.append(self.gpa, cn);
             last_tok = cn.first_token + cn.num_tokens;
         }
-        return ast.createNode(.row, start_tok, last_tok - start_tok, children.items, 0);
+        return self.createNode(ast, .row, start_tok, last_tok - start_tok, children.items, 0);
     }
 
     /// \big \Big \bigg \Bigg <delim> → a `.left` node of a SINGLE delimiter
@@ -2026,7 +2088,7 @@ pub const Parser = struct {
         const leaf = try ast.createLeaf(.char, dd.tok, 1, dd.cp);
         const children = [_]atom.Node{ast.node(leaf)};
         const num_tokens = (dd.tok + 1) - cmd_tok;
-        return ast.createNode(.left, cmd_tok, num_tokens, &children, level);
+        return self.createNode(ast, .left, cmd_tok, num_tokens, &children, level);
     }
 
     /// \middle <delim> — valid only between \left and \right (TeX: "You
@@ -2083,7 +2145,7 @@ pub const Parser = struct {
         }
         // pos sits just past the closing delimiter token
         const num_tokens = @as(u32, @intCast(self.pos)) - left_tok;
-        return ast.createNode(.left, left_tok, num_tokens, children.items, 0);
+        return self.createNode(ast, .left, left_tok, num_tokens, children.items, 0);
     }
 
     /// Consume one delimiter after \left/\right; null for `\left.` / `\right.`.

@@ -30,6 +30,7 @@ pub const Kind = enum {
     unknown_environment,
     mismatched_end,
     unclosed_environment,
+    child_count_overflow,
     source_too_large,
     nesting_too_deep,
 };
@@ -59,6 +60,7 @@ pub const Info = struct {
             .unknown_environment => "Unknown environment",
             .mismatched_end => "Mismatched \\end",
             .unclosed_environment => "Unclosed environment",
+            .child_count_overflow => "Child count overflow",
             .source_too_large => "Source too large",
             .nesting_too_deep => "Nesting too deep",
         };

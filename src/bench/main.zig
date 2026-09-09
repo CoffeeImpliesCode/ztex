@@ -58,6 +58,7 @@ pub fn main(init: std.process.Init) !void {
                 return error.BadIters;
         } else return error.UnknownArgument;
     }
+    if (iters == 0) return error.BadIters;
 
     const start = monoNs();
     var total_draws: usize = 0;
@@ -85,7 +86,12 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     const elapsed_ns = monoNs() - start;
-    const per_render_ns = elapsed_ns / count;
+    const per_render_ns = blk: {
+        if (count > 0) {
+            break :blk elapsed_ns / count;
+        }
+        return error.BadIters;
+    };
     const drawable_avg: f64 = @floatFromInt(total_draws);
     const count_f: f64 = @floatFromInt(count);
     if (single) |src| {

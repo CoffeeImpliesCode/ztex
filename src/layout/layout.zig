@@ -323,9 +323,38 @@ fn roleOfCp(cp: u21) Role {
     if (cp < 128) return ascii_roles[cp];
 
     return switch (cp) {
-        0x2212, 0x2213, 0x00B1, 0x00D7, 0x00F7, 0x22C5, 0x2217, 0x2218, 0x2219, 0x2229, 0x222A, 0x2227, 0x2228, 0x2295, 0x2296, 0x2297, 0x2298, 0x2299, 0x22C2, 0x22C3, 0x2020, 0x2021, 0x2216, 0x2240, 0x228E, 0x2293, 0x2294, 0x22C4, 0x22C6, 0x25B9, 0x25C3, 0x25CB, 0x2A3F, 0x00B7 => .bin,
+        0x2212, 0x2213, 0x00B1, 0x00D7, 0x00F7 => .bin,
+        0x22C5, 0x2217, 0x2218, 0x2219 => .bin,
+        0x2229, 0x222A, 0x2227, 0x2228 => .bin,
+        0x2295, 0x2296, 0x2297, 0x2298, 0x2299 => .bin,
+        0x22C2, 0x22C3 => .bin,
+        0x2020, 0x2021 => .bin,
+        0x2216, 0x2240, 0x228E, 0x2293, 0x2294 => .bin,
+        0x22C4, 0x22C6, 0x25B9, 0x25C3, 0x25CB, 0x2A3F, 0x00B7 => .bin,
 
-        0x2260, 0x2261, 0x2262, 0x2264, 0x2265, 0x2266, 0x2267, 0x2243, 0x2244, 0x2245, 0x2246, 0x2247, 0x2248, 0x2249, 0x223C, 0x2241, 0x2282, 0x2283, 0x2284, 0x2285, 0x2286, 0x2287, 0x2288, 0x2289, 0x2208, 0x2209, 0x220B, 0x220C, 0x227A, 0x227B, 0x2280, 0x2281, 0x226D, 0x226E, 0x226F, 0x2270, 0x2271, 0x22E0, 0x22E1, 0x22AC, 0x2190, 0x2192, 0x2194, 0x21D0, 0x21D2, 0x21D4, 0x2A7D, 0x2A7E, 0x2191, 0x2193, 0x2195, 0x2196, 0x2197, 0x2198, 0x2199, 0x21A6, 0x21A9, 0x21AA, 0x21BC, 0x21BD, 0x21C0, 0x21C1, 0x21D1, 0x21D3, 0x21D5, 0x221D, 0x2223, 0x2224, 0x2225, 0x2226, 0x2234, 0x2235, 0x224D, 0x2250, 0x226A, 0x226B, 0x2291, 0x2292, 0x22A2, 0x22A3, 0x22A5, 0x22A8, 0x22C8, 0x2322, 0x2323, 0x27F5, 0x27F6, 0x27F7, 0x27F8, 0x27F9, 0x27FA, 0x2AAF, 0x2AB0 => .rel,
+        0x2260, 0x2261, 0x2262 => .rel,
+        0x2264, 0x2265, 0x2266, 0x2267 => .rel,
+        0x2243, 0x2244, 0x2245, 0x2246, 0x2247, 0x2248, 0x2249, 0x223C, 0x2241 => .rel,
+        0x2282, 0x2283, 0x2284, 0x2285, 0x2286, 0x2287, 0x2288, 0x2289 => .rel,
+        0x2208, 0x2209, 0x220B, 0x220C => .rel,
+        0x227A, 0x227B, 0x2280, 0x2281 => .rel,
+        0x226D, 0x226E, 0x226F, 0x2270, 0x2271, 0x22E0, 0x22E1, 0x22AC => .rel,
+        0x2190, 0x2192, 0x2194 => .rel,
+        0x21D0, 0x21D2, 0x21D4 => .rel,
+        0x2A7D, 0x2A7E => .rel,
+        0x2191, 0x2193, 0x2195, 0x2196, 0x2197, 0x2198, 0x2199 => .rel,
+        0x21A6, 0x21A9, 0x21AA => .rel,
+        0x21BC, 0x21BD, 0x21C0, 0x21C1 => .rel,
+        0x21D1, 0x21D3, 0x21D5 => .rel,
+        0x221D, 0x2223, 0x2224, 0x2225, 0x2226 => .rel,
+        0x2234, 0x2235 => .rel,
+        0x224D, 0x2250 => .rel,
+        0x226A, 0x226B => .rel,
+        0x2291, 0x2292 => .rel,
+        0x22A2, 0x22A3, 0x22A5, 0x22A8 => .rel,
+        0x22C8, 0x2322, 0x2323 => .rel,
+        0x27F5, 0x27F6, 0x27F7, 0x27F8, 0x27F9, 0x27FA => .rel,
+        0x2AAF, 0x2AB0 => .rel,
 
         0x27E8, 0x2308, 0x230A => .open,
         0x27E9, 0x2309, 0x230B => .close,
@@ -1654,10 +1683,9 @@ fn envHasDelims(ast: *const atom.Ast, idx: u32) bool {
 /// slots — `{l|r}` packs [l, rule, r], so column 0 reads l and column 1
 /// reads r); null beyond the spec (columns default to centered, TeX).
 fn envColAlign(data: u32, c: usize) ?u32 {
-    const n = atom.envSpecCount(data);
     var seen: usize = 0;
-    for (0..n) |i| {
-        const nib = atom.envColSpec(data, i).?;
+    var spec_index: usize = 0;
+    while (atom.envColSpec(data, spec_index)) |nib| : (spec_index += 1) {
         if (nib == atom.EnvBits.col_rule) continue;
         if (seen == c) return nib;
         seen += 1;
@@ -2071,9 +2099,8 @@ fn layoutEnv(
         if (kind == .array) {
             var col_count: usize = 0;
             var bx: f32 = 0;
-            const nspec = atom.envSpecCount(n.data);
-            for (0..nspec) |i| {
-                const nib = atom.envColSpec(n.data, i).?;
+            var spec_index: usize = 0;
+            while (atom.envColSpec(n.data, spec_index)) |nib| : (spec_index += 1) {
                 if (nib == atom.EnvBits.col_rule) {
                     const rule = try list.createLeaf(.rule, 0.4, row_h.items[r], row_d.items[r], span);
                     try row_children.append(list.gpa, .{ .idx = rule, .x_shift = bx - 0.2, .shift = 0 });
@@ -2591,24 +2618,27 @@ fn sizeMiddleDelims(
 ///   · radicand set in cramped style (same size);
 ///   · clearance clr = RadicalDisplayStyleVerticalGap 0.148em in display/text,
 ///     RadicalVerticalGap 0.05em in script/scriptscript;
-///   · vinculum: a rule of thickness θ = rule_thickness at height H + clr,
-///     spanning exactly the radicand's width;
+///   · vinculum: a rule of thickness θ = rule_thickness at height
+///     radicand_height + clr, spanning exactly the radicand's width;
 ///   · the radical glyph is drawn at the CURRENT font size (size_pt), NOT
 ///     scaled up. XeTeX selects the smallest MATH-table vertical variant
 ///     (radical.v1–v4) whose AdvanceMeasurement covers the radicand's full
-///     extent (H + D + clr + θ); the variant's ink ascent (e.g. 1.45em for
-///     .v3) anchors at the vinculum's top and its descent covers the
-///     radicand. The base glyph (AdvanceMeasurement 1.001em) is used for
-///     shallow radicands. Variants keep the width slim (∼1em advance,
-///     ∼0.91em ink) while the height grows — the old code scaled the base
-///     glyph to H+D+clr+θ, fattening it to ∼2em-wide ink.
+///     extent (radicand_height + radicand_depth + clr + θ); the variant's
+///     ink ascent (e.g. 1.45em for .v3) anchors at the vinculum's top and
+///     its descent covers the radicand. The base glyph (AdvanceMeasurement
+///     1.001em) is used for shallow radicands. Variants keep the width slim
+///     (∼1em advance, ∼0.91em ink) while the height grows — the old code
+///     scaled the base glyph to radicand_height + radicand_depth + clr + θ,
+///     fattening it to ∼2em-wide ink.
 ///   · make_radical's clearance adjustment: the glyph box depth is replaced
 ///     by total−θ (the rule occupies the top θ of the ink); delta =
-///     (total−θ) − (H + D + clr), and half the excess goes into the
-///     clearance. Tall variants add ~0.2em here, floating the vinculum
-///     clear of the radicand and centering the radicand on the radical.
-///   · the construction box: height = H + clr + 2θ (the empty kern above
-///     the vinculum), depth = max(D, total − (H + clr + θ)).
+///     (total−θ) − (radicand_height + radicand_depth + clr), and half the
+///     excess goes into the clearance. Tall variants add ~0.2em here,
+///     floating the vinculum clear of the radicand and centering the radicand
+///     on the radical.
+///   · the construction box: height = radicand_height + clr + 2θ (the empty
+///     kern above the vinculum), depth = max(radicand_depth, total −
+///     (radicand_height + clr + θ)).
 ///   · \sqrt[n]{x}: the degree is set at 0.5×size (measured XeTeX), its
 ///     bottom raised by 0.6·(height − depth) of the construction (amsmath
 ///     \r@@t's \raise .6\dimen@\copy\rootbox), its left edge 0.278em
@@ -2641,8 +2671,8 @@ fn layoutSqrt(
 
     const radicand = try layoutInner(list, ast, radicand_child, fm, style, size_pt, cstyle, true);
     const rb = list.get(radicand);
-    const H = rb.height;
-    const D = rb.depth;
+    const radicand_height = rb.height;
+    const radicand_depth = rb.depth;
 
     // Height gate: only assemble (top + N*ext + bot pieces) when the required
     // radical ink height EXCEEDS the LARGEST pre-built MATH variant's
@@ -2652,7 +2682,7 @@ fn layoutSqrt(
     // extents. Pre-built variants give the "classic" look; the assembly is
     // only needed for genuinely tall stacks beyond what .v4 covers.
     const largest_variant_em: f32 = 3.001;
-    const req_em = (H + D + clr + rt) / size_pt;
+    const req_em = (radicand_height + radicand_depth + clr + rt) / size_pt;
     const vi = metrics.radicalVariant(req_em);
     const use_assembly = req_em > largest_variant_em;
 
@@ -2671,17 +2701,20 @@ fn layoutSqrt(
     const overlap_em: f32 = 0.320;
 
     if (!use_assembly) {
-        // ── Variant path (shallow radicals) ──────────────────────────────
+        // Variant path (shallow radicals).
         // Pre-built MATH variant (radical.v0–v4): a single √ char at the
         // current math size with the variant's adv/asc/desc — NOT scaled
         // up. The variant's ink ascent anchors at the vinculum top.
         const rv = metrics.radical_variants[vi];
         radicand_x = rv.adv * size_pt;
         rad_ink_height = (rv.asc + rv.desc) * size_pt;
-        const delta_v = @max(0.0, rad_ink_height - rt - (H + D + clr));
+        const delta_v = @max(
+            0.0,
+            rad_ink_height - rt - (radicand_height + radicand_depth + clr),
+        );
         clr2 = clr + delta_v / 2;
-        rule_top = H + clr2 + rt;
-        hbox_depth = @max(D, rad_ink_height - rule_top);
+        rule_top = radicand_height + clr2 + rt;
+        hbox_depth = @max(radicand_depth, rad_ink_height - rule_top);
 
         const surd = try list.create(
             .char,
@@ -2713,17 +2746,21 @@ fn layoutSqrt(
         // the true stride (0.32), under-counting extenders and leaving the
         // assembly's ink short of the radicand bottom.
         const stride_em: f32 = metrics.radical_ext_piece.ink_asc - overlap_em; // 0.320
-        const base_em: f32 = metrics.radical_top_piece.ink_asc + metrics.radical_bot_piece.ink_asc - overlap_em; // 2.120
+        const base_em: f32 = metrics.radical_top_piece.ink_asc +
+            metrics.radical_bot_piece.ink_asc - overlap_em; // 2.120
         const n_ext: usize = blk: {
             if (req_em <= base_em) break :blk @as(usize, 0);
             break :blk @intFromFloat(@ceil((req_em - base_em) / stride_em));
         };
         rad_ink_height = metrics.radicalAssemblyHeight(n_ext) * size_pt;
         radicand_x = metrics.radical_piece_adv * size_pt;
-        const delta_a = @max(0.0, rad_ink_height - rt - (H + D + clr));
+        const delta_a = @max(
+            0.0,
+            rad_ink_height - rt - (radicand_height + radicand_depth + clr),
+        );
         clr2 = clr + delta_a / 2;
-        rule_top = H + clr2 + rt;
-        hbox_depth = @max(D, rad_ink_height - rule_top);
+        rule_top = radicand_height + clr2 + rt;
+        hbox_depth = @max(radicand_depth, rad_ink_height - rule_top);
 
         // TOP piece: ink TOP at vinculum top (rule_top) → baseline at
         // rule_top − top.asc. shift = −baseline (piece baselines are below
@@ -2785,9 +2822,13 @@ fn layoutSqrt(
 
     // Radicand: flush at x = surd advance; baseline = row baseline (shift 0).
     try list.scratch.append(list.gpa, .{ .idx = radicand, .x_shift = radicand_x, .shift = 0 });
-    // Vinculum: rule of thickness rt centered at H + clr2 + rt/2.
+    // Vinculum: rule of thickness rt centered at radicand_height + clr2 + rt/2.
     const rule = try list.createLeaf(.rule, rb.width, rt / 2, rt / 2, span);
-    try list.scratch.append(list.gpa, .{ .idx = rule, .x_shift = radicand_x, .shift = -(H + clr2 + rt / 2) });
+    try list.scratch.append(list.gpa, .{
+        .idx = rule,
+        .x_shift = radicand_x,
+        .shift = -(radicand_height + clr2 + rt / 2),
+    });
     // The construction's height = vinculum top + rt: XeTeX's overbar is
     // [kern rt, rule rt, kern clr2, radicand], the empty kern above the rule
     // part of the box extent (measured \sqrt{x}: 25.485 = 13.26 + 9.825 +
@@ -2805,7 +2846,7 @@ fn layoutSqrt(
         //    ~11.7pt above the axis at 30pt);
         //  · assembly path (tall radicals): 0.6 × rule_top — the
         //    (height − hbox_depth) formula collapses for deep radicands
-        //    (hbox_depth ≈ D is large), parking the degree far too low. TeX
+        //    (hbox_depth ≈ radicand_depth is large), parking the degree far too low.
         //    places the index at the upper-left of the radical, baseline ≈
         //    0.6 of the radical's top (rule_top above the row baseline).
         const deg_size = size_pt * gl.scriptscriptfactor;
@@ -3475,7 +3516,13 @@ fn bigOpInk(op: atom.BigOp, display: bool) BigOpInk {
         .bigcup => BigOpInk{ .advance = 1.111, .disp_advance = 1.111, .asc = 0.917, .desc = 0.439, .ic = 0 },
         .bigcap => BigOpInk{ .advance = 1.111, .disp_advance = 1.111, .asc = 0.939, .desc = 0.417, .ic = 0 },
         .bigsqcup => BigOpInk{ .advance = 1.111, .disp_advance = 1.111, .asc = 0.936, .desc = 0.436, .ic = 0 },
-        .int, .oint, .oiint, .oiiint, .ointctrclockwise => BigOpInk{ .advance = 0.665, .disp_advance = 0.999, .asc = 1.361, .desc = 0.861, .ic = 5.91 },
+        .int, .oint, .oiint, .oiiint, .ointctrclockwise => BigOpInk{
+            .advance = 0.665,
+            .disp_advance = 0.999,
+            .asc = 1.361,
+            .desc = 0.861,
+            .ic = 5.91,
+        },
     };
 }
 /// A big operator glyph: a char box at the operator codepoint, BOXED BY THE

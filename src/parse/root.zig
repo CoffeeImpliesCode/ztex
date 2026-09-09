@@ -94,19 +94,6 @@ test "parse: sourceTooLong boundary is maxInt(u32)/2" {
     try testing.expect(sourceTooLong(std.math.maxInt(usize)));
 }
 
-test "parse: over-limit source returns SourceTooLarge with kind and span" {
-    // Exercise the parse() gate without a multi-GiB allocation: the check
-    // runs on src.len before any lexing, so a bound-mocked caller can be
-    // driven through the public error path only via a genuinely huge slice.
-    // Instead, assert the boundary contract via sourceTooLong and that the
-    // error kind/message exist (see Kind.source_too_large).
-    try testing.expectEqual(Kind.source_too_large, @as(Kind, .source_too_large));
-    try testing.expectEqualStrings(
-        "Source too large",
-        @as(Info, .{ .kind = .source_too_large, .span = .{ .start = 0, .end = 0 } }).message(),
-    );
-}
-
 test "parse: full pipeline, x+1 becomes 3-char row" {
     var ast = try parse(testing.allocator, "x+1", null);
     defer ast.deinit();
@@ -114,6 +101,49 @@ test "parse: full pipeline, x+1 becomes 3-char row" {
     const root = ast.node(ast.root);
     try testing.expectEqual(.row, root.tag);
     try testing.expectEqual(@as(u16, 3), root.num_children);
+}
+
+test "parse: flat row child-count overflow has kind and span" {
+    const child_count_max: usize = std.math.maxInt(u16);
+    const src = try testing.allocator.alloc(u8, child_count_max + 1);
+    defer testing.allocator.free(src);
+    @memset(src, 'x');
+
+    {
+        var ast = try parse(testing.allocator, src[0..child_count_max], null);
+        defer ast.deinit();
+        try testing.expectEqual(
+            @as(u16, std.math.maxInt(u16)),
+            ast.node(ast.root).num_children,
+        );
+    }
+
+    var err_info: Info = undefined;
+    try testing.expectError(
+        error.ChildCountOverflow,
+        parse(testing.allocator, src, &err_info),
+    );
+    try testing.expectEqual(Kind.child_count_overflow, err_info.kind);
+    try testing.expectEqual(@as(u32, 0), err_info.span.start);
+    try testing.expectEqual(@as(u32, @intCast(src.len)), err_info.span.end);
+}
+
+test "parse: nested row child-count overflow keeps inner span" {
+    const child_count: usize = @as(usize, std.math.maxInt(u16)) + 1;
+    const src = try testing.allocator.alloc(u8, child_count + 2);
+    defer testing.allocator.free(src);
+    src[0] = '{';
+    @memset(src[1 .. 1 + child_count], 'x');
+    src[1 + child_count] = '}';
+
+    var err_info: Info = undefined;
+    try testing.expectError(
+        error.ChildCountOverflow,
+        parse(testing.allocator, src, &err_info),
+    );
+    try testing.expectEqual(Kind.child_count_overflow, err_info.kind);
+    try testing.expectEqual(@as(u32, 1), err_info.span.start);
+    try testing.expectEqual(@as(u32, @intCast(1 + child_count)), err_info.span.end);
 }
 
 test "parse: frac with scripts" {

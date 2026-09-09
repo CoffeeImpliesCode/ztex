@@ -51,7 +51,11 @@ fn fontSpec(style: atom.CharStyle, opts: *const Options) FontSpec {
 /// Serialize a draw list to an SVG string. Caller owns the returned bytes.
 /// Fails only on allocation failure (`error.OutOfMemory`) or a non-finite
 /// coordinate (`error.NonFiniteCoordinate`, rejected by checkFinite).
-pub fn render(gpa: std.mem.Allocator, dl: *const draw.DrawList, opts: Options) error{ OutOfMemory, NonFiniteCoordinate }![]u8 {
+pub fn render(
+    gpa: std.mem.Allocator,
+    dl: *const draw.DrawList,
+    opts: Options,
+) error{ OutOfMemory, NonFiniteCoordinate }![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
 
@@ -187,7 +191,14 @@ pub fn render(gpa: std.mem.Allocator, dl: *const draw.DrawList, opts: Options) e
 }
 
 /// Write the SVG for a draw list to `path` (created/truncated) inside `dir`.
-pub fn writeFile(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8, dl: *const draw.DrawList, opts: Options) !void {
+pub fn writeFile(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    dl: *const draw.DrawList,
+    opts: Options,
+) !void {
     const svg = try render(gpa, dl, opts);
     defer gpa.free(svg);
     var file = try std.Io.Dir.createFile(dir, io, path, .{});
@@ -196,18 +207,20 @@ pub fn writeFile(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []co
 }
 
 fn colorHex(c: draw.Color) [8]u8 {
-    var out: [8]u8 = undefined;
-    hexByte(c.r, out[0..2]);
-    hexByte(c.g, out[2..4]);
-    hexByte(c.b, out[4..6]);
-    hexByte(c.a, out[6..8]);
-    return out;
+    return .{
+        hexDigit(c.r >> 4),
+        hexDigit(c.r & 0x0f),
+        hexDigit(c.g >> 4),
+        hexDigit(c.g & 0x0f),
+        hexDigit(c.b >> 4),
+        hexDigit(c.b & 0x0f),
+        hexDigit(c.a >> 4),
+        hexDigit(c.a & 0x0f),
+    };
 }
 
-fn hexByte(v: u8, out: []u8) void {
-    const hex = "0123456789abcdef";
-    out[0] = hex[v >> 4];
-    out[1] = hex[v & 0x0f];
+fn hexDigit(value: u8) u8 {
+    return "0123456789abcdef"[value & 0x0f];
 }
 
 /// Parse a color from a name (`white`, `black`, …) or hex (`#RRGGBB[AA]`).

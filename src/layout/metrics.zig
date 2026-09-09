@@ -131,7 +131,11 @@ pub const FontMetrics = union(enum) {
     pub const glyph: *const fn (self: *const FontMetrics, cp: u21, style: atom.CharStyle) ?Glyph = glyphImpl;
 
     /// Deterministic fallback for any unknown glyph (em-based estimate).
-    pub const glyphEstimate: *const fn (self: *const FontMetrics, cp: u21, style: atom.CharStyle) Glyph = glyphEstimateImpl;
+    pub const glyphEstimate: *const fn (
+        self: *const FontMetrics,
+        cp: u21,
+        style: atom.CharStyle,
+    ) Glyph = glyphEstimateImpl;
 
     /// TeX layout parameters at the 10pt base; shared by both arms
     /// (spacing facts, not render geometry).
@@ -2285,7 +2289,7 @@ const delim_ladder = [_]struct { cp: u21, variants: [8]DelimVariant }{
 /// divides.v3, ink 1.734em — the |'s smallest variant covering the fence's
 /// required ink).
 pub fn delimVariants(cp: u21) ?[]const DelimVariant {
-    for (&delim_ladder) |entry| {
+    for (&delim_ladder) |*entry| {
         if (entry.cp == cp) return &entry.variants;
     }
     return null;
@@ -2351,9 +2355,24 @@ pub const RadicalPiece = struct {
     /// (nothing below).
     connector_bot: f32,
 };
-pub const radical_top_piece = RadicalPiece{ .cp = 0xF300, .ink_asc = 0.620, .connector_top = 0.000, .connector_bot = 0.320 };
-pub const radical_ext_piece = RadicalPiece{ .cp = 0xF301, .ink_asc = 0.640, .connector_top = 0.640, .connector_bot = 0.640 };
-pub const radical_bot_piece = RadicalPiece{ .cp = 0x23B7, .ink_asc = 1.820, .connector_top = 0.320, .connector_bot = 0.000 };
+pub const radical_top_piece: RadicalPiece = .{
+    .cp = 0xF300,
+    .ink_asc = 0.620,
+    .connector_top = 0.000,
+    .connector_bot = 0.320,
+};
+pub const radical_ext_piece: RadicalPiece = .{
+    .cp = 0xF301,
+    .ink_asc = 0.640,
+    .connector_top = 0.640,
+    .connector_bot = 0.640,
+};
+pub const radical_bot_piece: RadicalPiece = .{
+    .cp = 0x23B7,
+    .ink_asc = 1.820,
+    .connector_top = 0.320,
+    .connector_bot = 0.000,
+};
 /// Advance (width) of every radical piece in em — all three share the same
 /// hmtx 1056/1000em on LM Math (the vertical bar at x=702..742 is constant
 /// across the assembly; only the hook (right) and foot (left) extend
@@ -2365,11 +2384,11 @@ pub const radical_piece_adv: f32 = 1.056;
 /// Total = sum(ink_asc) − (N+1) × overlap + N × (ext.ink_asc − overlap)
 ///       = top.asc + N×ext.asc + bot.asc − (N+1)×0.320.
 /// Returns 0 for negative N (defensive).
-pub fn radicalAssemblyHeight(N: usize) f32 {
+pub fn radicalAssemblyHeight(extender_count: usize) f32 {
     const overlap = 0.320;
     var h: f32 = radical_top_piece.ink_asc + radical_bot_piece.ink_asc;
-    h += @as(f32, @floatFromInt(N)) * radical_ext_piece.ink_asc;
-    h -= (@as(f32, @floatFromInt(N)) + 1.0) * overlap;
+    h += @as(f32, @floatFromInt(extender_count)) * radical_ext_piece.ink_asc;
+    h -= (@as(f32, @floatFromInt(extender_count)) + 1.0) * overlap;
     return h;
 }
 /// Horizontal position of a glyph's TOP-ACCENT ATTACHMENT point, in em

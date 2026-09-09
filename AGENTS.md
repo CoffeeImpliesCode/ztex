@@ -11,7 +11,7 @@ conventions as `~/projects/{noapi, nogui, skript, wayland, notui}`.
 - **Dev env**: devenv + direnv (`.envrc` → `use devenv`)
 - **Linting**: zlint (`zlint.json` rules) + `zig fmt --check`
 - **Toolchain**: `zig` from devenv (nixpkgs 0.16)
-- **Lint/analyze tools**: prefer the locally built versions (`~/.local/bin/zlint`, `~/tools/ziglint`, `~/tools/zbc`, `~/tools/zcov`) over devenv's nixpkgs ones — they may be patched for this setup.
+- **Lint/analyze tools**: the gate prefers local tools (`~/.local/bin/ziglint`, `~/.local/bin/zlint`, `~/.local/bin/zbc`, `~/.local/bin/zig-cov`, `~/.local/bin/zwanzig`) and falls back to `PATH`. The required analyzer resolves from `ZWANZIG`, then the local path, then `PATH`.
 
 ## Structure
 
@@ -51,7 +51,7 @@ zig build bench -Dcpu=native   # unlock AVX2/512 (default = baseline SSE)
 zig-cov test        # line coverage (installed zig-cov; ~49% baseline)
 zig fmt --check .   # formatting gate
 zlint               # lint (prefer ~/.local/bin/zlint; devenv nixpkgs is fallback)
-gate                # all gates: fmt --check, build, test, ast-check, ziglint, zlint (local ~/.local/bin); zbc by default (advisory; strict via ZBC_STRICT=1); optional `--cov`; exits 1 on issues
+gate                # required gate: bash scripts/gate.sh [zig-gate args...]; runs zwanzig default rules with 2 threads over src tools build.zig, then zig-gate; set ZWANZIG_THREADS to a positive decimal override or ZWANZIG to an executable path/command; missing or failing stages fail the gate
 hyperfine 'zig build bench'  # stable cross-run timing
 jj st               # working-copy status (never git)
 ```
