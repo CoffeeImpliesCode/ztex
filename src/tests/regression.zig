@@ -103,38 +103,8 @@ pub fn dumpSvg(gpa: std.mem.Allocator, src: []const u8, size_pt: f32, padding: f
     var dl = try ztex.render(gpa, src, size_pt, null);
     defer dl.deinit();
     const svg = try ztex.svg.render(gpa, &dl, .{ .padding = padding });
-    // Strip the font-family and data-op attributes so the golden snapshots
-    // stay font-independent, short, and stable (data-op is the rasterizer's
-    // big-op form hint, covered by the critique scripts, not geometry);
-    // font-style/weight and pt units are kept.
-    const fam = " font-family=\"";
-    const dop = " data-op=\"v1\"";
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    var i: usize = 0;
-    // Strip BOTH the font-family and data-op attributes in a single input-
-    // ordered pass (either may come first in any given <text>; a serial
-    // per-attribute pass with a fixed start offset would overshoot one). The
-    // data-op big-op form hint is covered by the critique rasterizer, not
-    // geometry; font-family is stripped to keep the goldens font-independent.
-    while (true) {
-        const f = std.mem.findPos(u8, svg, i, fam);
-        const d = std.mem.findPos(u8, svg, i, dop);
-        if (f == null and d == null) break;
-        if (f != null and (d == null or f.? < d.?)) {
-            try out.appendSlice(gpa, svg[i..f.?]);
-            // skip the family value up to its closing quote
-            var j = f.? + fam.len;
-            while (j < svg.len and svg[j] != '"') j += 1;
-            i = j + 1;
-        } else {
-            try out.appendSlice(gpa, svg[i..d.?]);
-            i = d.? + dop.len;
-        }
-    }
-    if (i < svg.len) try out.appendSlice(gpa, svg[i..]);
-    gpa.free(svg);
-    return out.toOwnedSlice(gpa);
+    defer gpa.free(svg);
+    return ztex.svg.stripForGoldenSnapshot(gpa, svg);
 }
 
 /// Golden SVG snapshots for the corpus, at size_pt = 20.

@@ -7,11 +7,9 @@ const std = @import("std");
 const atom = @import("ztex.atom");
 
 pub const metrics = @import("metrics.zig");
-pub const box = @import("box.zig");
 pub const draw = @import("draw.zig");
 pub const layout = @import("layout.zig");
-
-pub const Style = layout.Style;
+const box = @import("box.zig");
 
 /// Lay out an atom tree and flatten it to a draw list.
 ///

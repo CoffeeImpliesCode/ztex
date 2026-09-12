@@ -86,12 +86,12 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     const elapsed_ns = monoNs() - start;
-    const per_render_ns = blk: {
-        if (count > 0) {
-            break :blk elapsed_ns / count;
-        }
-        return error.BadIters;
-    };
+    // iters > 0 is checked on entry, so the loops above rendered at least
+    // once and `count` is non-zero. Bind the divisor to a const so the guard
+    // sits directly in front of the division it protects.
+    const divisor: u64 = count;
+    if (divisor == 0) return error.BadIters;
+    const per_render_ns = elapsed_ns / divisor;
     const drawable_avg: f64 = @floatFromInt(total_draws);
     const count_f: f64 = @floatFromInt(count);
     if (single) |src| {

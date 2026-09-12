@@ -1465,7 +1465,7 @@ const InkEntry = struct {
 /// Drawn-glyph ink extents for every codepoint in the metric tables above,
 /// in em of the glyph's font-size, measured with fontTools BoundsPen on
 /// latinmodern-math.otf 2.005 (CFF outline bounds, per-mille → em; the
-/// big-op rows reproduce the bigOpInk table in layout.zig exactly).
+/// big-op rows reproduce the `bigOpInk` table below exactly).
 /// Sorted by `cp` (binary-search invariant). layoutChar/layoutText box
 /// every normal glyph by this ink × the drawn size, so the box (and the
 /// frame/viewBox) bounds the ink that is actually drawn: the cmr10/cmmi10
@@ -1906,6 +1906,167 @@ const ink_table = [_]InkEntry{
     .{ .cp = 0x1D71A, .a = 0.442, .d = 0.194 }, // 𝜚
     .{ .cp = 0x1D71B, .a = 0.431, .d = 0.011 }, // 𝜛
 };
+
+/// The drawn glyph's ink extents of a big operator, in em of the glyph's
+/// font-size (measured with fontTools on latinmodern-math.otf 2.005).
+/// Latin Modern Math draws every big op AXIS-CENTERED — ∑/∏/∐ ink
+/// +0.750/−0.250em, ∫/∮ +0.805/−0.306em, ⋂ +0.772/−0.250, ⋃ +0.750/−0.272,
+/// ⨆ +0.764/−0.264 (the font MATH axis is 0.250em) — unlike cmex10 whose
+/// glyphs hang almost entirely below the baseline. The big-op BOX takes
+/// its WIDTH from the hmtx ADVANCE (below) and its height/depth from this
+/// ink, at the drawn glyph size,
+/// so the viewBox bounds the real ink, the (h−d)/2 − axis shift every parent
+/// applies centers the ink on the math axis (the ink center is
+/// (asc−desc)/2 = 0.25em above the glyph baseline, the axis is 0.25em of
+/// size_pt, so display ∑/∫ land within ±0.5·gs of the axis with NOTHING
+/// clipped; XeTeX-LMMath \showbox confirms: text-style ∫ shift ≈ 0), and
+/// the advance/limits/side-script geometry all measure from the true ink
+/// width (the old cmex10 width under-sized the box ~1.8×: limits centered
+/// on a stub, the next atom overlapped the ink, the frame clipped).
+/// Widths are the LATIN-MODERN-MATH hmtx ADVANCE in em of the drawn glyph
+/// (measured with fontTools: ∑ 1.056, ∏/∐ 0.944, ⋃/⋂/⨆ 0.833, ∫/∮ 0.665),
+/// not the ink-bbox width (∑ 0.943, ∫ 0.553) — the advance is what the
+/// rendered glyph occupies, so the box advance matches the drawn ∑/∫
+/// exactly.
+///
+/// DISPLAY style uses the font's display variants (the MATH-table
+/// MathGlyphVariantRecords XeTeX selects for display operators — measured
+/// from the embedded XeTeX render: display ∑ ink +0.95/−0.45em, advance
+/// 1.444em; display ∫ ink +1.361/−0.861em). The limits ops (∑ ∏ ∐ ⋃ ⋂ ⨆)
+/// take the variant's FULL box (advance 1.444/1.278/1.111em — verified:
+/// the following term in \sum_{i=1}^{n} x_i sits at 1.444em + thin, and the
+/// over/under limits center on that box). The nolimits ops (∫ ∮) keep the
+/// BASE advance for the horizontal script placement and the row advance
+/// (measured: \int_0^1 sup at 0.665em + ic, row advance 0.665 + ic + scripts
+/// + thin), but the box HEIGHT/DEPTH come from the display variant (so the
+/// beside-script drops measure from the drawn glyph: \int_0^1 sup raise
+/// 11.860 = 1.361×10 − 1.75, sub drop 10.008 = 0.861×10 + 1.40).
+pub const BigOpInk = struct {
+    advance: f32,
+    /// Display-variant hmtx advance (em). For limits ops it equals
+    /// `advance` (the box takes the variant advance); for the nolimits ∫/∮
+    /// the ROW box keeps the base advance while the beside scripts attach
+    /// at the variant advance (measured \int_0^1 sup at 0.999em).
+    disp_advance: f32,
+    asc: f32,
+    desc: f32,
+    /// MathItalicsCorrection (pt at 10pt): base glyph ic (∫ 3.32) in text
+    /// style, display-variant ic (∫ .v1 5.91) in display style.
+    ic: f32,
+};
+
+/// The big operator's drawn ink/advance/italic correction — the single
+/// source for every big-op value: the base glyph in the non-display
+/// styles, the font's display variant when `display`.
+pub fn bigOpInk(op: atom.BigOp, display: bool) BigOpInk {
+    const base = switch (op) {
+        .sum => BigOpInk{
+            .advance = 1.056,
+            .disp_advance = 1.056,
+            .asc = 0.750,
+            .desc = 0.250,
+            .ic = 0,
+        }, // U+2211 ∑
+        .prod => BigOpInk{
+            .advance = 0.944,
+            .disp_advance = 0.944,
+            .asc = 0.750,
+            .desc = 0.250,
+            .ic = 0,
+        }, // U+220F ∏
+        .coprod => BigOpInk{
+            .advance = 0.944,
+            .disp_advance = 0.944,
+            .asc = 0.750,
+            .desc = 0.250,
+            .ic = 0,
+        }, // U+2210 ∐
+        .bigcup => BigOpInk{
+            .advance = 0.833,
+            .disp_advance = 0.833,
+            .asc = 0.750,
+            .desc = 0.272,
+            .ic = 0,
+        }, // U+22C3 ⋃
+        .bigcap => BigOpInk{
+            .advance = 0.833,
+            .disp_advance = 0.833,
+            .asc = 0.772,
+            .desc = 0.250,
+            .ic = 0,
+        }, // U+22C2 ⋂
+        .bigsqcup => BigOpInk{
+            .advance = 0.833,
+            .disp_advance = 0.833,
+            .asc = 0.764,
+            .desc = 0.264,
+            .ic = 0,
+        }, // U+2A06 ⨆
+        .int, .oint, .oiint, .oiiint, .ointctrclockwise => BigOpInk{
+            .advance = 0.665,
+            .disp_advance = 0.665,
+            .asc = 0.805,
+            .desc = 0.306,
+            .ic = 3.32,
+        },
+    };
+    if (!display) return base;
+    // Display variants (summation.v1, integral.v1, ... — hmtx advances and
+    // ink measured with fontTools; the ink matches the embedded XeTeX
+    // render within 0.001em; the .v1 MathItalicsCorrection values are
+    // 0 for the limits ops and 0.591em for ∫/∮).
+    return switch (op) {
+        .sum => BigOpInk{
+            .advance = 1.444,
+            .disp_advance = 1.444,
+            .asc = 0.950,
+            .desc = 0.450,
+            .ic = 0,
+        },
+        .prod => BigOpInk{
+            .advance = 1.278,
+            .disp_advance = 1.278,
+            .asc = 0.950,
+            .desc = 0.450,
+            .ic = 0,
+        },
+        .coprod => BigOpInk{
+            .advance = 1.278,
+            .disp_advance = 1.278,
+            .asc = 0.950,
+            .desc = 0.450,
+            .ic = 0,
+        },
+        .bigcup => BigOpInk{
+            .advance = 1.111,
+            .disp_advance = 1.111,
+            .asc = 0.917,
+            .desc = 0.439,
+            .ic = 0,
+        },
+        .bigcap => BigOpInk{
+            .advance = 1.111,
+            .disp_advance = 1.111,
+            .asc = 0.939,
+            .desc = 0.417,
+            .ic = 0,
+        },
+        .bigsqcup => BigOpInk{
+            .advance = 1.111,
+            .disp_advance = 1.111,
+            .asc = 0.936,
+            .desc = 0.436,
+            .ic = 0,
+        },
+        .int, .oint, .oiint, .oiiint, .ointctrclockwise => BigOpInk{
+            .advance = 0.665,
+            .disp_advance = 0.999,
+            .asc = 1.361,
+            .desc = 0.861,
+            .ic = 5.91,
+        },
+    };
+}
 
 /// Binary search over `tbl` for `cp`.
 fn search(tbl: []const Entry, cp: u21) ?Entry {
@@ -3014,8 +3175,8 @@ test "metrics: remaining glyphEstimate-fallback symbols resolve with real LM Mat
 }
 
 test "metrics: the 65 glyphEstimate-gap codepoints resolve with real LM Math advances" {
-    // The audit's remaining glyphEstimate fallbacks (F4). Each must resolve
-    // with its exact Latin-Modern-Math advance (em x 10 at 10pt,
+    // The remaining glyphEstimate fallbacks. Each must resolve with its
+    // exact Latin-Modern-Math advance (em x 10 at 10pt,
     // hmtx / unitsPerEm x 10, fontTools on latinmodern-math.otf - replacing
     // the TFM-verified Computer-Modern widths; the codepoints LM Math does
     // not cover - digamma, triangleright/left, baruparrow, blacklozenge -
@@ -3179,7 +3340,7 @@ test "metrics: roman letters at script sizes scale the LM Math advance" {
 }
 
 test "metrics: glyphAt takes the lookupAscii fast path outside the optical bands" {
-    // glyphAt wires in lookupAscii (M7): outside the 7pt/5pt bands it must
+    // glyphAt wires in lookupAscii: outside the 7pt/5pt bands it must
     // return BIT-IDENTICAL values to the LUT (both derive from the same 10pt
     // table rows); inside the bands the script-size tables carry their own
     // h/d/ic and the slow path must win.

@@ -112,6 +112,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "atom", .module = atom, .root = b.path("src/atom.zig") },
         .{ .name = "parse", .module = parse, .root = b.path("src/parse/root.zig") },
         .{ .name = "layout", .module = layout, .root = b.path("src/layout/root.zig") },
+        .{ .name = "svg", .module = svg, .root = b.path("src/svg.zig") },
         .{ .name = "ztex", .module = ztex, .root = b.path("src/root.zig") },
         .{ .name = "tests", .module = tests, .root = b.path("src/tests/root.zig") },
     };
@@ -156,19 +157,30 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_t.step);
     }
 
-    // ── benchmark (build with -Doptimize=ReleaseSafe or ReleaseFast) ─
+    // ── benchmark ───────────────────────────────────────────
+    // Benchmarks must measure optimized code, so they default to ReleaseFast
+    // instead of the global Debug default. An explicit -Dbench-optimize wins;
+    // an explicit -Doptimize (or --release) still steers the bench mode.
+    const bench_optimize = b.option(
+        std.builtin.OptimizeMode,
+        "bench-optimize",
+        "Optimize mode for the benchmark artifact (default: ReleaseFast)",
+    ) orelse if (optimize != .Debug) optimize else .ReleaseFast;
     const bench_exe = b.addExecutable(.{
         .name = "ztex-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench/main.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = bench_optimize,
             .imports = &.{
                 .{ .name = "ztex", .module = ztex },
             },
         }),
     });
-    const bench_step = b.step("bench", "Run benchmark harness (e.g. -Doptimize=ReleaseSafe)");
+    const bench_step = b.step(
+        "bench",
+        "Run benchmark harness (ReleaseFast; override with -Dbench-optimize)",
+    );
     b.installArtifact(bench_exe);
     const run_bench = b.addRunArtifact(bench_exe);
     run_bench.step.dependOn(b.getInstallStep());
@@ -189,4 +201,12 @@ pub fn build(b: *std.Build) void {
     const gen_step = b.step("gen-goldens", "Print golden tables for the breadth corpus");
     const run_gen = b.addRunArtifact(gen_exe);
     gen_step.dependOn(&run_gen.step);
+
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = exe.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    const docs_step = b.step("docs", "Generate documentation");
+    docs_step.dependOn(&install_docs.step);
 }

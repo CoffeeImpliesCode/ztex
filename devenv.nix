@@ -4,10 +4,13 @@ rec {
   # zig 0.16 dev environment (house convention, cf. ~/projects/wayland).
   # https://devenv.sh/basics/
   packages = with pkgs; [
-    # zig
+    zig                # the toolchain: zig 0.16
     bash
     pkg-config
-    # zig-zlint
+
+    # Gate analyzers that are not in nixpkgs live in ~/tools and are exposed
+    # through ~/.local/bin: zwanzig (required by scripts/gate.sh), zlint,
+    # ziglint, zbc, zig-cov. See AGENTS.md.
 
     # performance / profiling tooling (ztex: speed is a top priority)
     hyperfine        # CLI timing of benchmarks

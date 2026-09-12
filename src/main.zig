@@ -2,27 +2,34 @@ const std = @import("std");
 const ztex = @import("ztex");
 
 const usage =
-    \\ztex — render LaTeX math to an SVG or raster image (PPM/PGM).
+    \\ztex — render LaTeX math to an SVG or a PPM/PGM raster.
     \\
-    \\  -i <latex>   input formula (default: a sample)
-    \\  -o <file>    write SVG or image to file (default: stdout)
-    \\  -s <pt>      font size in points (default 20)
-    \\  -p <px>      padding in px / pt (default 0)
-    \\  --dpi <num>  raster resolution in DPI (default 96)
-    \\  --png        write PNG bitmap (auto-detected if -o ends in .png)
-    \\  --ppm        write PPM (P6) 24-bit image
-    \\  --pgm        write PGM (P5) 8-bit alpha mask
-    \\  -b <color>   background: name or #RRGGBB[AA] (default: white; use
-    \\               'none'/'transparent' for no background)
+    \\  -i <latex>    input formula (default: a sample)
+    \\  -o <file>     write the output to file (default: stdout)
+    \\  -s <pt>       font size in points (default 20)
+    \\  -p <n>        padding around the formula: pt for SVG, px for a raster
+    \\                (default 0)
+    \\  --dpi <n>     raster resolution in DPI (default 96)
+    \\  --ppm         write PPM (P6) 24-bit image
+    \\  --pgm         write PGM (P5) 8-bit alpha mask
+    \\  -b <color>    background: name or #RRGGBB[AA] (default: white; use
+    \\                'none'/'transparent' for no background)
     \\  --bg <color>  alias for -b
-    \\  -h, --help   show this help
+    \\  -h, --help    show this help
+    \\
+    \\Raster output: pass --ppm or --pgm, or give -o a path ending in .ppm,
+    \\.pnm or .pgm. Without one of those the output is SVG.
     \\
 ;
 
-/// Render a LaTeX formula to SVG. With `-o`, writes an SVG file; otherwise
-/// prints the SVG to stdout. One `ztex.Context` is created per run — it owns
-/// the embedded Latin Modern faces and the per-glyph metric cache, and the
-/// layout measures every glyph from the real fonts through it.
+/// Exit status for a command-line usage error, kept apart from the status 1
+/// of a render failure so a caller can tell a bad command from a bad
+/// formula.
+const usage_status: u8 = 2;
+
+/// One `ztex.Context` is created per run — it owns the embedded Latin Modern
+/// faces and the per-glyph metric cache, and the layout measures every glyph
+/// from the real fonts through it.
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.arena.allocator();
@@ -39,43 +46,63 @@ pub fn main(init: std.process.Init) !void {
     _ = arg_it.next(); // skip argv[0]
     while (arg_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "-i")) {
-            src = arg_it.next() orelse return error.MissingValue;
+            src = arg_it.next() orelse {
+                try printUsageError(io, "option '-i' needs a LaTeX formula\n");
+                std.process.exit(usage_status);
+            };
         } else if (std.mem.eql(u8, arg, "-o")) {
-            out_path = arg_it.next() orelse return error.MissingValue;
+            out_path = arg_it.next() orelse {
+                try printUsageError(io, "option '-o' needs an output path\n");
+                std.process.exit(usage_status);
+            };
         } else if (std.mem.eql(u8, arg, "-s")) {
-            size = std.fmt.parseFloat(f32, arg_it.next() orelse return error.MissingValue) catch
-                return error.BadSize;
+            const v = arg_it.next() orelse {
+                try printUsageError(io, "option '-s' needs a point size\n");
+                std.process.exit(usage_status);
+            };
+            size = std.fmt.parseFloat(f32, v) catch {
+                try printUsageErrorArg(io, "invalid font size for -s: '", v, "'\n");
+                std.process.exit(usage_status);
+            };
         } else if (std.mem.eql(u8, arg, "-p")) {
-            pad = std.fmt.parseFloat(f32, arg_it.next() orelse return error.MissingValue) catch
-                return error.BadPadding;
+            const v = arg_it.next() orelse {
+                try printUsageError(io, "option '-p' needs a padding length\n");
+                std.process.exit(usage_status);
+            };
+            pad = std.fmt.parseFloat(f32, v) catch {
+                try printUsageErrorArg(io, "invalid padding for -p: '", v, "'\n");
+                std.process.exit(usage_status);
+            };
         } else if (std.mem.eql(u8, arg, "--dpi")) {
-            dpi = std.fmt.parseFloat(f32, arg_it.next() orelse return error.MissingValue) catch
-                return error.BadDpi;
+            const v = arg_it.next() orelse {
+                try printUsageError(io, "option '--dpi' needs a resolution in DPI\n");
+                std.process.exit(usage_status);
+            };
+            dpi = std.fmt.parseFloat(f32, v) catch {
+                try printUsageErrorArg(io, "invalid resolution for --dpi: '", v, "'\n");
+                std.process.exit(usage_status);
+            };
         } else if (std.mem.eql(u8, arg, "--ppm")) {
             raster_format = .rgba32;
         } else if (std.mem.eql(u8, arg, "--pgm")) {
             raster_format = .alpha8;
         } else if (std.mem.eql(u8, arg, "-b") or std.mem.eql(u8, arg, "--bg")) {
-            const v = arg_it.next() orelse return error.MissingValue;
+            const v = arg_it.next() orelse {
+                try printUsageErrorArg(io, "option '", arg, "' needs a color\n");
+                std.process.exit(usage_status);
+            };
             bg = ztex.svg.parseColorChecked(v) catch |e| switch (e) {
                 error.UnrecognizedColor => {
-                    try std.Io.File.stderr().writeStreamingAll(
-                        io,
-                        "ztex: unrecognized background color '",
-                    );
-                    try std.Io.File.stderr().writeStreamingAll(io, v);
-                    try std.Io.File.stderr().writeStreamingAll(
-                        io,
-                        "' (use a color name, #RRGGBB[AA], or 'none'/'transparent')\n",
-                    );
-                    std.process.exit(1);
+                    try printUsageErrorArg(io, "unrecognized background color '", v, "' (use a color name, #RRGGBB[AA], or 'none'/'transparent')\n");
+                    std.process.exit(usage_status);
                 },
             };
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             try std.Io.File.stdout().writeStreamingAll(io, usage);
             return;
         } else {
-            return error.UnknownArgument;
+            try printUsageErrorArg(io, "unknown argument '", arg, "'; try 'ztex --help'\n");
+            std.process.exit(usage_status);
         }
     }
 
@@ -137,6 +164,31 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(svg);
         try std.Io.File.stdout().writeStreamingAll(io, svg);
     }
+}
+
+/// Print `ztex: <msg>` to stderr. Every command-line problem leaves through
+/// here and the following `std.process.exit(usage_status)`, so a bad
+/// command line never surfaces as a Zig error return from `main`.
+fn printUsageError(io: std.Io, msg: []const u8) !void {
+    const f = std.Io.File.stderr();
+    try f.writeStreamingAll(io, "ztex: ");
+    try f.writeStreamingAll(io, msg);
+}
+
+/// Print `ztex: <msg><operand><tail>` to stderr. The operand is written
+/// separately because it comes from the command line and must not be copied
+/// into a fixed-size buffer.
+fn printUsageErrorArg(
+    io: std.Io,
+    msg: []const u8,
+    operand: []const u8,
+    tail: []const u8,
+) !void {
+    const f = std.Io.File.stderr();
+    try f.writeStreamingAll(io, "ztex: ");
+    try f.writeStreamingAll(io, msg);
+    try f.writeStreamingAll(io, operand);
+    try f.writeStreamingAll(io, tail);
 }
 
 /// Print a caret-annotated parse error to stderr. The first line carries

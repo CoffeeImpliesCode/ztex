@@ -282,6 +282,60 @@ fn escapeAppend(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), text: []const u
     }
 }
 
+const font_family_attr = " font-family=\"";
+const data_op_attr = " data-op=\"v1\"";
+
+/// One stripped attribute: `start` is where its text begins, `after` is the
+/// offset the copy continues from once it is gone.
+const StripHit = struct { start: usize, after: usize };
+
+/// Golden-snapshot form of an SVG document: the same bytes with every
+/// `font-family="…"` value and every `data-op="v1"` marker removed. Both are
+/// stripped because neither is geometry. The family name depends on the
+/// machine's font stack, so keeping it would make the goldens fail on any
+/// machine but this one; `data-op` is the rasterizer's hint that the drawn
+/// glyph is the OpenType MATH `.v1` big-op variant, covered by the critique
+/// rasterizer instead of the snapshot. font-style/weight and pt units are
+/// kept. Either attribute may come first inside a `<text>`, so both are
+/// removed in one input-ordered pass. Caller owns the result; `svg` is only
+/// read.
+pub fn stripForGoldenSnapshot(
+    gpa: std.mem.Allocator,
+    svg: []const u8,
+) error{OutOfMemory}![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    while (nextStrip(svg, i)) |hit| {
+        try out.appendSlice(gpa, svg[i..hit.start]);
+        i = hit.after;
+    }
+    if (i < svg.len) try out.appendSlice(gpa, svg[i..]);
+    return out.toOwnedSlice(gpa);
+}
+
+/// The earlier of the two stripped attributes at or after `from`, or null
+/// when the remaining input holds neither.
+fn nextStrip(svg: []const u8, from: usize) ?StripHit {
+    const fam = std.mem.findPos(u8, svg, from, font_family_attr);
+    const dop = std.mem.findPos(u8, svg, from, data_op_attr);
+    if (fam) |f| {
+        if (dop) |d| {
+            if (d < f) return dataOpHit(d);
+        }
+        // the family value ends at its closing quote
+        var j = f + font_family_attr.len;
+        while (j < svg.len and svg[j] != '"') j += 1;
+        return .{ .start = f, .after = j + 1 };
+    }
+    if (dop) |d| return dataOpHit(d);
+    return null;
+}
+
+fn dataOpHit(at: usize) StripHit {
+    return .{ .start = at, .after = at + data_op_attr.len };
+}
+
 // ── tests ────────────────────────────────
 
 const testing = std.testing;
@@ -309,9 +363,36 @@ test "svg: baseline offset places all content at non-negative y" {
     dl.depth = 2;
     const svg = try render(testing.allocator, &dl, .{});
     defer testing.allocator.free(svg);
-    // baseline offset = height + margin (0.08*size=0.8) = 8.8; frame adds
-    // the 0.2em lineGap (2pt) to the height; every coordinate carries pt units
-    try std.mem.indexOf(u8, svg, "<text x=\"0.8pt\" y=\"8.8pt\" font-size=\"10pt\"") != null;
+    // The baseline lands at the draw list's ascent plus the 0.08*size frame
+    // margin, so the content top sits at y = margin and every coordinate is
+    // non-negative. Assert the invariant, not a formatted float literal:
+    // 0.08 * 10 is 0.79999995 in f32, so pinning its shortest-round-trip
+    // spelling would pin float formatting instead of the geometry.
+    try testing.expectApproxEqAbs(@as(f32, 8.8), try attrNumber(svg, "y=\""), 0.001);
+    // The frame bounds the ink: ascent + descent, padded by the margin on
+    // both sides, plus the 0.2em browser lineGap below the baseline.
+    try testing.expectApproxEqAbs(
+        @as(f32, 8 + 2 + 2 * 0.8 + 2),
+        try attrNumber(svg, "height=\""),
+        0.001,
+    );
+    try testing.expectApproxEqAbs(@as(f32, 5 + 2 * 0.8), try attrNumber(svg, "width=\""), 0.001);
+}
+
+/// Parse the number at the first occurrence of `attr` in an SVG attribute
+/// value, stopping at the value's first non-numeric character (the `pt`
+/// unit or the closing quote). Fails when `attr` is absent.
+fn attrNumber(svg: []const u8, attr: []const u8) !f32 {
+    const at = std.mem.indexOf(u8, svg, attr) orelse return error.MissingAttribute;
+    const start = at + attr.len;
+    var end = start;
+    while (end < svg.len) : (end += 1) {
+        const c = svg[end];
+        const is_num = (c >= '0' and c <= '9') or c == '.' or c == '-' or c == '+' or c == 'e';
+        if (!is_num) break;
+    }
+    if (end == start) return error.EmptyAttribute;
+    return std.fmt.parseFloat(f32, svg[start..end]);
 }
 
 test "svg: escapes xml-special characters in text" {

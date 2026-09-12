@@ -1,5 +1,5 @@
-//! ztex.layout.box — superflat TeX box model: one flat array of fixed-size
-//! boxes with per-parent child placement in a parallel `ChildRef` array.
+//! ztex.layout.box — the box pool: fixed-size `Box` records, a parallel
+//! `ChildRef` run per parent, and a `CharData` side table.
 
 const std = @import("std");
 const atom = @import("ztex.atom");
@@ -9,11 +9,10 @@ pub const Kind = enum(u8) {
     hbox,
     /// children stacked vertically (fraction); positioned by shift
     vbox,
-    /// a single glyph; leaf
     char,
     /// invisible; metrics only
     glue,
-    /// invisible strut; metrics only
+    /// invisible; metrics only
     strut,
     /// filled rectangle (fraction bar, rule); leaf
     rule,
@@ -43,16 +42,15 @@ pub const BigOpForm = enum(u8) {
     variant,
 };
 
-/// A flat, fixed-size laid-out box.
+/// A laid-out box: fixed-size, stored in the BoxList pool.
 ///
-/// Box carries only the SHARED layout header (kind, dimensions, child run,
+/// Only the SHARED layout header lives here (kind, dimensions, child run,
 /// source span). Everything char-only — codepoint, style, size, and the
 /// layout flags that ride along to flatten/SVG (synthetic, big-op form,
-/// display-variant advance/ic, radical form, fixed-delimiter req) — lives
-/// in the BoxList `chars` side table, indexed by box index and populated
-/// only for `.char` boxes; rule/glue/strut/hbox/vbox/script boxes pay no
-/// storage for it. Read/write char state through BoxList.charData /
-/// charDataPtr, never directly on a Box.
+/// display-variant advance/ic, radical form, fixed-delimiter req) — lives in
+/// the BoxList `chars` side table, indexed by box index and populated only for
+/// `.char` boxes; other kinds pay no storage for it. Read/write char state
+/// through BoxList.charData/charDataPtr, never directly on a Box.
 pub const Box = struct {
     kind: Kind,
     width: f32,
@@ -68,11 +66,7 @@ pub const Box = struct {
     src_end: u32,
 };
 
-/// Char-only state of a glyph box, held in the BoxList side table
-/// (BoxList.chars), not in Box. Every box index has an entry — `.char`
-/// boxes get their real values in `create`, all other kinds the default.
 pub const CharData = struct {
-    /// the glyph codepoint
     cp: u21 = 0,
     /// effective font style
     style: atom.CharStyle = .italic,
@@ -141,19 +135,15 @@ pub const CharData = struct {
     delim_req: f32 = 0,
 };
 
-/// The flat box pool.
-///
-/// Do NOT copy a BoxList by value: it owns the `boxes`, `childrefs`,
-/// `chars`, and `scratch` arrays and deinits them exactly once.
-/// `init`/`deinit` must be paired 1:1; after `deinit` the list is unusable.
+/// Do NOT copy a BoxList by value: it owns the `boxes`, `childrefs`, `chars`,
+/// and `scratch` arrays and deinits them exactly once. `init`/`deinit` must be
+/// paired 1:1; after `deinit` the list is unusable.
 pub const BoxList = struct {
     gpa: std.mem.Allocator,
     boxes: std.ArrayList(Box) = .empty,
     childrefs: std.ArrayList(ChildRef) = .empty,
-    /// Char-only box state, parallel to `boxes` (indexed by box index).
-    /// `.char` boxes carry their codepoint/style/size and layout flags;
-    /// every other kind keeps the default entry. Rule/glue/strut/hbox/vbox/
-    /// script boxes pay no storage for char state.
+    /// Char-only box state, parallel to `boxes` (indexed by box index):
+    /// `.char` boxes carry their real values, every other kind the default.
     chars: std.ArrayList(CharData) = .empty,
     /// Reusable per-parent placement buffer. Layout fns save `items.len`,
     /// append their placements, hand the run to `create` (which copies it
@@ -178,15 +168,12 @@ pub const BoxList = struct {
         return self.boxes.items[idx];
     }
 
-    /// Char-only state of a box (codepoint, style, size, layout flags).
-    /// Every box index has an entry; non-char boxes return the default.
     pub fn charData(self: *const BoxList, idx: u32) CharData {
         std.debug.assert(idx < self.chars.items.len);
         return self.chars.items[idx];
     }
 
-    /// Mutable char-state slot, for post-create flagging (synthetic, big-op
-    /// form, display advance/ic, radical form, fixed-delimiter req).
+    /// Mutable char-state slot, for post-create flagging.
     pub fn charDataPtr(self: *BoxList, idx: u32) *CharData {
         std.debug.assert(idx < self.chars.items.len);
         return &self.chars.items[idx];
@@ -198,19 +185,14 @@ pub const BoxList = struct {
     /// storage. Any `create`/`createLeaf` call may reallocate that array and
     /// dangle the slice — never hold it across a `create` call.
     pub fn children(self: *const BoxList, idx: u32) []const ChildRef {
-        // Read the fields straight from the pool instead of going through
-        // `get` (which copies the whole Box) — one less by-value copy per
-        // parent. `get` stays by-value for callers that want a Box.
         std.debug.assert(idx < self.boxes.items.len);
         const b = &self.boxes.items[idx];
         if (b.num_children == 0) return &.{};
         return self.childrefs.items[b.first_child .. b.first_child + b.num_children];
     }
 
-    /// Append a box with a contiguous run of child placements; returns index.
-    /// Char-only state (cp/style/size) goes into the `chars` side table,
-    /// populated only for `.char` boxes — every other kind keeps the
-    /// default entry and pays no storage for it.
+    /// Append a box plus its contiguous run of child placements (copied into
+    /// `childrefs`); returns the box index.
     pub fn create(
         self: *BoxList,
         kind: Kind,
@@ -243,7 +225,6 @@ pub const BoxList = struct {
         return idx;
     }
 
-    /// Append a leaf box (no children).
     pub fn createLeaf(
         self: *BoxList,
         kind: Kind,

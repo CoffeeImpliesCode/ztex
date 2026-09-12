@@ -1,12 +1,11 @@
-//! ztex.parse.error — parse-error context (kind + span + message).
+//! ztex.parse.error — parse-error context.
 //!
-//! Lexer/parser error-return sites are bare error-set values (`error.Xxx`)
-//! with no position. Threading an `?*Info` out-param through `lex`/`parse`
-//! lets clients pretty-print the failure: the kind, the byte span of the
-//! offending input, and a TeX-style message. The error VALUES are unchanged
-//! (tests still `expectError` them); `Info` is only filled when a caller
-//! passes a non-null pointer, and only immediately before the matching
-//! error is returned.
+//! Lexer/parser error sites return bare error-set values (`error.Xxx`) with
+//! no position. Threading an `?*Info` out-param through `lex`/`parse` lets
+//! clients pretty-print the failure: the kind, the byte span of the offending
+//! input, and a TeX-style message. The error VALUES are unchanged (tests
+//! still `expectError` them); `Info` is filled only when the caller passes a
+//! non-null pointer, and only immediately before the matching error returns.
 
 const std = @import("std");
 const atom = @import("ztex.atom");
@@ -35,8 +34,7 @@ pub const Kind = enum {
     nesting_too_deep,
 };
 
-/// Parse-error context filled by `lex`/`parse` when the caller passes a
-/// non-null `err_info` out-param. On success the out-param is untouched.
+/// Parse-error context; the out-param is untouched when `parse` succeeds.
 pub const Info = struct {
     kind: Kind,
     /// Byte span of the offending input into the source. Zero-width at end
@@ -44,7 +42,6 @@ pub const Info = struct {
     /// (e.g. `\frac{a}` — the missing denominator's position).
     span: atom.Span,
 
-    /// A concrete TeX-style message for this kind.
     pub fn message(self: Info) []const u8 {
         return switch (self.kind) {
             .dangling_escape => "Dangling escape",
@@ -94,8 +91,7 @@ pub fn lineCol(src: []const u8, offset: usize) struct { line: usize, col: usize 
     return .{ .line = line, .col = countCodepoints(src[line_start..o]) + 1 };
 }
 
-/// With a trailing `\r` trimmed (so a CRLF-terminated line prints clean).
-/// Empty source yields "".
+/// The source line containing `offset`, with a trailing `\r` trimmed.
 pub fn sourceLine(src: []const u8, offset: usize) []const u8 {
     const o = @min(offset, src.len);
     var start = o;

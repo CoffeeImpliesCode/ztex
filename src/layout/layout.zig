@@ -47,6 +47,14 @@ const big_ladder_idx = [_]u8{ 0, 1, 4, 6, 7 };
 /// ink reaches the target).
 const big_target_ink = [_]f32{ 0, 1.094, 1.792, 2.392, 2.990 };
 
+/// Ink targets (em) of amsmath's FIXED fraction-delimiter rule: a display
+/// `\binom`/`\genfrac`-with-delims covers the style's standard fraction
+/// box and the XeTeX/KaTeX/MathJax refs draw parenleft.v6 there, the
+/// smaller styles the BASE paren — both rungs of the ladder above, read
+/// from it instead of restated here.
+const ams_delim_req_display_em: f32 = big_target_ink[3];
+const ams_delim_req_small_em: f32 = big_target_ink[1];
+
 /// Bit 21 of a \middle delimiter char leaf's `data` (the low 21 bits hold
 /// the codepoint — delimiterCp/layoutChar read only those via @truncate).
 /// Mirrors the parser's marker. layoutRow emits such leaves as zero-width
@@ -518,10 +526,9 @@ inline fn styleScale(gl: metrics.GlueParams, st: Style) f32 {
 }
 
 /// Decode the first codepoint of `bytes` with zg's DFA decoder (ASCII fast
-/// path; no view/iterator setup). Empty or malformed UTF-8 yields 0,
-/// matching the previous `Utf8View.init(...) catch null` fallback: zg
-/// substitutes U+FFFD (len 1) for malformed sequences, which we fold back to
-/// 0 — a genuine U+FFFD (EF BF BD) decodes with len 3 and is kept.
+/// path; no view/iterator setup). Empty or malformed UTF-8 yields 0: zg
+/// substitutes U+FFFD (len 1) for a malformed sequence, which is folded back
+/// to 0, while a genuine U+FFFD (EF BF BD) decodes with len 3 and is kept.
 inline fn firstCodepoint(bytes: []const u8) u21 {
     if (bytes.len == 0) return 0;
     if (bytes[0] < 0x80) return bytes[0];
@@ -1247,7 +1254,7 @@ fn layoutRow(
         const cb = list.get(child_box);
         // A BARE big operator is axis-centered: make_op sets the op box's
         // shift_amount to (h−d)/2 − axis in EVERY style (TeXbook rule 13b).
-        // The box's h/d are the DRAWN glyph's ink extents (bigOpInk × drawn
+        // The box's h/d are the DRAWN glyph's ink extents (metrics.bigOpInk × drawn
         // size), so this shift puts the ink CENTER on the math axis — the
         // old cmex10 hang-below box placed the LMMath glyph's baseline where
         // the cmex glyph's baseline should be, riding 0.75–1.1em too high
@@ -2204,8 +2211,8 @@ fn layoutEnv(
 /// v6 at display, the base paren at the smaller styles.
 fn binomDelimReqEm(style: Style) f32 {
     return switch (style) {
-        .display => 2.392,
-        .text, .script, .script_script => 1.094,
+        .display => ams_delim_req_display_em,
+        .text, .script, .script_script => ams_delim_req_small_em,
     };
 }
 
@@ -2904,8 +2911,8 @@ fn opTailIc(
         if ((n.data & atom.LimitsBits.mask) == atom.LimitsBits.force) return 0;
         const op: atom.BigOp = @enumFromInt(n.data & atom.LimitsBits.value_mask);
         if (bigOpLimits(op)) return 0;
-        const base_adv = bigOpInk(op, false).advance;
-        const disp_adv = bigOpInk(op, true).disp_advance;
+        const base_adv = metrics.bigOpInk(op, false).advance;
+        const disp_adv = metrics.bigOpInk(op, true).disp_advance;
         return s((disp_adv - base_adv) * 10.0, size_pt);
     }
     return 0;
@@ -3004,9 +3011,9 @@ fn layoutScript(
             // 0.333em — see below).
             // The text ∑ (ic 0) puts both scripts at the advance 1.056em.
             const op: atom.BigOp = @enumFromInt(base_u_atom.data & atom.LimitsBits.value_mask);
-            const ink = bigOpInk(op, style == .display);
+            const ink = metrics.bigOpInk(op, style == .display);
             if (style == .display and !bigOpLimits(op)) {
-                const base_adv = bigOpInk(op, false).advance;
+                const base_adv = metrics.bigOpInk(op, false).advance;
                 // display-variant advance − base advance (0.334em for ∫)
                 const attach = (ink.disp_advance - base_adv) * 10.0;
                 sup_ic = s(attach, size_pt);
@@ -3050,7 +3057,7 @@ fn layoutScript(
     // The script raises/drops below are computed from the SHIFTED
     // dimensions (height − shift, depth + shift) — exactly what tex.web
     // make_scripts sees after hpack absorbs the box's shift_amount. The box
-    // h/d are the drawn glyph's ink (bigOpInk × size_pt), so at 10pt a
+    // h/d are the drawn glyph's ink (metrics.bigOpInk × size_pt), so at 10pt a
     // display ∫ (gs 10) gives base_h 8.05 / base_d 3.06 and the shift
     // (8.05−3.06)/2 − 2.5 ≈ 0 — the ink center sits on the math axis at
     // every style, the XeTeX-LMMath \showbox numbers.
@@ -3268,8 +3275,8 @@ fn layoutOpLimits(
         s(bcd.disp_ic, size_pt)
     else if (bigOpByCp(bcd.cp)) |op|
         // Text/script ops: the BASE glyph's italic correction (∫/∮ 3.32 —
-        // bigOpInk is the single source for every big-op advance/ic).
-        s(bigOpInk(op, false).ic, size_pt)
+        // metrics.bigOpInk is the single source for every big-op advance/ic).
+        s(metrics.bigOpInk(op, false).ic, size_pt)
     else
         0;
 
@@ -3405,128 +3412,8 @@ fn bigOpLimits(op: atom.BigOp) bool {
     };
 }
 
-/// The drawn glyph's ink extents of a big operator, in em of the glyph's
-/// font-size (measured with fontTools on latinmodern-math.otf 2.005).
-/// Latin Modern Math draws every big op AXIS-CENTERED — ∑/∏/∐ ink
-/// +0.750/−0.250em, ∫/∮ +0.805/−0.306em, ⋂ +0.772/−0.250, ⋃ +0.750/−0.272,
-/// ⨆ +0.764/−0.264 (the font MATH axis is 0.250em) — unlike cmex10 whose
-/// glyphs hang almost entirely below the baseline. The big-op BOX takes
-/// its WIDTH from the hmtx ADVANCE (below) and its height/depth from this
-/// ink, at the drawn glyph size,
-/// so the viewBox bounds the real ink, the (h−d)/2 − axis shift every parent
-/// applies centers the ink on the math axis (the ink center is
-/// (asc−desc)/2 = 0.25em above the glyph baseline, the axis is 0.25em of
-/// size_pt, so display ∑/∫ land within ±0.5·gs of the axis with NOTHING
-/// clipped; XeTeX-LMMath \showbox confirms: text-style ∫ shift ≈ 0), and
-/// the advance/limits/side-script geometry all measure from the true ink
-/// width (the old cmex10 width under-sized the box ~1.8×: limits centered
-/// on a stub, the next atom overlapped the ink, the frame clipped).
-/// Widths are the LATIN-MODERN-MATH hmtx ADVANCE in em of the drawn glyph
-/// (measured with fontTools: ∑ 1.056, ∏/∐ 0.944, ⋃/⋂/⨆ 0.833, ∫/∮ 0.665),
-/// not the ink-bbox width (∑ 0.943, ∫ 0.553) — the advance is what the
-/// rendered glyph occupies, so the box advance matches the drawn ∑/∫
-/// exactly.
-///
-/// DISPLAY style uses the font's display variants (the MATH-table
-/// MathGlyphVariantRecords XeTeX selects for display operators — measured
-/// from the embedded XeTeX render: display ∑ ink +0.95/−0.45em, advance
-/// 1.444em; display ∫ ink +1.361/−0.861em). The limits ops (∑ ∏ ∐ ⋃ ⋂ ⨆)
-/// take the variant's FULL box (advance 1.444/1.278/1.111em — verified:
-/// the following term in \sum_{i=1}^{n} x_i sits at 1.444em + thin, and the
-/// over/under limits center on that box). The nolimits ops (∫ ∮) keep the
-/// BASE advance for the horizontal script placement and the row advance
-/// (measured: \int_0^1 sup at 0.665em + ic, row advance 0.665 + ic + scripts
-/// + thin), but the box HEIGHT/DEPTH come from the display variant (so the
-/// beside-script drops measure from the drawn glyph: \int_0^1 sup raise
-/// 11.860 = 1.361×10 − 1.75, sub drop 10.008 = 0.861×10 + 1.40).
-const BigOpInk = struct {
-    advance: f32,
-    /// Display-variant hmtx advance (em). For limits ops it equals
-    /// `advance` (the box takes the variant advance); for the nolimits ∫/∮
-    /// the ROW box keeps the base advance while the beside scripts attach
-    /// at the variant advance (measured \int_0^1 sup at 0.999em).
-    disp_advance: f32,
-    asc: f32,
-    desc: f32,
-    /// MathItalicsCorrection (pt at 10pt): base glyph ic (∫ 3.32) in text
-    /// style, display-variant ic (∫ .v1 5.91) in display style.
-    ic: f32,
-};
-fn bigOpInk(op: atom.BigOp, display: bool) BigOpInk {
-    const base = switch (op) {
-        .sum => BigOpInk{
-            .advance = 1.056,
-            .disp_advance = 1.056,
-            .asc = 0.750,
-            .desc = 0.250,
-            .ic = 0,
-        }, // U+2211 ∑
-        .prod => BigOpInk{
-            .advance = 0.944,
-            .disp_advance = 0.944,
-            .asc = 0.750,
-            .desc = 0.250,
-            .ic = 0,
-        }, // U+220F ∏
-        .coprod => BigOpInk{
-            .advance = 0.944,
-            .disp_advance = 0.944,
-            .asc = 0.750,
-            .desc = 0.250,
-            .ic = 0,
-        }, // U+2210 ∐
-        .bigcup => BigOpInk{
-            .advance = 0.833,
-            .disp_advance = 0.833,
-            .asc = 0.750,
-            .desc = 0.272,
-            .ic = 0,
-        }, // U+22C3 ⋃
-        .bigcap => BigOpInk{
-            .advance = 0.833,
-            .disp_advance = 0.833,
-            .asc = 0.772,
-            .desc = 0.250,
-            .ic = 0,
-        }, // U+22C2 ⋂
-        .bigsqcup => BigOpInk{
-            .advance = 0.833,
-            .disp_advance = 0.833,
-            .asc = 0.764,
-            .desc = 0.264,
-            .ic = 0,
-        }, // U+2A06 ⨆
-        .int, .oint, .oiint, .oiiint, .ointctrclockwise => BigOpInk{
-            .advance = 0.665,
-            .disp_advance = 0.665,
-            .asc = 0.805,
-            .desc = 0.306,
-            .ic = 3.32,
-        },
-    };
-    if (!display) return base;
-    // Display variants (summation.v1, integral.v1, ... — hmtx advances and
-    // ink measured with fontTools; the ink matches the embedded XeTeX
-    // render within 0.001em; the .v1 MathItalicsCorrection values are
-    // 0 for the limits ops and 0.591em for ∫/∮).
-    return switch (op) {
-        .sum => BigOpInk{ .advance = 1.444, .disp_advance = 1.444, .asc = 0.950, .desc = 0.450, .ic = 0 },
-        .prod => BigOpInk{ .advance = 1.278, .disp_advance = 1.278, .asc = 0.950, .desc = 0.450, .ic = 0 },
-        .coprod => BigOpInk{ .advance = 1.278, .disp_advance = 1.278, .asc = 0.950, .desc = 0.450, .ic = 0 },
-        .bigcup => BigOpInk{ .advance = 1.111, .disp_advance = 1.111, .asc = 0.917, .desc = 0.439, .ic = 0 },
-        .bigcap => BigOpInk{ .advance = 1.111, .disp_advance = 1.111, .asc = 0.939, .desc = 0.417, .ic = 0 },
-        .bigsqcup => BigOpInk{ .advance = 1.111, .disp_advance = 1.111, .asc = 0.936, .desc = 0.436, .ic = 0 },
-        .int, .oint, .oiint, .oiiint, .ointctrclockwise => BigOpInk{
-            .advance = 0.665,
-            .disp_advance = 0.999,
-            .asc = 1.361,
-            .desc = 0.861,
-            .ic = 5.91,
-        },
-    };
-}
 /// A big operator glyph: a char box at the operator codepoint, BOXED BY THE
-/// DRAWN FONT'S INK (bigOpInk × drawn size) — the box WIDTH is the hmtx
+/// DRAWN FONT'S INK (metrics.bigOpInk × drawn size) — the box WIDTH is the hmtx
 /// ADVANCE and the height/depth the ink asc/desc, so the box bounds exactly
 /// what the glyph occupies horizontally and what is drawn vertically. The
 /// old cmex10 width (∑ 14.44448, ∫ 5.55557, unscaled design values)
@@ -3535,7 +3422,7 @@ fn bigOpInk(op: atom.BigOp, display: bool) BigOpInk {
 /// ∫ side-script sat on top of the ink. The bigop spacing/limits gaps still
 /// come from cmex10: those are spacing facts, independent of the drawn
 /// glyph. In display style the BOX takes the font's display-variant extents
-/// (bigOpInk display branch — ∑ advance 1.444em, ink 0.950/0.450; ∫ keeps
+/// (metrics.bigOpInk display branch — ∑ advance 1.444em, ink 0.950/0.450; ∫ keeps
 /// the base advance 0.665em with the variant ink 1.361/0.861), so the
 /// over/under-limit kerns and the beside-script drops measure from the XeTeX
 /// reference geometry. The BOX is what the limits/scripts/advance geometry
@@ -3569,7 +3456,7 @@ fn layoutOp(
     const op: atom.BigOp = @enumFromInt(n.data & atom.LimitsBits.value_mask);
     const cp = bigOpCodepoint(op);
     const display = style == .display;
-    const ink = bigOpInk(op, display);
+    const ink = metrics.bigOpInk(op, display);
     // Box AT DESIGN: display ops box by the display-variant extents, all
     // other styles by the base extents, always × size_pt. The limits kerns,
     // beside-script drops and the row advance all measure from this box and
@@ -3782,11 +3669,7 @@ fn layoutFraction(
     const part_style: Style = if (parts_display)
         .display
     else if (eff_style == .display) .text else if (eff_style == .text) .script else .script_script;
-    const part_scale = switch (part_style) {
-        .display, .text => 1.0,
-        .script => gl.scriptfactor,
-        .script_script => gl.scriptscriptfactor,
-    };
+    const part_scale = styleScale(gl, part_style);
     // TeX sizes are absolute from the document base, not compounded
     // multiplicatively.  eff_size already reflects forced-style rescaling,
     // so dividing back by the fraction's OWN style scale recovers the

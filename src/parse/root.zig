@@ -25,16 +25,15 @@ pub const Error = lexer.Error || parser.Error || error{
     SourceTooLarge,
 };
 
-/// Hard upper bound on `src.len`. `Span` (token.zig) stores byte offsets as
-/// u32, and the lexer's `emit` casts its usize positions with `@intCast`; a
+/// Hard upper bound on `src.len`. `atom.Span` stores byte offsets as u32,
+/// and the lexer's `emit` casts its usize positions with `@intCast`; a
 /// source longer than `maxInt(u32)` bytes would overflow that cast (a
 /// safe-mode panic / a ReleaseFast truncation). The bound is HALF of that
 /// because the node pool grows to ~2× the token count on nested/scripted
-/// input, and `pushNode` (atom.zig) casts `nodes.items.len` to u32 the same
-/// way — a source near `maxInt(u32)` could push the pool past the cast
-/// (H2). We reject such sources up front with `error.SourceTooLarge`
-/// instead. Realistic math input is orders of magnitude smaller; the bound
-/// only guards the degenerate case.
+/// way — a source near `maxInt(u32)` could push the pool past the cast. We
+/// reject such sources up front with `error.SourceTooLarge` instead.
+/// Realistic math input is orders of magnitude smaller; the bound only
+/// guards the degenerate case.
 pub const max_source_bytes: usize = std.math.maxInt(u32) / 2;
 
 /// True when a source of `len` bytes is too long for u32 byte offsets.
@@ -269,7 +268,7 @@ fn nestedBraces(n: usize, buf: []u8) []const u8 {
 
 test "parse: deeply nested input returns NestingTooDeep, not a crash" {
     // 5000 nested groups ≈ 1 nesting level per byte; without the depth
-    // guard (C1) this would overflow the C stack, which Zig cannot catch.
+    // guard this would overflow the C stack, which Zig cannot catch.
     // The guard trips at max_nesting and unwinds cleanly.
     var buf: [5000 * 2 + 1]u8 = undefined;
     const src = nestedBraces(5000, &buf);

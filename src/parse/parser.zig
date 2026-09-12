@@ -688,7 +688,7 @@ pub const Parser = struct {
     /// path (groups, fractions, \left..\right, environments, style
     /// switches, substacks), so counting it there bounds them all. When the
     /// depth exceeds `max_nesting` the parse fails with NestingTooDeep
-    /// instead of overflowing the stack (C1).
+    /// instead of overflowing the stack.
     depth: u32 = 0,
     /// Caller-provided parse-error context: filled (when non-null) with the
     /// kind + offending span immediately before any error is returned.
@@ -752,7 +752,7 @@ pub const Parser = struct {
             // returned directly by lex()/parse() at their own sites), so a
             // call here is a programming error. Abort loudly in EVERY build
             // mode: `unreachable` is undefined behavior in ReleaseFast and
-            // could corrupt the process instead of failing (M7).
+            // could corrupt the process instead of failing.
             .dangling_escape, .invalid_utf8, .source_too_large => @panic(
                 "parse.parser.fail: lexer-only kind routed to the parser",
             ),
@@ -844,7 +844,7 @@ pub const Parser = struct {
     fn parseRow(self: *Parser, ast: *atom.Ast, mode: RowMode) Error!u32 {
         self.depth += 1;
         defer self.depth -= 1;
-        // Nesting guard (C1): every recursive path (parseGroup, fractions'
+        // Nesting guard: every recursive path (parseGroup, fractions'
         // required args, \left..\right, environments, style switches,
         // substacks) re-enters parseRow, so this counts the whole mutual
         // recursion. Beyond `max_nesting` the input is pathological — a
@@ -2945,7 +2945,7 @@ test "parser: & outside an environment is an ordinary char" {
     try testing.expectEqual(.char, ast.node(ast.child(ast.root, 1)).tag);
 }
 
-// ── supported_commands (audit L5) ──────────────
+// ── supported_commands ──────────────────────────
 
 /// Independent comptime recomputation of the DISTINCT command count across
 /// the four dispatch tables. `supported_commands` is built from these same
@@ -3013,8 +3013,6 @@ test "parser: supported_commands is exactly the union of the four tables" {
             try testing.expect(!std.mem.eql(u8, s, prev));
         }
     }
-    // 4. Independent count check: length == recomputed distinct union size.
-    try testing.expectEqual(@as(usize, supported_distinct_count), supported_commands.len);
     // 4. Independent count check: length == recomputed distinct union size.
     try testing.expectEqual(@as(usize, supported_distinct_count), supported_commands.len);
 }

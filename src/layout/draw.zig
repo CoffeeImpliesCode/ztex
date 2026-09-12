@@ -1,6 +1,5 @@
-//! ztex.layout.draw — the terminal flat, painter-ordered draw list
-//! (text/rect/line at absolute coordinates) + box→draw flattening. Every
-//! primitive carries the byte span of the box it came from.
+//! ztex.layout.draw — box tree → painter-ordered draw list of absolute-
+//! coordinate primitives (text/rect/line), each carrying its box's byte span.
 
 const std = @import("std");
 const box = @import("box.zig");
@@ -13,7 +12,6 @@ pub const Color = struct {
     a: u8 = 255,
 };
 
-/// A drawable primitive.
 pub const Draw = union(enum) {
     /// a glyph run at its baseline (x, y)
     text: Text,
@@ -101,7 +99,7 @@ pub const Line = struct {
     src_end: u32,
 };
 
-/// The flat, ordered draw list. Painter's order; absolute coordinates.
+/// The ordered draw list. Painter's order; absolute coordinates.
 ///
 /// Do NOT copy a DrawList by value: it owns the `items` array and the
 /// `glyph_arena` (which owns every synthetic glyph's bytes) and deinits
@@ -132,8 +130,7 @@ pub const DrawList = struct {
     height: f32 = 0,
     depth: f32 = 0,
     /// running ink bbox accumulated by `flatten` (`ink_valid` guards the
-    /// initial union; all zeros for an empty draw list). Internal — read
-    /// through `bounds()`.
+    /// initial union). Internal — read through `bounds()`.
     ink_valid: bool = false,
     ink_min_x: f32 = 0,
     ink_min_y: f32 = 0,
@@ -161,12 +158,11 @@ pub const DrawList = struct {
         return self.items.items.len;
     }
 
-    /// Exact ink bounds of everything `flatten` drew, relative to the root
-    /// reference point: `width` = horizontal ink span, `height` = ink
-    /// ascent above the baseline, `depth` = ink descent below it. All zero
-    /// for an empty draw list. See the struct doc for the box-vs-ink
-    /// semantics (this is the INK bound; `width`/`height`/`depth` are the
-    /// BOX bounds).
+    /// Exact INK bounds of everything `flatten` drew, relative to the root
+    /// reference point: `width` = horizontal ink span, `height` = ink ascent
+    /// above the baseline, `depth` = ink descent below it; all zero for an
+    /// empty draw list. The `width`/`height`/`depth` FIELDS are the BOX
+    /// bounds — see the struct doc.
     pub fn bounds(self: *const DrawList) struct { width: f32, height: f32, depth: f32 } {
         if (!self.ink_valid) return .{ .width = 0, .height = 0, .depth = 0 };
         return .{
@@ -176,8 +172,6 @@ pub const DrawList = struct {
         };
     }
 
-    /// Union a drawn primitive's extent (x0,y0)-(x1,y1) into the running
-    /// ink bbox. Called by `flatten` for every emitted primitive.
     fn accInk(self: *DrawList, x0: f32, y0: f32, x1: f32, y1: f32) void {
         if (!self.ink_valid) {
             self.ink_valid = true;
@@ -196,12 +190,10 @@ pub const DrawList = struct {
 
 const black: Color = .{ .r = 0, .g = 0, .b = 0 };
 
-/// Flatten a box tree into a draw list in painter's order.
-///
-/// `(x, y)` is the box's reference point (baseline). Children are placed at
-/// `(x + cr.x_shift, y + cr.shift)`, computed by layout. Every emitted
-/// primitive's extent is also unioned into the list's running ink bbox
-/// (see `DrawList.bounds()`).
+/// `(x, y)` is the box's reference point (baseline); children land at
+/// `(x + cr.x_shift, y + cr.shift)` as computed by layout. Every emitted
+/// primitive's extent is also unioned into `out`'s running ink bbox (see
+/// `DrawList.bounds()`).
 pub fn flatten(
     list: *const box.BoxList,
     root: u32,
@@ -213,11 +205,11 @@ pub fn flatten(
     const b = list.get(root);
     switch (b.kind) {
         .char => {
-            // The drawn glyph is the box's codepoint. Normally its utf-8
-            // equals the source span bytes (zero copy); a synthetic box (a
-            // big operator like \sum → ∑) has no matching source bytes, so
-            // its glyph is duped into the glyph arena. Synthetic is the sole
-            // non-alias case — no byte comparison needed.
+            // Normally the drawn utf-8 equals the source span bytes (zero
+            // copy); a synthetic box (a big operator like \sum → ∑) has no
+            // matching source bytes, so its glyph is duped into the glyph
+            // arena. Synthetic is the sole non-alias case — no byte
+            // comparison needed.
             const ch = list.charData(root);
             const bytes = if (ch.synthetic) blk: {
                 var buf: [4]u8 = undefined;

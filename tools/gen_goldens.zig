@@ -82,30 +82,8 @@ fn dumpSvgOnly(gpa: std.mem.Allocator, src: []const u8, size: f32) ![]u8 {
     var dl = try ztex.render(gpa, src, size, null);
     defer dl.deinit();
     const svg = try ztex.svg.render(gpa, &dl, .{ .padding = 0 });
-    // Strip the font-family and data-op attributes (see regression.dumpSvg)
-    // so the SVG goldens stay font-independent and short.
-    const fam = " font-family=\"";
-    const dop = " data-op=\"v1\"";
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(gpa);
-    var i: usize = 0;
-    while (true) {
-        const f = std.mem.findPos(u8, svg, i, fam);
-        const d = std.mem.findPos(u8, svg, i, dop);
-        if (f == null and d == null) break;
-        if (f != null and (d == null or f.? < d.?)) {
-            try buf.appendSlice(gpa, svg[i..f.?]);
-            var j = f.? + fam.len;
-            while (j < svg.len and svg[j] != '"') j += 1;
-            i = j + 1;
-        } else {
-            try buf.appendSlice(gpa, svg[i..d.?]);
-            i = d.? + dop.len;
-        }
-    }
-    if (i < svg.len) try buf.appendSlice(gpa, svg[i..]);
-    gpa.free(svg);
-    return buf.toOwnedSlice(gpa);
+    defer gpa.free(svg);
+    return ztex.svg.stripForGoldenSnapshot(gpa, svg);
 }
 
 fn dumpAtomsOnly(gpa: std.mem.Allocator, src: []const u8) ![]u8 {

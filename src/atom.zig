@@ -1,18 +1,14 @@
 //! ztex.atom — superflat LaTeX atom (AST).
 //!
-//! Pattern: house superflat AST (cf. `~/projects/{vain,skript}`). The whole
-//! tree is one flat array of fixed-size AoS nodes; child links are contiguous
-//! index runs; source provenance is via a parallel token table with byte
-//! offsets. No pointers, no pointer chasing, no per-node allocation.
-//!
-//! Duplication protocol: a parent's `createNode` re-appends copies of its
-//! immediate children immediately before itself, so a node's child run is
-//! always contiguous. Each subtree appears in the pool more than once; only
-//! the root-reachable chain is the tree.
+//! One flat pool of fixed-size nodes; a node's children are a contiguous
+//! index run. Duplication protocol: `createNode` re-appends copies of the
+//! immediate children just before the parent, so a subtree appears in the
+//! pool more than once and only the root-reachable chain is the tree.
+//! Provenance is a parallel token table of byte spans.
 
 const std = @import("std");
 
-// ── lexical tokens (folded in from the former token.zig) ────────────
+// ── lexical tokens ────────────────────────────────────────────────────────
 
 /// Lexical token kind.
 pub const TokenTag = enum(u8) {
@@ -134,7 +130,6 @@ pub const EnvBits = struct {
     pub const max_spec_cols: usize = 12;
 };
 
-/// The environment kind of an `.env` node.
 pub inline fn envKind(data: u32) EnvKind {
     return @enumFromInt(data & EnvBits.kind_mask);
 }
@@ -377,7 +372,6 @@ pub inline fn emToFixed(em: f32) u32 {
     return @bitCast(em);
 }
 
-/// Decode a `space` node's width-in-em back to f32 (raw f32 bits).
 pub inline fn fixedToEm(v: u32) f32 {
     return @bitCast(v);
 }
@@ -427,14 +421,12 @@ pub const Ast = struct {
         try self.tokens.append(self.gpa, t);
     }
 
-    /// Append one node; returns its index.
     pub fn pushNode(self: *Ast, n: Node) !u32 {
         const idx: u32 = @intCast(self.nodes.items.len);
         try self.nodes.append(self.gpa, n);
         return idx;
     }
 
-    /// Append a contiguous run of nodes; returns the first index.
     pub fn pushNodes(self: *Ast, ns: []const Node) !u32 {
         const first: u32 = @intCast(self.nodes.items.len);
         try self.nodes.appendSlice(self.gpa, ns);
@@ -463,7 +455,6 @@ pub const Ast = struct {
         });
     }
 
-    /// Create a leaf node (no children).
     pub fn createLeaf(
         self: *Ast,
         tag: Tag,

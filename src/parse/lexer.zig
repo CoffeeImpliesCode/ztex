@@ -1,10 +1,9 @@
 //! ztex.parse.lexer — LaTeX math tokenizer.
 //!
-//! Pre-lexes the whole source into the superflat AST's flat token table
-//! (house pattern, cf. `~/projects/{vain,skript}`). One forward pass over
-//! `ast.src` appends a `Token` per lexical element; whitespace and comments
-//! are skipped. Every token carries its byte span into the source, so later
-//! atoms map back to source text in O(1).
+//! Pre-lexes the whole source into the AST's flat token table. One forward
+//! pass over `ast.src` appends a `Token` per lexical element; whitespace and
+//! comments are skipped. Every token carries its byte span into the source,
+//! so later atoms map back to source text in O(1).
 
 const std = @import("std");
 const atom = @import("ztex.atom");
