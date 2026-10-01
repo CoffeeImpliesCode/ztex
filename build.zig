@@ -81,6 +81,19 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // ── ztex.c — C ABI root: the static library, and its own test root ──
+    const c_abi = b.addModule("ztex.c", .{
+        .root_source_file = b.path("src/ztex_c.zig"),
+        .target = target,
+        .optimize = optimize,
+        // A C host usually links this archive into a PIE or a shared
+        // object, so it is built PIC; plain executables never notice.
+        .pic = true,
+        .imports = &.{
+            .{ .name = "ztex", .module = ztex },
+        },
+    });
+
     // ── ztex executable ────────────────────────────
     const exe = b.addExecutable(.{
         .name = "ztex",
@@ -115,6 +128,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "svg", .module = svg, .root = b.path("src/svg.zig") },
         .{ .name = "ztex", .module = ztex, .root = b.path("src/root.zig") },
         .{ .name = "tests", .module = tests, .root = b.path("src/tests/root.zig") },
+        .{ .name = "c", .module = c_abi, .root = b.path("src/ztex_c.zig") },
     };
 
     // Coverage wiring. The test roots below SHARE module instances (atom is
@@ -201,6 +215,27 @@ pub fn build(b: *std.Build) void {
     const gen_step = b.step("gen-goldens", "Print golden tables for the breadth corpus");
     const run_gen = b.addRunArtifact(gen_exe);
     gen_step.dependOn(&run_gen.step);
+
+    // ── C ABI static library ──────────────────────────────────
+    // A separate step, NOT part of the default install: a Zig-only user's
+    // `zig build` still builds exactly what it built before.
+    const c_lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "ztex",
+        .root_module = c_abi,
+    });
+    const install_c_lib = b.addInstallArtifact(c_lib, .{});
+    const install_c_header = b.addInstallDirectory(.{
+        .source_dir = b.path("include"),
+        .install_dir = .prefix,
+        .install_subdir = "include",
+    });
+    const c_lib_step = b.step(
+        "static-lib",
+        "Build the C ABI static library and install its header (zig-out/lib/libztex.a)",
+    );
+    c_lib_step.dependOn(&install_c_lib.step);
+    c_lib_step.dependOn(&install_c_header.step);
 
     const install_docs = b.addInstallDirectory(.{
         .source_dir = exe.getEmittedDocs(),

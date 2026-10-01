@@ -10,6 +10,8 @@ const context = @import("context.zig");
 const coverage = @import("coverage.zig");
 const layout = @import("ztex.layout");
 const draw = layout.draw;
+const atom = @import("ztex.atom");
+const font = @import("font.zig");
 
 pub const Format = enum {
     /// 32-bit RGBA (R, G, B, A in byte order)
@@ -300,11 +302,7 @@ test "rasterize: \\mathbf draws the bold face, not the regular one" {
                 .format = .alpha8,
             });
             defer buf.deinit();
-            var n: usize = 0;
-            for (buf.pixels) |p| {
-                if (p != 0) n += 1;
-            }
-            return n;
+            return inkedPixels(buf);
         }
     }.f;
 
@@ -316,6 +314,405 @@ test "rasterize: \\mathbf draws the bold face, not the regular one" {
     try testing.expect(bold > roman);
     // Bold must be a real weight difference, not an antialiasing wobble.
     try testing.expect(bold * 10 > roman * 11);
+}
+
+/// A single-glyph draw item at the origin, 20pt, in `style`. `bytes` is a
+/// string literal, so a test draw list needs no glyph arena.
+fn item(bytes: []const u8, style: atom.CharStyle) draw.Text {
+    return .{
+        .bytes = bytes,
+        .x = 0,
+        .y = 0,
+        .size = 20,
+        .style = style,
+        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+        .src_start = 0,
+        .src_end = 0,
+    };
+}
+
+/// Rasterize one draw item at 20pt / 72 dpi (1 px per pt) inside a frame far
+/// larger than any variant, so a taller rung is never clipped by the box.
+fn rasterOne(gpa: std.mem.Allocator, ctx: *context.Context, t: draw.Text) !PixelBuffer {
+    var dl = draw.DrawList.init(gpa);
+    defer dl.deinit();
+    try dl.add(.{ .text = t });
+    dl.accInk(-60, -70, 60, 30);
+    return rasterize(gpa, ctx, &dl, .{ .dpi = 72, .format = .alpha8 });
+}
+
+/// Non-zero bytes in an alpha8 buffer — the drawn ink.
+fn inkedPixels(buffer: PixelBuffer) usize {
+    var n: usize = 0;
+    for (buffer.pixels) |p| {
+        if (p != 0) n += 1;
+    }
+    return n;
+}
+
+/// Buffer rows carrying ink — the drawn glyph's height, in pixels.
+fn inkedRows(buffer: PixelBuffer) usize {
+    var n: usize = 0;
+    for (0..buffer.height) |y| {
+        for (0..buffer.width) |x| {
+            if (buffer.pixels[y * buffer.stride + x] != 0) {
+                n += 1;
+                break;
+            }
+        }
+    }
+    return n;
+}
+
+/// The value a glyph lookup must yield, or a test failure that names what
+/// is missing. A forced unwrap would abort the whole test binary when the
+/// font data stops resolving, leaving a panic trace instead of the lookup
+/// that went null.
+fn expectResolved(comptime T: type, subject: []const u8, resolved: ?T) error{MissingGlyph}!T {
+    if (resolved) |value| return value;
+    std.debug.print("glyph lookup returned null: {s}\n", .{subject});
+    return error.MissingGlyph;
+}
+
+// The old rasterizer named 62 Latin Modern glyph ids literally: 4 big
+// operators, 6 radical pieces and 52 fence rungs. Every one of them must
+// come back out of the font's own MATH table unchanged, so the lookup is a
+// pure substitution for those families. The ids live only here, as
+// expectations — no draw path names a glyph.
+test "resolveGlyph: the MATH table reproduces every former hardcoded glyph id" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    const face = ctx.fonts.faceForStyle(.italic);
+
+    // Display big operators: .v1 of each operator's own ladder.
+    const bigops = [_]struct { cp: u21, text: []const u8, gid: u32 }{
+        .{ .cp = 0x2211, .text = "\u{2211}", .gid = 3074 }, // ∑ summation.v1
+        .{ .cp = 0x220F, .text = "\u{220F}", .gid = 3075 }, // ∏ product.v1
+        .{ .cp = 0x222B, .text = "\u{222B}", .gid = 3063 }, // ∫ integral.v1
+        .{ .cp = 0x222E, .text = "\u{222E}", .gid = 3067 }, // ∮ contourintegral.v1
+        // The old switch named only the four above, so every other display
+        // operator fell through to its BASE glyph — ∐, ⋃, ⋂, ⨆, ∯ and ∰
+        // all have a .v1 the layout meant to draw.
+        .{ .cp = 0x2210, .text = "\u{2210}", .gid = 3076 }, // ∐ coproduct.v1
+        .{ .cp = 0x222F, .text = "\u{222F}", .gid = 3068 }, // ∯ contourint.v1
+        .{ .cp = 0x2230, .text = "\u{2230}", .gid = 3069 }, // ∰ contouriint.v1
+        .{ .cp = 0x22C3, .text = "\u{22C3}", .gid = 2768 }, // ⋃ nbigcup.v1
+        .{ .cp = 0x22C2, .text = "\u{22C2}", .gid = 2766 }, // ⋂ nbigcap.v1
+        .{ .cp = 0x2A06, .text = "\u{2A06}", .gid = 2793 }, // ⨆ bigsqcup.v1
+    };
+    for (bigops) |op| {
+        var t = item(op.text, .italic);
+        t.bigop_form = .variant;
+        try testing.expectEqual(op.gid, resolveGlyph(face, op.cp, &t).?);
+    }
+
+    // The √ vertical variants radical.v1 … radical.v4.
+    for ([_]u32{ 3081, 3082, 3083, 3084 }, 0..) |gid, rung| {
+        var t = item("\u{221A}", .italic);
+        t.radical_form = @intCast(rung + 1);
+        try testing.expectEqual(gid, resolveGlyph(face, radical_cp, &t).?);
+    }
+    // The √ glyph ASSEMBLY's three pieces, bottom → extender → top. The old
+    // switch named only the top two and let radical_form 7 reach the cmap's
+    // U+23B7 — the same glyph in Latin Modern, but only by coincidence of
+    // that font's numbering.
+    const pieces = [_]struct { form: u8, gid: u32 }{
+        .{ .form = radical_form_top, .gid = 3080 },
+        .{ .form = radical_form_extender, .gid = 3079 },
+        .{ .form = radical_form_bottom, .gid = 3078 },
+    };
+    for (pieces) |piece| {
+        var t = item("\u{221A}", .italic);
+        t.radical_form = piece.form;
+        try testing.expectEqual(piece.gid, resolveGlyph(face, radical_cp, &t).?);
+    }
+
+    // Fence ladders .v1 … .v7. `|` and ∣ share the divides construction.
+    const divides = [7]u32{ 2677, 2684, 2691, 2698, 2705, 2712, 2719 };
+    const floor_left = [7]u32{ 2377, 2399, 2421, 2443, 2465, 2487, 2535 };
+    const floor_right = [7]u32{ 2378, 2400, 2422, 2444, 2466, 2488, 2536 };
+    const ceil_left = [7]u32{ 2375, 2397, 2419, 2441, 2463, 2485, 2533 };
+    const ceil_right = [7]u32{ 2376, 2398, 2420, 2442, 2464, 2486, 2534 };
+    const angle_left = [7]u32{ 2583, 2587, 2591, 2595, 2599, 2603, 2607 };
+    const angle_right = [7]u32{ 2584, 2588, 2592, 2596, 2600, 2604, 2608 };
+    const slash = [7]u32{ 2672, 2679, 2686, 2693, 2700, 2707, 2714 };
+    const fences = [_]struct { cp: u21, text: []const u8, ladder: [7]u32 }{
+        .{ .cp = '(', .text = "(", .ladder = .{ 2367, 2389, 2411, 2433, 2455, 2477, 2499 } },
+        .{ .cp = ')', .text = ")", .ladder = .{ 2368, 2390, 2412, 2434, 2456, 2478, 2500 } },
+        .{ .cp = '[', .text = "[", .ladder = .{ 2373, 2395, 2417, 2439, 2461, 2483, 2525 } },
+        .{ .cp = ']', .text = "]", .ladder = .{ 2374, 2396, 2418, 2440, 2462, 2484, 2526 } },
+        .{ .cp = '{', .text = "{", .ladder = .{ 2371, 2393, 2415, 2437, 2459, 2481, 2515 } },
+        .{ .cp = '}', .text = "}", .ladder = .{ 2372, 2394, 2416, 2438, 2460, 2482, 2516 } },
+        .{ .cp = '|', .text = "|", .ladder = divides },
+        .{ .cp = 0x2223, .text = "\u{2223}", .ladder = divides },
+        // ‖ parallel has its own construction. The old switch clamped rungs
+        // 5-7 of divides AND parallel to .v4; the ladder has rungs there.
+        .{
+            .cp = 0x2225,
+            .text = "\u{2225}",
+            .ladder = .{ 2678, 2685, 2692, 2699, 2706, 2713, 2720 },
+        },
+        // The old per-codepoint switch named none of these, so \left⌊,
+        // \left⟨ and \left/ all fell through to their BASE glyph. They have
+        // real ladders; pin the rungs they now draw.
+        .{ .cp = 0x230A, .text = "\u{230A}", .ladder = floor_left },
+        .{ .cp = 0x230B, .text = "\u{230B}", .ladder = floor_right },
+        .{ .cp = 0x2308, .text = "\u{2308}", .ladder = ceil_left },
+        .{ .cp = 0x2309, .text = "\u{2309}", .ladder = ceil_right },
+        .{ .cp = 0x27E8, .text = "\u{27E8}", .ladder = angle_left },
+        .{ .cp = 0x27E9, .text = "\u{27E9}", .ladder = angle_right },
+        .{ .cp = 0x002F, .text = "/", .ladder = slash },
+    };
+    for (fences) |fence| {
+        for (fence.ladder, 0..) |gid, rung| {
+            var t = item(fence.text, .italic);
+            t.delim_form = @intCast(rung + 1);
+            try testing.expectEqual(gid, resolveGlyph(face, fence.cp, &t).?);
+        }
+    }
+
+    // amsmath's FIXED rule: the rung whose ladder ink covers req_em, with
+    // 2.392em (\binom at display) landing on parenleft.v6.
+    const fixed = [_]struct { req_em: f32, gid: u32 }{
+        .{ .req_em = 0.5, .gid = 2367 },
+        .{ .req_em = 0.9, .gid = 2389 },
+        .{ .req_em = 1.2, .gid = 2411 },
+        .{ .req_em = 1.5, .gid = 2433 },
+        .{ .req_em = 1.9, .gid = 2455 },
+        .{ .req_em = 2.392, .gid = 2477 },
+        .{ .req_em = 2.8, .gid = 2499 },
+    };
+    for (fixed) |f| {
+        var t = item("(", .italic);
+        t.delim_fixed = f.req_em;
+        try testing.expectEqual(f.gid, resolveGlyph(face, '(', &t).?);
+    }
+}
+
+// U+2A11 ∬ was pinned to U+222E ∮'s .v1, so every double contour integral
+// rasterized as a single one. Its own ladder starts at 3071.
+test "resolveGlyph: a display \\iint draws contourint2.v1, not \\oint's variant" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    const face = ctx.fonts.faceForStyle(.italic);
+
+    var oint = item("\u{222E}", .italic);
+    oint.bigop_form = .variant;
+    var iint = item("\u{2A11}", .italic);
+    iint.bigop_form = .variant;
+
+    const oint_gid = try expectResolved(u32, "U+222E .v1", resolveGlyph(face, 0x222E, &oint));
+    const iint_gid = try expectResolved(u32, "U+2A11 .v1", resolveGlyph(face, 0x2A11, &iint));
+    try testing.expectEqual(@as(u32, 3067), oint_gid);
+    try testing.expectEqual(@as(u32, 3071), iint_gid);
+    try testing.expect(iint_gid != oint_gid);
+    // Read back from the table, not from a constant: 3071 IS contourint2.v1.
+    const base = try expectResolved(u32, "U+2A11 base glyph", face.glyphIndex(0x2A11));
+    const ladder = try expectResolved(font.MathVariants, "U+2A11 ladder", face.variants(base));
+    try testing.expectEqual(@as(usize, 1), ladder.len());
+    try testing.expectEqual(iint_gid, ladder.glyph(0));
+}
+
+// The bug reached the pixels, not just the glyph id: with U+2A11 pinned to
+// U+222E's variant, a display ∬ and a display ∮ produced the SAME bitmap.
+test "rasterize: a display \\iint and \\oint no longer rasterize identically" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+
+    var oint = item("\u{222E}", .italic);
+    oint.bigop_form = .variant;
+    var iint = item("\u{2A11}", .italic);
+    iint.bigop_form = .variant;
+    const iint_base = item("\u{2A11}", .italic);
+
+    var oint_buffer = try rasterOne(testing.allocator, &ctx, oint);
+    defer oint_buffer.deinit();
+    var iint_buffer = try rasterOne(testing.allocator, &ctx, iint);
+    defer iint_buffer.deinit();
+    var base_buffer = try rasterOne(testing.allocator, &ctx, iint_base);
+    defer base_buffer.deinit();
+
+    try testing.expect(inkedPixels(oint_buffer) > 0);
+    try testing.expect(inkedPixels(iint_buffer) > 0);
+    // The bug: ∬ was pinned to ∮'s variant, so the two drew the same pixels.
+    try testing.expect(!std.mem.eql(u8, iint_buffer.pixels, oint_buffer.pixels));
+    // And the variant rung is what reaches the pixels — ∬ at base size is a
+    // different drawing again, so the ladder is genuinely consulted.
+    try testing.expect(!std.mem.eql(u8, iint_buffer.pixels, base_buffer.pixels));
+}
+
+// A fence must grow along its variant ladder, not by scaling the base
+// glyph: every rung paints a different bitmap, each taller than the last,
+// and the tallest matches the ladder's own 2.991em advance at 20pt.
+test "rasterize: a fence grows through the variant ladder, rung by rung" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    const face = ctx.fonts.faceForStyle(.italic);
+    const paren = try expectResolved(u32, "'(' base glyph", face.glyphIndex('('));
+    const ladder = try expectResolved(font.MathVariants, "'(' ladder", face.variants(paren));
+    try testing.expectEqual(@as(usize, 7), ladder.len());
+
+    var previous: ?PixelBuffer = null;
+    defer if (previous) |*p| p.deinit();
+    var previous_rows: usize = 0;
+
+    for (0..7) |rung| {
+        var t = item("(", .italic);
+        t.delim_form = @intCast(rung + 1);
+        const buffer = try rasterOne(testing.allocator, &ctx, t);
+        const rows = inkedRows(buffer);
+        // The rung must be visibly taller, and match the AdvanceMeasurement
+        // the table reports for it (1px per pt at 20pt).
+        try testing.expect(rows > previous_rows);
+        try testing.expectApproxEqAbs(
+            ladder.advanceEm(rung) * 20.0,
+            @as(f32, @floatFromInt(rows)),
+            2.0,
+        );
+        if (previous) |before| {
+            // Same frame, same pen position: a differing bitmap means a
+            // DIFFERENT glyph, not the same one nudged.
+            try testing.expectEqual(buffer.pixels.len, before.pixels.len);
+            try testing.expect(!std.mem.eql(u8, buffer.pixels, before.pixels));
+        }
+        if (previous) |*before| before.deinit();
+        previous = buffer;
+        previous_rows = rows;
+    }
+}
+
+// A face with no MATH table must degrade, never fail: the fence still
+// renders as its base cmap glyph, and a codepoint the face cannot map at
+// all is skipped instead of borrowing a glyph id from another font.
+test "resolveGlyph: a face with no MATH table degrades to the base glyph" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    const face = ctx.fonts.faceForStyle(.roman);
+    // Precondition: the Roman face really carries no MATH data.
+    try testing.expect(face.mathConstants() == null);
+
+    var stretched = item("(", .roman);
+    stretched.delim_form = 6;
+    const plain = item("(", .roman);
+    try testing.expectEqual(
+        face.glyphIndex('(').?,
+        resolveGlyph(face, '(', &stretched).?,
+    );
+
+    var stretched_buffer = try rasterOne(testing.allocator, &ctx, stretched);
+    defer stretched_buffer.deinit();
+    var plain_buffer = try rasterOne(testing.allocator, &ctx, plain);
+    defer plain_buffer.deinit();
+    // Degradation, not disappearance: byte-identical to the unstretched glyph.
+    try testing.expect(std.mem.eql(u8, stretched_buffer.pixels, plain_buffer.pixels));
+    try testing.expect(inkedPixels(stretched_buffer) > 0);
+
+    // ∑ is absent from the Roman face, so there is nothing to degrade TO.
+    var op = item("\u{2211}", .roman);
+    op.bigop_form = .variant;
+    try testing.expect(resolveGlyph(face, 0x2211, &op) == null);
+    var empty_buffer = try rasterOne(testing.allocator, &ctx, op);
+    defer empty_buffer.deinit();
+    try testing.expectEqual(@as(usize, 0), inkedPixels(empty_buffer));
+}
+
+/// U+221A √ — the glyph an OpenType MATH table keys the radical's vertical
+/// size variants and its glyph assembly under. layout.zig boxes the ASSEMBLY
+/// pieces under the placeholder codepoints U+F300 (top), U+F301 (extender)
+/// and U+23B7 (bottom); the private-use pair is in no cmap, so those pieces
+/// resolve through this anchor instead of through the codepoint on the draw
+/// item.
+const radical_cp: u21 = 0x221A;
+
+/// Which piece of the radical's MATH glyph assembly layout.zig is asking for.
+/// Values below `radical_form_top` select a pre-built vertical size variant.
+const radical_form_top: u8 = 5;
+const radical_form_extender: u8 = 6;
+const radical_form_bottom: u8 = 7;
+
+/// The glyph at the 1-based MATH size-variant position `variant_index` of
+/// `cp`'s ladder. Null when the face carries no MATH table, the codepoint has
+/// no glyph, or the ladder is shorter than the requested rung — the caller
+/// degrades rather than inventing an id. `variants` excludes the base glyph,
+/// hence the -1. Allocation free: the ladder is a view over the face's bytes.
+fn mathVariantGlyph(
+    face: *const font.FontFace,
+    cp: u21,
+    variant_index: u8,
+) ?u32 {
+    if (variant_index == 0) return null;
+    const base_gid = face.glyphIndex(cp) orelse return null;
+    const ladder = face.variants(base_gid) orelse return null;
+    const rung: usize = @as(usize, variant_index) - 1;
+    if (rung >= ladder.len()) return null;
+    return ladder.glyph(rung);
+}
+
+/// One piece of the radical's MATH glyph assembly: the top piece, the
+/// extender, or the bottom piece. Null when the face has no MATH table, no √
+/// glyph, no assembly, or an empty one.
+fn radicalAssemblyGlyph(face: *const font.FontFace, piece: u8) ?u32 {
+    const base_gid = face.glyphIndex(radical_cp) orelse return null;
+    const stack = face.assembly(base_gid) orelse return null;
+    if (stack.partCount() == 0) return null;
+    // Parts run bottom to top, so the top piece is the last part.
+    if (piece == radical_form_top) return stack.part(stack.partCount() - 1).glyph;
+    if (piece == radical_form_bottom) return stack.part(0).glyph;
+    if (piece != radical_form_extender) return null;
+    // A construction may list several extender glyphs; the last one is the
+    // piece the top part stacks onto, so that is the one to repeat.
+    var i: usize = stack.partCount();
+    while (i > 0) {
+        i -= 1;
+        if (stack.part(i).extender) return stack.part(i).glyph;
+    }
+    return null;
+}
+
+/// The amsmath FIXED-rule variant position (1-based) for a delimiter boxed at
+/// `req_em` ink: the smallest rung of metrics.delim_ladder whose ascent plus
+/// descent covers the request.
+fn fixedDelimForm(req_em: f32) u8 {
+    if (req_em >= 2.8) return 7;
+    if (req_em >= 2.3) return 6;
+    if (req_em >= 1.9) return 5;
+    if (req_em >= 1.5) return 4;
+    if (req_em >= 1.2) return 3;
+    if (req_em >= 0.9) return 2;
+    return 1;
+}
+
+/// The glyph a draw item paints: the MATH size variant for a stretchy item
+/// (display big operator, √, fence), else the base cmap glyph. Null when the
+/// codepoint has no glyph at all — the caller then draws nothing.
+///
+/// Degrading to the base glyph is deliberate. A face without a MATH table (any
+/// LM Roman face, any user-supplied font) then paints an unstretched but
+/// legible fence, and a ladder too short for the request paints the base glyph
+/// too. Failing the draw instead would discard every other formula on the page
+/// because one font lacks a table, and the raster API has no per-glyph error
+/// channel to report a soft failure through. Nothing here panics and nothing
+/// invents a glyph id: an unresolved stretchy item is never drawn from a
+/// foreign font's numbering.
+fn resolveGlyph(face: *const font.FontFace, cp: u21, t: *const draw.Text) ?u32 {
+    if (t.bigop_form == .variant) {
+        if (mathVariantGlyph(face, cp, 1)) |g| return g;
+    }
+    if (t.radical_form > 0) {
+        // Rungs above the ladder (form 5..7) fall through to the assembly;
+        // anything past `radical_form_bottom` is rejected by both.
+        const piece = mathVariantGlyph(face, radical_cp, t.radical_form) orelse
+            radicalAssemblyGlyph(face, t.radical_form);
+        if (piece) |g| return g;
+    }
+    if (t.delim_form > 0 or t.delim_fixed > 0) {
+        const variant_index = if (t.delim_form > 0)
+            t.delim_form
+        else
+            fixedDelimForm(t.delim_fixed);
+        if (mathVariantGlyph(face, cp, variant_index)) |g| return g;
+    }
+    return face.glyphIndex(cp);
 }
 
 fn drawGlyph(
@@ -342,113 +739,10 @@ fn drawGlyph(
 
     const face = ctx.fonts.faceForStyle(t.style);
 
-    // Resolve OpenType MATH variants for big operators, radicals, and delimiters
-    const gid = blk: {
-        if (t.bigop_form == .variant) {
-            if (cp == 0x2211) break :blk @as(u32, 3074); // summation.v1
-            if (cp == 0x220F) break :blk @as(u32, 3075); // product.v1
-            if (cp == 0x222B) break :blk @as(u32, 3063); // integral.v1
-            if (cp == 0x222E or cp == 0x2A11) break :blk @as(u32, 3067); // contourintegral.v1
-        }
-        if (t.radical_form > 0) {
-            switch (t.radical_form) {
-                1 => break :blk @as(u32, 3081), // radical.v1
-                2 => break :blk @as(u32, 3082), // radical.v2
-                3 => break :blk @as(u32, 3083), // radical.v3
-                4 => break :blk @as(u32, 3084), // radical.v4
-                5 => break :blk @as(u32, 3080), // radical.tp
-                6 => break :blk @as(u32, 3079), // radical.ex
-                else => {},
-            }
-        }
-        if (t.delim_form > 0 or t.delim_fixed > 0) {
-            const vi = if (t.delim_form > 0) t.delim_form else blk_fix: {
-                if (t.delim_fixed >= 2.8) break :blk_fix @as(u8, 7);
-                if (t.delim_fixed >= 2.3) break :blk_fix @as(u8, 6);
-                if (t.delim_fixed >= 1.9) break :blk_fix @as(u8, 5);
-                if (t.delim_fixed >= 1.5) break :blk_fix @as(u8, 4);
-                if (t.delim_fixed >= 1.2) break :blk_fix @as(u8, 3);
-                if (t.delim_fixed >= 0.9) break :blk_fix @as(u8, 2);
-                break :blk_fix @as(u8, 1);
-            };
-            if (cp == '(') {
-                switch (vi) {
-                    1 => break :blk @as(u32, 2367), // parenleft.v1
-                    2 => break :blk @as(u32, 2389), // parenleft.v2
-                    3 => break :blk @as(u32, 2411), // parenleft.v3
-                    4 => break :blk @as(u32, 2433), // parenleft.v4
-                    5 => break :blk @as(u32, 2455), // parenleft.v5
-                    6 => break :blk @as(u32, 2477), // parenleft.v6
-                    else => break :blk @as(u32, 2499), // parenleft.v7
-                }
-            } else if (cp == ')') {
-                switch (vi) {
-                    1 => break :blk @as(u32, 2368), // parenright.v1
-                    2 => break :blk @as(u32, 2390), // parenright.v2
-                    3 => break :blk @as(u32, 2412), // parenright.v3
-                    4 => break :blk @as(u32, 2434), // parenright.v4
-                    5 => break :blk @as(u32, 2456), // parenright.v5
-                    6 => break :blk @as(u32, 2478), // parenright.v6
-                    else => break :blk @as(u32, 2500), // parenright.v7
-                }
-            } else if (cp == '[') {
-                switch (vi) {
-                    1 => break :blk @as(u32, 2373), // bracketleft.v1
-                    2 => break :blk @as(u32, 2395), // bracketleft.v2
-                    3 => break :blk @as(u32, 2417), // bracketleft.v3
-                    4 => break :blk @as(u32, 2439), // bracketleft.v4
-                    5 => break :blk @as(u32, 2461), // bracketleft.v5
-                    6 => break :blk @as(u32, 2483), // bracketleft.v6
-                    else => break :blk @as(u32, 2525), // bracketleft.v7
-                }
-            } else if (cp == ']') {
-                switch (vi) {
-                    1 => break :blk @as(u32, 2374), // bracketright.v1
-                    2 => break :blk @as(u32, 2396), // bracketright.v2
-                    3 => break :blk @as(u32, 2418), // bracketright.v3
-                    4 => break :blk @as(u32, 2440), // bracketright.v4
-                    5 => break :blk @as(u32, 2462), // bracketright.v5
-                    6 => break :blk @as(u32, 2484), // bracketright.v6
-                    else => break :blk @as(u32, 2526), // bracketright.v7
-                }
-            } else if (cp == '{') {
-                switch (vi) {
-                    1 => break :blk @as(u32, 2371), // braceleft.v1
-                    2 => break :blk @as(u32, 2393), // braceleft.v2
-                    3 => break :blk @as(u32, 2415), // braceleft.v3
-                    4 => break :blk @as(u32, 2437), // braceleft.v4
-                    5 => break :blk @as(u32, 2459), // braceleft.v5
-                    6 => break :blk @as(u32, 2481), // braceleft.v6
-                    else => break :blk @as(u32, 2515), // braceleft.v7
-                }
-            } else if (cp == '}') {
-                switch (vi) {
-                    1 => break :blk @as(u32, 2372), // braceright.v1
-                    2 => break :blk @as(u32, 2394), // braceright.v2
-                    3 => break :blk @as(u32, 2416), // braceright.v3
-                    4 => break :blk @as(u32, 2438), // braceright.v4
-                    5 => break :blk @as(u32, 2460), // braceright.v5
-                    6 => break :blk @as(u32, 2482), // braceright.v6
-                    else => break :blk @as(u32, 2516), // braceright.v7
-                }
-            } else if (cp == '|' or cp == 0x2223) {
-                switch (vi) {
-                    1 => break :blk @as(u32, 2677), // divides.v1
-                    2 => break :blk @as(u32, 2684), // divides.v2
-                    3 => break :blk @as(u32, 2691), // divides.v3
-                    else => break :blk @as(u32, 2698), // divides.v4
-                }
-            } else if (cp == 0x2225) {
-                switch (vi) {
-                    1 => break :blk @as(u32, 2678), // parallel.v1
-                    2 => break :blk @as(u32, 2685), // parallel.v2
-                    3 => break :blk @as(u32, 2692), // parallel.v3
-                    else => break :blk @as(u32, 2699), // parallel.v4
-                }
-            }
-        }
-        break :blk face.glyphIndex(cp) orelse return;
-    };
+    // Stretchy glyphs resolve through the face's own MATH table (see
+    // `resolveGlyph`): a glyph id is font-specific, so baking one in draws
+    // the wrong shape on every font but Latin Modern.
+    const gid = resolveGlyph(face, cp, &t) orelse return;
     var outline = try face.glyphOutline(gpa, gid);
     defer outline.deinit();
     if (outline.curves.items.len == 0) return;

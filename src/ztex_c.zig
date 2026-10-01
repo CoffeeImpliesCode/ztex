@@ -1,0 +1,1103 @@
+//! ztex_c — the C ABI over the ztex render pipeline.
+//!
+//! Everything here is an adapter, not a second implementation: the
+//! parse → layout → svg/raster work belongs to `ztex.Context`,
+//! `ztex.svg.render` and `ztex.raster.rasterize` (reached through
+//! `Context.renderPixels`). What this module owns is the C-shaped contract:
+//!
+//! - No Zig error union crosses the boundary. Every entry point returns
+//!   `c_int` — a `Status` — and the text of the last failure on a context
+//!   is readable with `ztex_last_error`.
+//! - Nothing is handed to C as a heap pointer. Rendered output is copied
+//!   into the caller's buffer, and the only heap the library holds is the
+//!   render context, taken from the CALLER's allocator and released by
+//!   `ztex_context_destroy` through that same allocator.
+//! - Strings cross as NUL-terminated UTF-8; the LaTeX source also carries
+//!   an explicit byte length, and that length is what the pipeline renders
+//!   (`strlen` is never called on the source).
+//!
+//! Lengths and capacities are 32-bit so include/ztex.h needs no
+//! <stdint.h> (C89 has none) and the ABI is identical on every target; a
+//! render needing more than 4 GiB fails with `.output_too_large` instead
+//! of truncating.
+
+const std = @import("std");
+const ztex = @import("ztex");
+
+const Style = ztex.layout.Style;
+const Color = ztex.draw.Color;
+const Format = ztex.raster.Format;
+
+/// Failure codes returned by every entry point: C-shaped, an integer rather
+/// than an error union. `ztex_status_name` names one.
+pub const Status = enum(c_int) {
+    ok = 0,
+    /// A null handle/buffer/out-parameter, an unknown style or pixel-format
+    /// code, or a size that is not a positive finite number.
+    invalid_argument = 1,
+    /// The LaTeX front end rejected the formula; `ztex_last_error` names the
+    /// kind and the position.
+    parse_error = 2,
+    /// The layout stage rejected the atom tree.
+    invalid_ast = 3,
+    out_of_memory = 4,
+    /// A draw-list coordinate was not finite, so no SVG can be written.
+    non_finite_coordinate = 5,
+    /// The caller's buffer cannot hold the whole payload. Nothing was
+    /// written and the out-parameter carries the size needed.
+    buffer_too_small = 6,
+    /// The output does not fit the 32-bit length ABI.
+    output_too_large = 7,
+    /// A font could not be read while rasterizing a glyph outline.
+    font_error = 8,
+};
+
+/// "No background": a zero alpha in the packed `0xRRGGBBAA` colors below.
+/// Zero, so an all-zero options struct is the default rendering.
+pub const color_none: u32 = 0;
+
+/// Largest payload the 32-bit length ABI can describe: a caller's buffer
+/// needs one byte more than this for the NUL the library appends.
+const max_payload: usize = std.math.maxInt(u32) - 1;
+
+/// Bytes of failure text a context keeps. The error path never allocates,
+/// so the text is bounded here and `ztex_last_error` truncates whatever
+/// does not fit in the caller's buffer.
+const err_text_max = 256;
+
+/// The caller's allocator, copied into the context by
+/// `ztex_context_create`: the struct itself may be a temporary, but `alloc`,
+/// `dealloc` and `user` must stay valid until `ztex_context_destroy`.
+///
+/// `alloc` returns memory aligned for `max_align_t` (16 bytes on every
+/// target ztex builds for) or NULL when it cannot; `dealloc` receives the
+/// exact `len` its matching `alloc` call was given. Growth inside the
+/// library is allocate + copy + free, so an arena works and a
+/// size-tracking free list stays exact.
+pub const CAllocator = extern struct {
+    alloc: ?*const fn (user: ?*anyopaque, len: u32) callconv(.c) ?*anyopaque,
+    dealloc: ?*const fn (user: ?*anyopaque, ptr: ?*anyopaque, len: u32) callconv(.c) void,
+    user: ?*anyopaque,
+};
+
+/// SVG rendering knobs. An all-zero struct is the default rendering: no
+/// padding, no background rectangle, the built-in font stacks.
+pub const SvgOptions = extern struct {
+    /// Empty margin on every side, in points.
+    padding: f32 = 0,
+    /// Background fill as `0xRRGGBBAA`; `color_none` emits no rectangle.
+    background: u32 = color_none,
+    /// CSS font stack for math (italic) runs, or null for the built-in one.
+    math_font_family: ?[*:0]const u8 = null,
+    /// CSS font stack for upright (\text, \mathrm, \mathbf) runs, or null
+    /// for the built-in one.
+    upright_font_family: ?[*:0]const u8 = null,
+};
+
+/// Raster rendering knobs. Every field is the caller's to set: a NULL
+/// `ztex_raster_options` means the defaults below, but a ZEROED struct is
+/// an error (`dpi` 0 is not a resolution) and says so.
+pub const RasterOptions = extern struct {
+    /// Output resolution in dots per inch; must be finite and > 0.
+    dpi: f32 = 96,
+    /// Uniform scale applied on top of `dpi`; must be finite and > 0.
+    scale: f32 = 1,
+    /// Transparent margin around the content, in pixels.
+    padding: u32 = 0,
+    /// 0 = 32-bit RGBA (R, G, B, A byte order), 1 = 8-bit alpha mask.
+    format: u32 = 0,
+    /// Ink color as `0xRRGGBBAA` — alpha LAST, so opaque black is
+    /// `0x000000ff` and `0xff000000` is a transparent red. Unused by the
+    /// alpha mask. This default must stay the rasterizer's own
+    /// (`ztex.raster.Options{}`), or every render that leaves `fg` unset
+    /// paints nothing at all.
+    fg: u32 = 0x000000ff,
+    /// Background as `0xRRGGBBAA`, or `color_none` for a transparent
+    /// buffer.
+    bg: u32 = color_none,
+};
+
+/// The render context: what `ztex_context_create` hands back. Opaque to C.
+const Context = struct {
+    /// The pipeline. Owns the embedded Latin Modern faces and the glyph
+    /// metric cache; every byte it takes comes from `callbacks`.
+    inner: ztex.Context,
+    callbacks: Callbacks,
+    /// Failure text of the last call on this context, NUL-terminated at
+    /// `err_len`. Bounded, so recording a failure never allocates.
+    err_text: [err_text_max]u8,
+    err_len: usize,
+
+    fn gpa(self: *Context) std.mem.Allocator {
+        return self.callbacks.allocator();
+    }
+
+    /// Record `msg` as this context's failure text and return `st`. The text
+    /// is truncated to the fixed buffer rather than allocated.
+    fn fail(self: *Context, st: Status, msg: []const u8) Status {
+        const n = @min(msg.len, self.err_text.len - 1);
+        @memcpy(self.err_text[0..n], msg[0..n]);
+        self.err_text[n] = 0;
+        self.err_len = n;
+        return st;
+    }
+
+    /// `fail` with a formatted message. The exact length is measured first,
+    /// so `bufPrint` writes `n` bytes plus its NUL at index `n <= len - 1`
+    /// and cannot overflow.
+    fn failFmt(self: *Context, st: Status, comptime fmt: []const u8, args: anytype) Status {
+        var buf: [err_text_max]u8 = undefined;
+        const n = @min(std.fmt.count(fmt, args), buf.len - 1);
+        const msg = std.fmt.bufPrint(buf[0..n], fmt, args) catch unreachable;
+        return self.fail(st, msg);
+    }
+
+    /// Forget the previous failure: every entry point clears it before it
+    /// works, so a stale message can never be read back after a success.
+    fn clearFailure(self: *Context) void {
+        self.err_text[0] = 0;
+        self.err_len = 0;
+    }
+
+    /// Copy `bytes` and a NUL into the caller's buffer. A buffer that cannot
+    /// hold the whole payload is left UNTOUCHED and reports the size it
+    /// needs, so a caller can never mistake a partial render for a whole
+    /// one.
+    fn emit(self: *Context, bytes: []const u8, out: ?[*]u8, capacity: u32, out_len: *u32) Status {
+        if (bytes.len > max_payload) return self.fail(
+            .output_too_large,
+            "the rendered output does not fit the 32-bit length ABI",
+        );
+        const need: u32 = @intCast(bytes.len);
+        out_len.* = need;
+        const buf = out orelse return self.fail(
+            .buffer_too_small,
+            "no output buffer; the size needed was reported in out_length",
+        );
+        if (capacity < need + 1) return self.failFmt(
+            .buffer_too_small,
+            "the output is {d} bytes; the buffer needs {d}",
+            .{ need, need + 1 },
+        );
+        @memcpy(buf[0..need], bytes);
+        buf[need] = 0;
+        return .ok;
+    }
+
+    /// Record a pipeline failure and map it to a status. The parse errors
+    /// are the ones that filled `info`, so they name the kind, the error and
+    /// the position; the rest name themselves.
+    fn renderFailed(
+        self: *Context,
+        e: PipelineError,
+        info: ztex.parse.Info,
+        src: []const u8,
+    ) Status {
+        return switch (e) {
+            error.OutOfMemory => self.fail(.out_of_memory, "out of memory"),
+            error.InvalidAst => self.fail(.invalid_ast, "the layout stage rejected the atom tree"),
+            error.NonFiniteCoordinate => self.fail(
+                .non_finite_coordinate,
+                "a draw-list coordinate is not finite; no SVG can be written",
+            ),
+            error.InvalidSfnt,
+            error.MissingTable,
+            error.InvalidTable,
+            error.UnsupportedCmap,
+            error.UnsupportedFont,
+            => self.failFmt(.font_error, "a font could not be read: {s}", .{@errorName(e)}),
+            // Everything the arms above do not name is a front-end error,
+            // whose `info` the lexer/parser filled just before returning.
+            else => blk: {
+                const lc = ztex.parse.err.lineCol(src, info.span.start);
+                break :blk self.failFmt(
+                    .parse_error,
+                    "parse error: {s} ({s}) at line {d}, col {d}",
+                    .{ info.message(), @errorName(e), lc.line, lc.col },
+                );
+            },
+        };
+    }
+};
+
+/// Every failure the pipeline can report across this boundary. The font
+/// members come from the rasterizer's glyph-outline path; the C face gives
+/// all of them one status, so a font the library cannot read is a
+/// reportable outcome instead of a crash.
+const PipelineError = ztex.parse.Error || ztex.font.FontError || error{
+    InvalidAst,
+    NonFiniteCoordinate,
+    OutOfMemory,
+};
+
+/// The allocator callbacks as the context stores them — inside the context,
+/// so the `std.mem.Allocator` handed to the pipeline keeps a stable `ptr`.
+/// They keep the C convention all the way in: Zig's own `.auto` convention
+/// is not the C one, and a call crossing between the two passes its
+/// arguments in the wrong registers.
+const Callbacks = struct {
+    alloc_fn: *const fn (user: ?*anyopaque, len: u32) callconv(.c) ?*anyopaque,
+    dealloc_fn: *const fn (user: ?*anyopaque, ptr: ?*anyopaque, len: u32) callconv(.c) void,
+    user: ?*anyopaque,
+
+    fn allocator(self: *Callbacks) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+const vtable: std.mem.Allocator.VTable = .{
+    .alloc = cbAlloc,
+    // The C contract has no realloc, and declining both hooks is a
+    // supported allocator behaviour: the caller grows by allocating,
+    // copying and freeing.
+    .resize = std.mem.Allocator.noResize,
+    .remap = std.mem.Allocator.noRemap,
+    .free = cbFree,
+};
+
+fn cbAlloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+    _ = ra;
+    const self: *Callbacks = @ptrCast(@alignCast(ptr));
+    const len32 = std.math.cast(u32, len) orelse return null;
+    const p = self.alloc_fn(self.user, len32) orelse return null;
+    // The contract promises max_align_t, which covers every fundamental
+    // alignment std asks for here. Refuse — as an ordinary allocation
+    // failure, so a render just reports out-of-memory — rather than hand
+    // back under-aligned memory if that ever stops holding.
+    if (!alignment.check(@intFromPtr(p))) {
+        self.dealloc_fn(self.user, p, len32);
+        return null;
+    }
+    return @ptrCast(p);
+}
+
+fn cbFree(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+    _ = alignment;
+    _ = ra;
+    const self: *Callbacks = @ptrCast(@alignCast(ptr));
+    const len = std.math.cast(u32, memory.len) orelse return;
+    self.dealloc_fn(self.user, memory.ptr, len);
+}
+
+comptime {
+    // The allocator contract above is malloc-class alignment.
+    if (@alignOf(Context) > 16) @compileError("a render context must be 16-byte aligned");
+}
+
+/// The arguments both render entry points take, once validated.
+const Args = struct {
+    src: []const u8,
+    style: Style,
+    size_pt: f32,
+};
+
+/// Validate the arguments every render shares into `args`, answering the
+/// status to report: nothing is parsed or laid out from a request the C
+/// caller got wrong.
+fn readArgs(
+    self: *Context,
+    args: *Args,
+    latex: ?[*:0]const u8,
+    latex_length: u32,
+    style: c_int,
+    size_pt: f32,
+) Status {
+    const math = std.enums.fromInt(Style, style) orelse
+        return self.fail(.invalid_argument, "unknown math style code");
+    if (!std.math.isFinite(size_pt) or size_pt <= 0)
+        return self.fail(.invalid_argument, "size_pt must be a positive finite number");
+    if (latex == null and latex_length != 0)
+        return self.fail(.invalid_argument, "latex is NULL but latex_length is not 0");
+    args.* = .{
+        .src = if (latex) |p| p[0..latex_length] else "",
+        .style = math,
+        .size_pt = size_pt,
+    };
+    return .ok;
+}
+
+/// Map the C options struct onto the SVG serializer's, resolving the two
+/// font stacks (null keeps the serializer's own default) and packing the
+/// background color.
+fn svgOptions(options: ?*const SvgOptions) ztex.svg.Options {
+    const o = options orelse return .{};
+    return .{
+        .padding = o.padding,
+        .background = if (o.background == color_none) null else unpackColor(o.background),
+        .font_family = family(o.math_font_family),
+        .text_font_family = family(o.upright_font_family),
+    };
+}
+
+/// Map the C options struct onto the rasterizer's, or null when the pixel
+/// format code is not one this build knows.
+fn rasterOptions(options: ?*const RasterOptions) ?ztex.raster.Options {
+    const o = options orelse return ztex.raster.Options{};
+    return .{
+        .dpi = o.dpi,
+        .scale = o.scale,
+        .padding = o.padding,
+        .format = std.enums.fromInt(Format, o.format) orelse return null,
+        .fg = unpackColor(o.fg),
+        .bg = if (o.bg == color_none) null else unpackColor(o.bg),
+    };
+}
+
+/// NUL-terminated C string → slice; null keeps the serializer's default
+/// font stack.
+fn family(text: ?[*:0]const u8) []const u8 {
+    const defaults = ztex.svg.Options{};
+    const p = text orelse return defaults.font_family;
+    return std.mem.span(p);
+}
+
+/// `0xRRGGBBAA` → the pipeline's channel struct.
+fn unpackColor(bits: u32) Color {
+    return .{
+        .r = @truncate(bits >> 24),
+        .g = @truncate(bits >> 16),
+        .b = @truncate(bits >> 8),
+        .a = @truncate(bits),
+    };
+}
+
+// ── the C surface ────────────────────────────────
+//
+// The names below are published C ABI symbols, not Zig identifiers:
+// snake_case is the C convention, include/ztex.h declares exactly these
+// spellings, and every C host that links this library already depends on
+// them, so renaming them would break the contract for no gain. The rule is
+// waived for the exported surface alone; the internal helpers above stay
+// under it and keep their camelCase names.
+// zwanzig-disable: identifier-style
+
+/// Create a render context and write it to `out_context`, which the caller
+/// then owns until `ztex_context_destroy`. The context block comes from
+/// `allocator`, and so does every byte the pipeline takes after it;
+/// `ztex_context_destroy` gives all of them back through the same
+/// `dealloc`. On failure `out_context` is left untouched.
+export fn ztex_context_create(
+    allocator: ?*const CAllocator,
+    out_context: ?*?*Context,
+) c_int {
+    const desc = allocator orelse return @intFromEnum(Status.invalid_argument);
+    const out = out_context orelse return @intFromEnum(Status.invalid_argument);
+    const alloc_fn = desc.alloc orelse return @intFromEnum(Status.invalid_argument);
+    const dealloc_fn = desc.dealloc orelse return @intFromEnum(Status.invalid_argument);
+    const block: u32 = @intCast(@sizeOf(Context));
+    const raw = alloc_fn(desc.user, block) orelse return @intFromEnum(Status.out_of_memory);
+    const self: *Context = @ptrCast(@alignCast(raw));
+    // Written before the first allocation through the context, so the
+    // allocator the pipeline receives points into storage that outlives it.
+    self.callbacks = .{ .alloc_fn = alloc_fn, .dealloc_fn = dealloc_fn, .user = desc.user };
+    self.clearFailure();
+    self.inner = ztex.Context.init(self.gpa()) catch {
+        dealloc_fn(desc.user, raw, block);
+        return @intFromEnum(Status.out_of_memory);
+    };
+    out.* = self;
+    return @intFromEnum(Status.ok);
+}
+
+/// Destroy a context: the pipeline's embedded Latin Modern faces, its glyph
+/// metric cache and the context block itself all go back to the `dealloc`
+/// the context was created with. A NULL context is a no-op; passing the
+/// same one twice is undefined, exactly as calling free twice is.
+export fn ztex_context_destroy(context: ?*Context) void {
+    const self = context orelse return;
+    const block: u32 = @intCast(@sizeOf(Context));
+    self.inner.deinit();
+    self.callbacks.dealloc_fn(self.callbacks.user, @ptrCast(self), block);
+}
+
+/// The name of a status code, as a NUL-terminated C string owned by the
+/// library: it lives as long as the process and must never be freed. A code
+/// this build does not know reads "unknown status".
+export fn ztex_status_name(status: c_int) [*:0]const u8 {
+    const st = std.enums.fromInt(Status, status) orelse return "unknown status";
+    return @tagName(st);
+}
+
+/// Render one formula to SVG in the caller's buffer.
+///
+/// `latex` is read during the call only, and nothing is retained: the SVG
+/// is copied into `out`, which the caller owns. `out_length` always gets
+/// the payload size — on `ok` the bytes copied into `out`, on
+/// `buffer_too_small` the size needed — so `out = NULL, out_capacity = 0`
+/// is a size query, and a buffer that cannot hold the whole payload comes
+/// back UNWRITTEN rather than half filled. The payload needs
+/// `out_capacity >= size + 1`: the library always terminates it with a NUL.
+export fn ztex_render_svg(
+    context: ?*Context,
+    latex: ?[*:0]const u8,
+    latex_length: u32,
+    style: c_int,
+    size_pt: f32,
+    options: ?*const SvgOptions,
+    out: ?[*]u8,
+    out_capacity: u32,
+    out_length: ?*u32,
+) c_int {
+    const self = context orelse return @intFromEnum(Status.invalid_argument);
+    const len_out = out_length orelse
+        return @intFromEnum(self.fail(.invalid_argument, "out_length must not be NULL"));
+    self.clearFailure();
+    var args: Args = undefined;
+    const invalid = readArgs(self, &args, latex, latex_length, style, size_pt);
+    if (invalid != .ok) return @intFromEnum(invalid);
+    var info: ztex.parse.Info = undefined;
+    var list = self.inner.render(args.src, args.style, args.size_pt, &info) catch |e|
+        return @intFromEnum(self.renderFailed(e, info, args.src));
+    defer list.deinit();
+    const text = ztex.svg.render(self.gpa(), &list, svgOptions(options)) catch |e|
+        return @intFromEnum(self.renderFailed(e, info, args.src));
+    defer self.gpa().free(text);
+    return @intFromEnum(self.emit(text, out, out_capacity, len_out));
+}
+
+/// Render one formula to a pixel buffer in the caller's buffer. Ownership
+/// and sizing follow `ztex_render_svg` exactly; `out_width`/`out_height`
+/// receive the image size in pixels whenever the render itself succeeded,
+/// including on the `buffer_too_small` a size query returns.
+export fn ztex_render_raster(
+    context: ?*Context,
+    latex: ?[*:0]const u8,
+    latex_length: u32,
+    style: c_int,
+    size_pt: f32,
+    options: ?*const RasterOptions,
+    out: ?[*]u8,
+    out_capacity: u32,
+    out_length: ?*u32,
+    out_width: ?*u32,
+    out_height: ?*u32,
+) c_int {
+    const self = context orelse return @intFromEnum(Status.invalid_argument);
+    const len_out = out_length orelse
+        return @intFromEnum(self.fail(.invalid_argument, "out_length must not be NULL"));
+    const width_out = out_width orelse
+        return @intFromEnum(self.fail(.invalid_argument, "out_width must not be NULL"));
+    const height_out = out_height orelse
+        return @intFromEnum(self.fail(.invalid_argument, "out_height must not be NULL"));
+    self.clearFailure();
+    var args: Args = undefined;
+    const invalid = readArgs(self, &args, latex, latex_length, style, size_pt);
+    if (invalid != .ok) return @intFromEnum(invalid);
+    if (options) |o| {
+        if (!std.math.isFinite(o.dpi) or o.dpi <= 0) return @intFromEnum(
+            self.fail(.invalid_argument, "dpi must be a positive finite number"),
+        );
+        if (!std.math.isFinite(o.scale) or o.scale <= 0) return @intFromEnum(
+            self.fail(.invalid_argument, "scale must be a positive finite number"),
+        );
+    }
+    const raster = rasterOptions(options) orelse return @intFromEnum(
+        self.fail(.invalid_argument, "unknown pixel format code"),
+    );
+    var info: ztex.parse.Info = undefined;
+    var pix = self.inner.renderPixels(args.src, args.style, args.size_pt, raster, &info) catch |e|
+        return @intFromEnum(self.renderFailed(e, info, args.src));
+    defer pix.deinit();
+    width_out.* = pix.width;
+    height_out.* = pix.height;
+    return @intFromEnum(self.emit(pix.pixels, out, out_capacity, len_out));
+}
+
+/// Copy the text of the last failure on `context` into `buffer`, always
+/// NUL-terminating inside `capacity`. Truncation is the caller's choice:
+/// `out_length` always receives the FULL text length, so
+/// `out_length >= capacity` means the tail was cut. A NULL `buffer` or a zero
+/// `capacity` with text to report answers ZTEX_INVALID_ARGUMENT and leaves
+/// that text intact. The text belongs to the context and is overwritten by
+/// the next call on it.
+export fn ztex_last_error(
+    context: ?*const Context,
+    buffer: ?[*]u8,
+    capacity: u32,
+    out_length: ?*u32,
+) c_int {
+    const self = context orelse return @intFromEnum(Status.invalid_argument);
+    const len_out = out_length orelse return @intFromEnum(Status.invalid_argument);
+    len_out.* = @intCast(self.err_len);
+    if (self.err_len == 0) return @intFromEnum(Status.ok);
+    // Argument misuse here is reported without touching the stored text: a
+    // caller that misreads its own error must still be able to read it.
+    const buf = buffer orelse return @intFromEnum(Status.invalid_argument);
+    if (capacity == 0) return @intFromEnum(Status.invalid_argument);
+    const n: usize = @min(self.err_len, capacity - 1);
+    @memcpy(buf[0..n], self.err_text[0..n]);
+    buf[n] = 0;
+    return @intFromEnum(Status.ok);
+}
+
+// zwanzig-enable: identifier-style
+
+// ── tests ────────────────────────────────
+
+const testing = std.testing;
+
+test {
+    testing.refAllDecls(@This());
+}
+
+/// A `ztex_allocator` over `testing.allocator` that counts live bytes, so a
+/// test can prove a context gives every byte back.
+const Counted = struct {
+    state: State,
+
+    const State = struct {
+        gpa: std.mem.Allocator,
+        live: usize,
+
+        /// The state the `user` pointer addresses. `desc()` always passes
+        /// `&self.state`, so an absent pointer means the fixture was wired
+        /// wrong. Name it, answer the C contract (no allocation, no free)
+        /// and let the test fail on its own assertion: unwrapping a NULL
+        /// here would panic without saying which pointer was missing.
+        fn stateOf(user: ?*anyopaque) ?*State {
+            const ptr = user orelse {
+                std.debug.print("c abi test allocator: NULL user pointer\n", .{});
+                return null;
+            };
+            return @ptrCast(@alignCast(ptr));
+        }
+
+        fn alloc(user: ?*anyopaque, len: u32) callconv(.c) ?*anyopaque {
+            const self = stateOf(user) orelse return null;
+            const bytes = self.gpa.alloc(u8, len) catch return null;
+            self.live += bytes.len;
+            return @ptrCast(bytes.ptr);
+        }
+
+        fn dealloc(user: ?*anyopaque, ptr: ?*anyopaque, len: u32) callconv(.c) void {
+            const self = stateOf(user) orelse return;
+            const block = ptr orelse {
+                std.debug.print("c abi test allocator: NULL pointer to free\n", .{});
+                return;
+            };
+            self.gpa.free(@as([*]u8, @ptrCast(block))[0..len]);
+            self.live -= len;
+        }
+    };
+
+    fn init(gpa: std.mem.Allocator) Counted {
+        return .{ .state = .{ .gpa = gpa, .live = 0 } };
+    }
+
+    fn desc(self: *Counted) CAllocator {
+        return .{
+            .alloc = State.alloc,
+            .dealloc = State.dealloc,
+            .user = &self.state,
+        };
+    }
+};
+
+/// A created context over `testing.allocator`. The allocator's `user`
+/// pointer addresses the fixture, so a fixture must stay put once created.
+const Fixture = struct {
+    counted: Counted,
+    handle: ?*Context,
+
+    fn create(self: *Fixture) !void {
+        self.counted = Counted.init(testing.allocator);
+        const desc = self.counted.desc();
+        if (ztex_context_create(&desc, &self.handle) != 0) return error.ContextCreationFailed;
+    }
+
+    fn destroy(self: *Fixture) void {
+        ztex_context_destroy(self.handle);
+    }
+
+    fn ctx(self: *Fixture) ?*Context {
+        return self.handle;
+    }
+
+    /// The failure text of the last call, as a slice of `buf`.
+    fn lastError(self: *Fixture, buf: []u8) ![]const u8 {
+        var len: u32 = 0;
+        try testing.expectEqual(
+            @as(c_int, 0),
+            ztex_last_error(self.handle, buf.ptr, @intCast(buf.len), &len),
+        );
+        return buf[0..len];
+    }
+};
+
+test "c abi: render_svg writes an <svg document into the caller's buffer" {
+    var f: Fixture = undefined;
+    try f.create();
+    defer f.destroy();
+    const src: [:0]const u8 = "\\frac{1}{2}+x^2";
+    var buf: [16 * 1024]u8 = undefined;
+    var len: u32 = 0;
+    const live_before = f.counted.state.live;
+    const status = ztex_render_svg(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        null,
+        &buf,
+        @intCast(buf.len),
+        &len,
+    );
+    try testing.expectEqual(@as(c_int, 0), status);
+    const out = buf[0..len];
+    try testing.expect(std.mem.startsWith(u8, out, "<svg"));
+    try testing.expect(std.mem.endsWith(u8, out, "</svg>\n"));
+    // C callers get a NUL, not just the length.
+    try testing.expectEqual(@as(u8, 0), buf[len]);
+    // The call kept nothing: the context's own footprint is unchanged.
+    try testing.expectEqual(live_before, f.counted.state.live);
+}
+
+test "c abi: render_raster fills the caller's pixel buffer" {
+    var f: Fixture = undefined;
+    try f.create();
+    defer f.destroy();
+    const src: [:0]const u8 = "\\sum_{i=1}^{n} i";
+    const opts: RasterOptions = .{ .dpi = 96 };
+    var len: u32 = 0;
+    var width: u32 = 0;
+    var height: u32 = 0;
+    // A size query: no buffer at all, just the size the caller must provide.
+    try testing.expectEqual(@as(c_int, @intFromEnum(Status.buffer_too_small)), ztex_render_raster(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        &opts,
+        null,
+        0,
+        &len,
+        &width,
+        &height,
+    ));
+    try testing.expect(width > 0 and height > 0);
+    const bytes = try testing.allocator.alloc(u8, len + 1);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqual(@as(c_int, 0), ztex_render_raster(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        &opts,
+        bytes.ptr,
+        len + 1,
+        &len,
+        &width,
+        &height,
+    ));
+    // 4 bytes per pixel for the default RGBA format.
+    try testing.expectEqual(len, @as(u32, @intCast(width)) * height * 4);
+    // Ink on the page, and it is BLACK: the default `fg` is opaque black, so
+    // a pixel the glyph covers is (0, 0, 0, a) with a > 0. A default packed
+    // in the wrong byte order unpacks to a zero alpha and paints nothing.
+    const n: usize = len;
+    var i: usize = 0;
+    var inked: usize = 0;
+    while (i < n) : (i += 4) {
+        if (bytes[i + 3] == 0) continue;
+        inked += 1;
+        try testing.expectEqual([3]u8{ 0, 0, 0 }, bytes[i..][0..3].*);
+    }
+    try testing.expect(inked > 0);
+}
+
+test "c abi: the ink color crosses as 0xRRGGBBAA, alpha last" {
+    var f: Fixture = undefined;
+    try f.create();
+    defer f.destroy();
+    const src: [:0]const u8 = "\\frac{x}{2}";
+    // Every byte differs, and the one that decides visibility is the last,
+    // so no byte order but the documented one reproduces these pixels.
+    const opts: RasterOptions = .{ .dpi = 96, .fg = 0x1a2b3cff };
+    var len: u32 = 0;
+    var width: u32 = 0;
+    var height: u32 = 0;
+    var buf: [64 * 1024]u8 = undefined;
+    try testing.expectEqual(@as(c_int, 0), ztex_render_raster(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        &opts,
+        &buf,
+        @intCast(buf.len),
+        &len,
+        &width,
+        &height,
+    ));
+    try testing.expectEqual(len, @as(u32, @intCast(width)) * height * 4);
+    const n: usize = len;
+    var i: usize = 0;
+    var inked: usize = 0;
+    while (i < n) : (i += 4) {
+        if (buf[i + 3] == 0) continue;
+        inked += 1;
+        // Ink over a transparent buffer is that ink: only the coverage in
+        // the alpha byte varies, never the color.
+        try testing.expectEqual(@as(u8, 0x1a), buf[i]);
+        try testing.expectEqual(@as(u8, 0x2b), buf[i + 1]);
+        try testing.expectEqual(@as(u8, 0x3c), buf[i + 2]);
+    }
+    try testing.expect(inked > 0);
+}
+
+test "c abi: the alpha mask format is one byte per pixel" {
+    var f: Fixture = undefined;
+    try f.create();
+    defer f.destroy();
+    const src: [:0]const u8 = "x";
+    const opts: RasterOptions = .{ .dpi = 72, .format = 1 };
+    var len: u32 = 0;
+    var width: u32 = 0;
+    var height: u32 = 0;
+    const bytes = try testing.allocator.alloc(u8, 4096);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqual(@as(c_int, 0), ztex_render_raster(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        &opts,
+        bytes.ptr,
+        @intCast(bytes.len),
+        &len,
+        &width,
+        &height,
+    ));
+    try testing.expectEqual(len, width * height);
+}
+
+test "c abi: a malformed formula reports the parse failure and names it" {
+    var f: Fixture = undefined;
+    try f.create();
+    defer f.destroy();
+    // The denominator is missing.
+    const src: [:0]const u8 = "\\frac{1}";
+    var buf: [4096]u8 = undefined;
+    var len: u32 = 0;
+    const status = ztex_render_svg(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        null,
+        &buf,
+        @intCast(buf.len),
+        &len,
+    );
+    try testing.expectEqual(@as(c_int, @intFromEnum(Status.parse_error)), status);
+    var msg: [err_text_max]u8 = undefined;
+    const text = try f.lastError(&msg);
+    try testing.expect(std.mem.startsWith(u8, text, "parse error: Missing argument"));
+    try testing.expect(std.mem.indexOf(u8, text, "at line 1, col") != null);
+    try testing.expectEqualStrings("parse_error", std.mem.span(ztex_status_name(status)));
+}
+
+test "c abi: a too-small buffer is refused, never partially filled" {
+    var f: Fixture = undefined;
+    try f.create();
+    defer f.destroy();
+    const src: [:0]const u8 = "x^2+y^2";
+    var small: [8]u8 = @splat(0xaa);
+    var len: u32 = 0;
+    const status = ztex_render_svg(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        null,
+        &small,
+        @intCast(small.len),
+        &len,
+    );
+    try testing.expectEqual(@as(c_int, @intFromEnum(Status.buffer_too_small)), status);
+    // The caller learns the exact size it must provide...
+    try testing.expect(len > small.len);
+    // ...and got no bytes at all, not even a NUL.
+    for (small) |b| try testing.expectEqual(@as(u8, 0xaa), b);
+    const exact = try testing.allocator.alloc(u8, len + 1);
+    defer testing.allocator.free(exact);
+    try testing.expectEqual(@as(c_int, 0), ztex_render_svg(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        null,
+        exact.ptr,
+        len + 1,
+        &len,
+    ));
+    try testing.expect(std.mem.startsWith(u8, exact[0..len], "<svg"));
+}
+
+test "c abi: svg options set the background fill and the font stacks" {
+    var f: Fixture = undefined;
+    try f.create();
+    defer f.destroy();
+    const src: [:0]const u8 = "x+\\text{y}";
+    const opts: SvgOptions = .{
+        .padding = 2,
+        .background = 0xffffffff,
+        .math_font_family = "Test Math",
+        .upright_font_family = "Test Upright",
+    };
+    var buf: [16 * 1024]u8 = undefined;
+    var len: u32 = 0;
+    try testing.expectEqual(@as(c_int, 0), ztex_render_svg(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        &opts,
+        &buf,
+        @intCast(buf.len),
+        &len,
+    ));
+    const out = buf[0..len];
+    try testing.expect(std.mem.indexOf(u8, out, "fill=\"#ffffffff\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "font-family=\"Test Math\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "font-family=\"Test Upright\"") != null);
+}
+
+test "c abi: bad arguments are refused before any rendering" {
+    var f: Fixture = undefined;
+    try f.create();
+    defer f.destroy();
+    const src: [:0]const u8 = "x";
+    var buf: [64]u8 = undefined;
+    var len: u32 = 0;
+    const cap: u32 = @intCast(buf.len);
+    // No context, and no room to report the size.
+    try testing.expectEqual(@as(c_int, @intFromEnum(Status.invalid_argument)), ztex_render_svg(
+        null,
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        null,
+        &buf,
+        cap,
+        &len,
+    ));
+    try testing.expectEqual(@as(c_int, @intFromEnum(Status.invalid_argument)), ztex_render_svg(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        null,
+        &buf,
+        cap,
+        null,
+    ));
+    // An unknown style code, and a size that is not a usable point size.
+    try testing.expectEqual(@as(c_int, @intFromEnum(Status.invalid_argument)), ztex_render_svg(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        99,
+        20,
+        null,
+        &buf,
+        cap,
+        &len,
+    ));
+    try testing.expectEqual(@as(c_int, @intFromEnum(Status.invalid_argument)), ztex_render_svg(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        0,
+        null,
+        &buf,
+        cap,
+        &len,
+    ));
+    // A NULL source is only an empty formula, never a non-empty one.
+    try testing.expectEqual(@as(c_int, @intFromEnum(Status.invalid_argument)), ztex_render_svg(
+        f.ctx(),
+        null,
+        3,
+        @intFromEnum(Style.display),
+        20,
+        null,
+        &buf,
+        cap,
+        &len,
+    ));
+    var msg: [err_text_max]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, try f.lastError(&msg), "latex_length") != null);
+}
+
+test "c abi: raster options are validated, and NULL means the defaults" {
+    var f: Fixture = undefined;
+    try f.create();
+    defer f.destroy();
+    const src: [:0]const u8 = "x";
+    var len: u32 = 0;
+    var width: u32 = 0;
+    var height: u32 = 0;
+    // A C caller who writes `{0}` gets dpi 0, which is not a resolution.
+    const zeroed = std.mem.zeroes(RasterOptions);
+    try testing.expectEqual(@as(c_int, @intFromEnum(Status.invalid_argument)), ztex_render_raster(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        &zeroed,
+        null,
+        0,
+        &len,
+        &width,
+        &height,
+    ));
+    var msg: [err_text_max]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, try f.lastError(&msg), "dpi") != null);
+    // An unknown pixel format is refused rather than silently defaulted.
+    const bad: RasterOptions = .{ .dpi = 96, .format = 7 };
+    try testing.expectEqual(@as(c_int, @intFromEnum(Status.invalid_argument)), ztex_render_raster(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        &bad,
+        null,
+        0,
+        &len,
+        &width,
+        &height,
+    ));
+    // NULL options render at the pipeline's defaults (96 dpi).
+    try testing.expectEqual(@as(c_int, @intFromEnum(Status.buffer_too_small)), ztex_render_raster(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        null,
+        null,
+        0,
+        &len,
+        &width,
+        &height,
+    ));
+    try testing.expect(width > 0 and height > 0);
+}
+
+test "c abi: last_error truncates to the caller's buffer" {
+    var f: Fixture = undefined;
+    try f.create();
+    defer f.destroy();
+    const src: [:0]const u8 = "\\nosuchcommand";
+    var len: u32 = 0;
+    try testing.expectEqual(@as(c_int, @intFromEnum(Status.parse_error)), ztex_render_svg(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        null,
+        null,
+        0,
+        &len,
+    ));
+    var short: [12]u8 = @splat(0);
+    var full: [err_text_max]u8 = undefined;
+    var short_len: u32 = 0;
+    try testing.expectEqual(@as(c_int, 0), ztex_last_error(
+        f.ctx(),
+        &short,
+        @intCast(short.len),
+        &short_len,
+    ));
+    // The full length is always reported, so cutting the text is the
+    // caller's decision; the copy stays NUL-terminated inside the buffer.
+    try testing.expect(short_len > short.len);
+    try testing.expectEqual(@as(u8, 0), short[short.len - 1]);
+    try testing.expect(std.mem.startsWith(u8, short[0..], "parse error"));
+    const text = try f.lastError(&full);
+    try testing.expectEqual(short_len, @as(u32, @intCast(text.len)));
+    // A successful call clears the text, so nothing stale reads back.
+    const ok: [:0]const u8 = "x";
+    var buf: [4096]u8 = undefined;
+    try testing.expectEqual(@as(c_int, 0), ztex_render_svg(
+        f.ctx(),
+        ok.ptr,
+        @intCast(ok.len),
+        @intFromEnum(Style.display),
+        20,
+        null,
+        &buf,
+        @intCast(buf.len),
+        &len,
+    ));
+    try testing.expectEqual(@as(usize, 0), (try f.lastError(&full)).len);
+}
+
+test "c abi: destroying the context gives every byte back" {
+    var f: Fixture = undefined;
+    try f.create();
+    const src: [:0]const u8 = "\\frac{a}{b}+\\sqrt{x}+\\int_0^1 f(x)\\,dx";
+    var len: u32 = 0;
+    var width: u32 = 0;
+    var height: u32 = 0;
+    var buf: [64 * 1024]u8 = undefined;
+    try testing.expectEqual(@as(c_int, 0), ztex_render_svg(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        null,
+        &buf,
+        @intCast(buf.len),
+        &len,
+    ));
+    try testing.expectEqual(@as(c_int, @intFromEnum(Status.buffer_too_small)), ztex_render_raster(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        null,
+        null,
+        0,
+        &len,
+        &width,
+        &height,
+    ));
+    try testing.expect(f.counted.state.live > 0);
+    f.destroy();
+    try testing.expectEqual(@as(usize, 0), f.counted.state.live);
+    // Both halves of the surface tolerate a NULL handle.
+    ztex_context_destroy(null);
+    try testing.expectEqual(@as(c_int, @intFromEnum(Status.invalid_argument)), ztex_last_error(
+        null,
+        null,
+        0,
+        null,
+    ));
+}
+
+test "c abi: every status code has its own name" {
+    inline for (@typeInfo(Status).@"enum".fields) |field| {
+        const code: c_int = @intCast(field.value);
+        try testing.expectEqualStrings(field.name, std.mem.span(ztex_status_name(code)));
+    }
+    try testing.expectEqualStrings("unknown status", std.mem.span(ztex_status_name(1234)));
+}
