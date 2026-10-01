@@ -12,7 +12,9 @@ const draw = layout.draw;
 const atom = draw.atom;
 
 pub const Options = struct {
-    /// empty margin around the content, on every side (pt)
+    /// empty margin around the content, on every side (pt). Must be 0 or
+    /// greater; a negative margin is `error.InvalidArgument` and a
+    /// non-finite one `error.NonFiniteCoordinate`.
     padding: f32 = 0,
     /// optional background fill
     background: ?draw.Color = null,
@@ -25,9 +27,10 @@ pub const Options = struct {
 /// SVG font attributes for one CharStyle. Math (italic) runs use the math
 /// family, whose glyphs are italic by design; roman/bold runs switch to the
 /// upright text family so \text/\mathrm render upright instead of in the
-/// math font's italic shapes. font-style is emitted anyway so fallback
-/// faces (LM Roman Italic, DejaVu Serif Italic) stay italic when LMMath is
-/// missing.
+/// math font's italic shapes. The text-italic styles are TEXT italic, not
+/// math italic: they take the text family and declare font-style italic.
+/// Italic math is encoded in the glyph itself, so its face stays normal.
+/// Text slants use font-style instead.
 const FontSpec = struct {
     family: []const u8,
     style: []const u8,
@@ -37,7 +40,7 @@ const FontSpec = struct {
 
 fn fontSpec(style: atom.CharStyle, opts: *const Options) FontSpec {
     return switch (style) {
-        .italic => .{ .family = opts.font_family, .style = "italic", .weight = "" },
+        .italic => .{ .family = opts.font_family, .style = "normal", .weight = "" },
         .roman => .{ .family = opts.text_font_family, .style = "normal", .weight = "" },
         .bold => .{ .family = opts.text_font_family, .style = "normal", .weight = "bold" },
         // letter variants: LMMath carries blackboard/script/fraktur glyphs;
@@ -45,19 +48,31 @@ fn fontSpec(style: atom.CharStyle, opts: *const Options) FontSpec {
         .bb, .cal, .frak => .{ .family = opts.font_family, .style = "normal", .weight = "" },
         .sans => .{ .family = "DejaVu Sans, sans-serif", .style = "normal", .weight = "" },
         .mono => .{ .family = "DejaVu Sans Mono, monospace", .style = "normal", .weight = "" },
+        // text italic (TEXT slant on the upright family) and its bold
+        // combination: nested \textbf/\textit reach bold_italic.
+        .text_italic => .{ .family = opts.text_font_family, .style = "italic", .weight = "" },
+        .bold_italic => .{ .family = opts.text_font_family, .style = "italic", .weight = "bold" },
     };
 }
 
 /// Serialize a draw list to an SVG string. Caller owns the returned bytes.
-/// Fails only on allocation failure (`error.OutOfMemory`) or a non-finite
-/// coordinate (`error.NonFiniteCoordinate`, rejected by checkFinite).
+/// Fails on allocation failure (`error.OutOfMemory`), on a negative
+/// `padding` (`error.InvalidArgument` — a margin is a distance added on
+/// every side, and a negative one is a frame that reaches back over the
+/// content, so the document would declare a negative width), or on a
+/// non-finite coordinate (`error.NonFiniteCoordinate`, rejected by
+/// checkFinite, a non-finite `padding` among them).
 pub fn render(
     gpa: std.mem.Allocator,
     dl: *const draw.DrawList,
     opts: Options,
-) error{ OutOfMemory, NonFiniteCoordinate }![]u8 {
+) error{ OutOfMemory, NonFiniteCoordinate, InvalidArgument }![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
+    // Checked before anything is built, so a bad margin costs no document.
+    // A NaN margin is not negative (every comparison with it is false), so
+    // it passes here and is named for what it is by checkFinite below.
+    if (opts.padding < 0) return error.InvalidArgument;
 
     // The frame is the INK bounds, not the box bounds: boxes under-bind the
     // drawn glyphs (italic overhang past the advance, a display variant
@@ -65,20 +80,11 @@ pub fn render(
     // ink that is actually drawn.
     const ink = dl.bounds();
 
-    // The largest text size in points: both margins below scale with the
-    // glyph size, which the ink bbox itself does not carry.
+    // Browser line-box allowance scales with the largest text size.
     var max_size: f32 = 0;
     for (dl.items.items) |d| {
         if (d == .text) max_size = @max(max_size, d.text.size);
     }
-    // Horizontal slack, left and right. The ink bbox measures a glyph's
-    // horizontal extent from its ADVANCE box, not from the true ink left /
-    // right edge (the math ink table carries ascent / descent only), and an
-    // italic glyph leans past that edge — so a frame tight on the
-    // accumulated ink would shave the overhang off. 0.08 em of the largest
-    // size is the slop that covers it, and the border width XeTeX's preview
-    // leaves around the content.
-    const advance_slack = 0.08 * max_size;
     // Latin Modern Math has a 0.2em lineGap that browsers include in the
     // text line-box extent, below the baseline. Bounding only the glyph ink
     // under-shoots the browser's rendering and clips the bottom, so the
@@ -88,7 +94,7 @@ pub fn render(
     // Vertically the ink is exact (a char box's h/d IS the drawn glyph's
     // ink), so only the caller's padding and the browser line box below the
     // baseline go on top of it — the ink top lands ON the frame edge.
-    const pad_x = opts.padding + advance_slack;
+    const pad_x = opts.padding;
     const pad_top = opts.padding;
     const pad_bottom = opts.padding + linegap;
     const w = ink.width + 2 * pad_x;
@@ -101,17 +107,15 @@ pub fn render(
     const off_y = pad_top - ink.min_y;
     try checkFinite(&.{ w, h, off_x, off_y });
 
-    // All layout numbers are points. width/height carry explicit pt units so
-    // the output renders at its declared physical size (bare user units would
-    // be px = 96/72 × pt, i.e. 0.75×). The viewBox stays unitless: its user
-    // units are defined to equal pt by width/height.
+    // Outer dimensions set the physical point size. The viewBox maps each
+    // unitless inner coordinate to one point; inner `pt` would scale twice.
     try buf.print(
         gpa,
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{d}pt\" height=\"{d}pt\" viewBox=\"0 0 {d} {d}\">\n",
         .{ w, h, w, h },
     );
     if (opts.background) |bg| {
-        try buf.print(gpa, "<rect width=\"{d}pt\" height=\"{d}pt\" fill=\"#{s}\"/>\n", .{ w, h, colorHex(bg) });
+        try buf.print(gpa, "<rect width=\"{d}\" height=\"{d}\" fill=\"#{s}\"/>\n", .{ w, h, colorHex(bg) });
     }
 
     for (dl.items.items) |d| {
@@ -121,7 +125,7 @@ pub fn render(
                 try checkFinite(&.{ t.x + off_x, t.y + off_y, t.size });
                 try buf.print(
                     gpa,
-                    "<text x=\"{d}pt\" y=\"{d}pt\" font-size=\"{d}pt\" font-family=\"",
+                    "<text x=\"{d}\" y=\"{d}\" font-size=\"{d}\" font-family=\"",
                     .{ t.x + off_x, t.y + off_y, t.size },
                 );
                 // font_family/text_font_family are caller-supplied (Options),
@@ -194,7 +198,7 @@ pub fn render(
                 try checkFinite(&.{ r.x + off_x, r.y + off_y, r.w, r.h });
                 try buf.print(
                     gpa,
-                    "<rect x=\"{d}pt\" y=\"{d}pt\" width=\"{d}pt\" height=\"{d}pt\" fill=\"#{s}\"/>\n",
+                    "<rect x=\"{d}\" y=\"{d}\" width=\"{d}\" height=\"{d}\" fill=\"#{s}\"/>\n",
                     .{ r.x + off_x, r.y + off_y, r.w, r.h, colorHex(r.color) },
                 );
             },
@@ -202,10 +206,16 @@ pub fn render(
                 try checkFinite(&.{
                     l.x0 + off_x, l.y0 + off_y, l.x1 + off_x, l.y1 + off_y, l.width,
                 });
+                // No cap/join attribute: SVG's defaults are the butt cap and
+                // the miter join, which is what raster.zig's band and
+                // layout's box extents are sized for (see `strokeSegment`).
+                // A round cap would paint past the endpoint the ink bbox
+                // stops at, so the document and the bitmap would disagree on
+                // where the ink ends.
                 try buf.print(
                     gpa,
-                    "<line x1=\"{d}pt\" y1=\"{d}pt\" x2=\"{d}pt\" " ++
-                        "y2=\"{d}pt\" stroke=\"#{s}\" stroke-width=\"{d}pt\"/>\n",
+                    "<line x1=\"{d}\" y1=\"{d}\" x2=\"{d}\" " ++
+                        "y2=\"{d}\" stroke=\"#{s}\" stroke-width=\"{d}\"/>\n",
                     .{
                         l.x0 + off_x,      l.y0 + off_y, l.x1 + off_x, l.y1 + off_y,
                         colorHex(l.color), l.width,
@@ -249,43 +259,6 @@ fn colorHex(c: draw.Color) [8]u8 {
 
 fn hexDigit(value: u8) u8 {
     return "0123456789abcdef"[value & 0x0f];
-}
-
-/// Parse a color from a name (`white`, `black`, …) or hex (`#RRGGBB[AA]`).
-/// Returns null for the valid "no background" values `none`/`transparent`,
-/// a `draw.Color` for a recognized name/hex, and
-/// `error.UnrecognizedColor` for anything else — so callers can tell "no
-/// background" apart from a typo (e.g. `-b blak`).
-pub fn parseColorChecked(s: []const u8) !?draw.Color {
-    if (std.mem.eql(u8, s, "none") or std.mem.eql(u8, s, "transparent")) return null;
-    if (s.len > 0 and s[0] == '#') return parseHex(s[1..]) orelse error.UnrecognizedColor;
-    const named = [_]struct { name: []const u8, c: draw.Color }{
-        .{ .name = "white", .c = .{ .r = 255, .g = 255, .b = 255 } },
-        .{ .name = "black", .c = .{ .r = 0, .g = 0, .b = 0 } },
-        .{ .name = "red", .c = .{ .r = 255, .g = 0, .b = 0 } },
-        .{ .name = "green", .c = .{ .r = 0, .g = 128, .b = 0 } },
-        .{ .name = "blue", .c = .{ .r = 0, .g = 0, .b = 255 } },
-        .{ .name = "yellow", .c = .{ .r = 255, .g = 255, .b = 0 } },
-        .{ .name = "cyan", .c = .{ .r = 0, .g = 255, .b = 255 } },
-        .{ .name = "magenta", .c = .{ .r = 255, .g = 0, .b = 255 } },
-        .{ .name = "orange", .c = .{ .r = 255, .g = 165, .b = 0 } },
-        .{ .name = "gray", .c = .{ .r = 128, .g = 128, .b = 128 } },
-        .{ .name = "grey", .c = .{ .r = 128, .g = 128, .b = 128 } },
-    };
-    for (named) |n| {
-        if (std.mem.eql(u8, s, n.name)) return n.c;
-    }
-    return error.UnrecognizedColor;
-}
-
-fn parseHex(s: []const u8) ?draw.Color {
-    if (s.len != 6 and s.len != 8) return null;
-    var c: draw.Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 };
-    if (s.len == 8) c.a = std.fmt.parseInt(u8, s[6..8], 16) catch return null;
-    c.r = std.fmt.parseInt(u8, s[0..2], 16) catch return null;
-    c.g = std.fmt.parseInt(u8, s[2..4], 16) catch return null;
-    c.b = std.fmt.parseInt(u8, s[4..6], 16) catch return null;
-    return c;
 }
 
 /// Fail loudly (error) rather than emit `nan`/`inf` into the SVG. A
@@ -420,30 +393,6 @@ fn fractionDrawList(gpa: std.mem.Allocator) !draw.DrawList {
     return dl;
 }
 
-/// Three runs in a row at 20pt — math italic (the default), roman and bold:
-/// the three font specs `render` emits. Each run carries its ink.
-fn styledDrawList(gpa: std.mem.Allocator) !draw.DrawList {
-    var dl = draw.DrawList.init(gpa);
-    errdefer dl.deinit();
-    const styles = [3]atom.CharStyle{ .italic, .roman, .bold };
-    const runs = [3][]const u8{ "x", "hi", "b" };
-    for (styles, runs, 0..) |style, bytes, i| {
-        const x: f32 = @floatFromInt(10 * i);
-        try dl.add(.{ .text = .{
-            .bytes = bytes,
-            .x = x,
-            .y = 0,
-            .size = 20,
-            .style = style,
-            .color = black,
-            .src_start = @intCast(i),
-            .src_end = @intCast(i + 1),
-        } });
-        dl.accInk(x, -7, x + 5, 2); // 7pt of ink ascent, 2pt of descent
-    }
-    return dl;
-}
-
 /// The largest text size in the draw list, in points — the frame's margins
 /// are documented in `render` as fractions of it.
 fn maxTextSize(dl: *const draw.DrawList) f32 {
@@ -478,9 +427,7 @@ const Shift = struct { x: f32, y: f32 };
 ///     coordinate;
 ///   - every primitive takes the SAME shift, and that shift puts the frame
 ///     origin on the INK minimum: the ink top lands on the top edge (the
-///     vertical ink is exact) and the ink sits between equal horizontal
-///     margins (the ink's horizontal edge is the advance box, which
-///     under-binds an italic overhang, so a margin stays).
+///     vertical ink is exact) and the horizontal margin is caller padding.
 /// Walks the emitted elements in painter order, zipped with the draw
 /// list's primitives. Every primitive must be visited: an element `render`
 /// emitted outside the draw list (the background rect) or not at all (the
@@ -518,8 +465,9 @@ fn expectInsideFrame(svg: []const u8, dl: *const draw.DrawList, frame: Frame) !v
     }
     try testing.expectEqual(dl.len(), checked);
     const origin = shift orelse return error.NoPrimitivesEmitted;
-    try testing.expectApproxEqAbs(@as(f32, 0), ink.min_y + origin.y, 0.001);
-    try testing.expectApproxEqAbs((frame.w - ink.width) / 2, ink.min_x + origin.x, 0.001);
+    const padding = (frame.w - ink.width) / 2;
+    try testing.expectApproxEqAbs(padding, ink.min_y + origin.y, 0.001);
+    try testing.expectApproxEqAbs(padding, ink.min_x + origin.x, 0.001);
 }
 
 /// The bounding box of one emitted element, over every geometry attribute
@@ -585,13 +533,7 @@ test "svg: the frame is the ink bbox and every coordinate is non-negative" {
     const frame = try frameOf(svg);
     try expectInsideFrame(svg, &dl, frame);
 
-    // The margins are the documented ones: 0.08em of advance slack either
-    // side (the ink's horizontal edge is the advance box, which under-binds
-    // an italic overhang) and 0.2em of browser line box below the ink.
-    // Assert the invariant, not a float literal: 0.08 * 20 is 1.6000001 in
-    // f32, so pinning its spelling would pin float formatting.
-    const margin = (frame.w - ink.width) / 2;
-    try testing.expectApproxEqAbs(0.08 * maxTextSize(&dl), margin, 0.001);
+    // The browser line-box allowance stays below the measured glyph ink.
     try testing.expectApproxEqAbs(
         0.2 * maxTextSize(&dl),
         frame.h - (ink.height + ink.depth),
@@ -645,11 +587,11 @@ test "svg: background fills the viewBox" {
     const svg = try render(testing.allocator, &dl, .{ .background = .{ .r = 255, .g = 255, .b = 255 } });
     defer testing.allocator.free(svg);
     const frame = try frameOf(svg);
-    // the background spans the whole frame, in the frame's own pt units
+    // Background coordinates use the same viewBox units as the content.
     var want: [128]u8 = undefined;
     const head = try std.fmt.bufPrint(
         &want,
-        "<rect width=\"{d}pt\" height=\"{d}pt\" fill=\"#ffffffff\"/>",
+        "<rect width=\"{d}\" height=\"{d}\" fill=\"#ffffffff\"/>",
         .{ frame.w, frame.h },
     );
     try testing.expect(std.mem.indexOf(u8, svg, head) != null);
@@ -657,42 +599,52 @@ test "svg: background fills the viewBox" {
     try expectInsideFrame(svg, &dl, frame);
 }
 
-test "svg: pt units and per-style fonts on the svg root and text" {
-    var dl = try styledDrawList(testing.allocator);
+test "svg: a primitive's scoped color is emitted as its paint" {
+    // The color a \color/\textcolor/\boxed scope produced has to reach the
+    // document: glyphs and rules as a fill, decorations as a stroke, alpha
+    // included. A dropped scope silently renders the whole formula black.
+    const scoped: draw.Color = .{ .r = 18, .g = 52, .b = 86, .a = 128 };
+    var dl = draw.DrawList.init(testing.allocator);
     defer dl.deinit();
+    try dl.add(.{ .text = .{
+        .bytes = "x",
+        .x = 0,
+        .y = 0,
+        .size = 10,
+        .style = .roman,
+        .color = scoped,
+        .color_override = true,
+        .src_start = 0,
+        .src_end = 1,
+    } });
+    dl.accInk(0, -7, 5, 2);
+    try dl.add(.{ .rect = .{
+        .x = 6,
+        .y = 0,
+        .w = 4,
+        .h = 0.4,
+        .color = scoped,
+        .color_override = true,
+        .src_start = 1,
+        .src_end = 2,
+    } });
+    dl.accInk(6, 0, 10, 0.4);
+    try dl.add(.{ .line = .{
+        .x0 = 0,
+        .y0 = 4,
+        .x1 = 10,
+        .y1 = 4,
+        .color = scoped,
+        .color_override = true,
+        .width = 0.4,
+        .src_start = 2,
+        .src_end = 3,
+    } });
+    dl.accInk(0, 3.8, 10, 4.2);
     const svg = try render(testing.allocator, &dl, .{});
     defer testing.allocator.free(svg);
-    // the root declares the frame in pt (bare user units would be px, 0.75x)
-    // and the viewBox repeats the same numbers
-    const frame = try frameOf(svg);
-    var want: [192]u8 = undefined;
-    const head = try std.fmt.bufPrint(&want, "<svg xmlns=\"http://www.w3.org/2000/svg\" " ++
-        "width=\"{d}pt\" height=\"{d}pt\" viewBox=\"0 0 {d} {d}\">", .{
-        frame.w, frame.h, frame.w, frame.h,
-    });
-    try testing.expect(std.mem.startsWith(u8, svg, head));
-    // math (italic) runs: math family + font-style italic
-    try testing.expect(std.mem.indexOf(u8, svg, "font-family=\"Latin Modern Math, Latin Modern Roman, " ++
-        "DejaVu Serif, serif\" font-style=\"italic\"") != null);
-    // \text/\mathrm (roman): upright text family + font-style normal
-    try testing.expect(std.mem.indexOf(u8, svg, "font-family=\"Latin Modern Roman, DejaVu Serif, serif\" " ++
-        "font-style=\"normal\"") != null);
-    // \mathbf: bold weight on the text family
-    try testing.expect(std.mem.indexOf(u8, svg, "font-weight=\"bold\"") != null);
-    try expectInsideFrame(svg, &dl, frame);
-}
-
-test "svg: parseColorChecked tells none/transparent from unrecognized" {
-    // valid "no background" values stay null (no background)
-    try testing.expect((try parseColorChecked("none")) == null);
-    try testing.expect((try parseColorChecked("transparent")) == null);
-    // a valid color parses
-    try testing.expectEqual(@as(draw.Color, .{ .r = 255, .g = 0, .b = 0 }), (try parseColorChecked("red")).?);
-    try testing.expectEqual(@as(draw.Color, .{ .r = 255, .g = 128, .b = 0 }), (try parseColorChecked("#ff8000")).?);
-    // bad hex is rejected
-    try testing.expectError(error.UnrecognizedColor, parseColorChecked("#zz0000"));
-    // an unrecognized string errors (not silently treated as no background)
-    try testing.expectError(error.UnrecognizedColor, parseColorChecked("blak"));
+    try testing.expect(std.mem.indexOf(u8, svg, "fill=\"#12345680\"") != null);
+    try testing.expect(std.mem.indexOf(u8, svg, "stroke=\"#12345680\"") != null);
 }
 
 test "svg: escapes quotes in the font-family attribute" {
@@ -730,34 +682,33 @@ test "svg: rejects non-finite coordinates" {
     } });
     try testing.expectError(error.NonFiniteCoordinate, render(testing.allocator, &dl, .{}));
 }
-test "svg: \\mathbf declares a bold weight and \\text does not" {
-    // The bitmap path resolves \mathbf to the embedded bold face; the SVG
-    // path cannot embed a face, so it declares the weight instead. Both sides
-    // must agree that \mathbf is bold, or the two outputs diverge.
-    const emit = struct {
-        fn f(style: atom.CharStyle) ![]u8 {
-            var dl = draw.DrawList.init(testing.allocator);
-            defer dl.deinit();
-            try dl.add(.{ .text = .{
-                .bytes = "x",
-                .x = 0,
-                .y = 0,
-                .size = 10,
-                .style = style,
-                .color = .{ .r = 0, .g = 0, .b = 0 },
-                .src_start = 0,
-                .src_end = 1,
-            } });
-            dl.accInk(0, -7, 5, 2);
-            return try render(testing.allocator, &dl, .{});
-        }
-    }.f;
 
-    const bold = try emit(.bold);
-    defer testing.allocator.free(bold);
-    const roman = try emit(.roman);
-    defer testing.allocator.free(roman);
-
-    try testing.expect(std.mem.indexOf(u8, bold, "font-weight=\"bold\"") != null);
-    try testing.expect(std.mem.indexOf(u8, roman, "font-weight=") == null);
+// A negative margin is not a small margin: it reaches back over the
+// content, so the document that used to come back declared
+// `width="-1988pt"` over a viewBox of "0 0 -1988 …" — a frame no viewer
+// can draw, emitted as ZTEX_OK. The option is refused instead, and a
+// non-finite one keeps the coordinate error it always had.
+test "svg: a negative padding is refused, not framed as a negative size" {
+    var dl = try fractionDrawList(testing.allocator);
+    defer dl.deinit();
+    // Past the ink on both sides: the frame came out negative.
+    try testing.expectError(
+        error.InvalidArgument,
+        render(testing.allocator, &dl, .{ .padding = -1000 }),
+    );
+    // Small enough that the frame would have stayed positive: still a bad
+    // option, and refused the same way.
+    try testing.expectError(
+        error.InvalidArgument,
+        render(testing.allocator, &dl, .{ .padding = -0.5 }),
+    );
+    // A non-finite margin is a coordinate, and keeps the coordinate's error.
+    try testing.expectError(
+        error.NonFiniteCoordinate,
+        render(testing.allocator, &dl, .{ .padding = std.math.nan(f32) }),
+    );
+    // A margin of 0 or more still frames the content inside the frame.
+    const svg = try render(testing.allocator, &dl, .{ .padding = 4 });
+    defer testing.allocator.free(svg);
+    try expectInsideFrame(svg, &dl, try frameOf(svg));
 }

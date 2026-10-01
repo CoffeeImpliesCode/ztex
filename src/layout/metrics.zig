@@ -9,9 +9,18 @@
 //! differ from LM Math (x 0.5715 vs 0.528em, ∑ 1.4444 vs 1.056em, ∫ 0.5556
 //! vs 0.665em), so layout advances never matched the rendered glyphs and
 //! formulas overflowed the frame. Widths are now the LM Math advance so
-//! layout advance == render advance. Height/depth stay the LM Math ink
-//! (see `ink_table`); italic corrections and the TeX glue parameters stay
-//! the CM values (spacing facts, not render geometry).
+//! layout advance == render advance; italic corrections and the TeX glue
+//! parameters stay the CM values (spacing facts, not render geometry).
+//! The DRAWN INK comes from a second generated table, `ink_metrics.zig`: the
+//! real outlines of the same five embedded faces `font.zig` draws from, in
+//! every direction (ascent, descent, the ink reaching past the advance box,
+//! the ink's lower edge), so a glyph is framed by the face it is actually
+//! painted from — an italic `f` leans past its advance, a combining mark's
+//! ink sits entirely ABOVE the baseline (which is what places an accent over
+//! its argument), and a bold `f` is a different, taller design than the
+//! upright one. `ink_table` below is what is left of the older rounded
+//! Latin-Modern-Math ink rows, and now answers ONLY for a codepoint the
+//! active face's cmap does not carry.
 //! The static tables are self-contained (no external font files, fully
 //! deterministic lookups); the `.font` arm of the `FontMetrics` union
 //! delegates glyph measurement to the embedded Latin Modern fonts via
@@ -40,6 +49,8 @@
 
 const std = @import("std");
 const atom = @import("ztex.atom");
+const roman_style_metrics = @import("roman_style_metrics.zig");
+const ink_metrics = @import("ink_metrics.zig");
 
 /// Per-glyph metrics, in points at the base font size (10pt).
 pub const Glyph = struct {
@@ -47,15 +58,45 @@ pub const Glyph = struct {
     height: f32,
     depth: f32,
     italic_correction: f32,
+    /// The drawn glyph's OpenType MATH `TopAccentAttachment`, em of the
+    /// glyph's font size, when the active face records one (the `.font`
+    /// arm reads it from the real MATH table and rescales it to the 10pt
+    /// base). `null` = the face records none, so an accent over this glyph
+    /// falls back to `accentAttach`'s measured row. The static arm leaves
+    /// it null: there is no face, only the table.
+    top_accent_attachment: ?f32 = null,
 };
 
-/// Drawn-glyph ink extents, in em of the glyph's font-size: ascent above
-/// the baseline, descent below. layoutChar/layoutText box every normal
-/// glyph by these (× the drawn size) so the box — and the frame/viewBox —
-/// bounds the ink that is actually drawn; see `glyphInk`.
+/// Drawn-glyph ink extents, in em of the glyph's font-size: the outline's own
+/// bounding box above and below the baseline. layoutChar/layoutText box every
+/// normal glyph by these (× the drawn size) so the box — and the
+/// frame/viewBox — bounds the ink that is actually drawn; see `glyphInkAt`
+/// for the per-face source and `fallbackInk` for a codepoint no face carries.
+///
+/// `left` is how far the ink REACHES LEFT of the glyph origin, in the same em
+/// (`max(0, -xMin)`: a negative left side bearing — math italic `j`, every
+/// combining mark). `right_edge` is where the ink ENDS on the right, measured
+/// right from that same origin (`max(0, xMax)`) — an ABSOLUTE edge, NOT an
+/// overhang: `layout.setCharOverhang` takes
+/// `max(0, right_edge × size − this box's advance)`, so the overhang is
+/// measured against whatever advance the glyph was really boxed by. A static
+/// optical band is narrower than the face whose outline this is (LMRoman17's
+/// `f`: 0.276em boxed, ink to 0.357em), and an overhang recorded against the
+/// face's wider hmtx advance would stop 0.030em short of the hook it has to
+/// enclose. Both are non-negative; 0 — a glyph whose ink ends at the origin,
+/// or a fallback face whose ink was never measured — frames the advance box
+/// exactly as before.
+///
+/// `bottom` is the ink's lower edge measured UP from the baseline: positive
+/// for a combining mark, whose ink floats entirely above its base (that is
+/// what places an accent over its argument), and 0 for a glyph that sits on
+/// the baseline or hangs below it — its descent is `desc`.
 pub const GlyphInk = struct {
     asc: f32,
     desc: f32,
+    left: f32 = 0,
+    right_edge: f32 = 0,
+    bottom: f32 = 0,
 };
 
 /// TeX layout parameters, in points at the base size (10pt). Values are
@@ -86,6 +127,13 @@ pub const GlueParams = struct {
     scriptfactor: f32, // script style size fraction
     scriptscriptfactor: f32, // scriptscript style size fraction
     x_height: f32, // cmmi10 x-height, for script clearance floors
+    /// The `.font` arm's OpenType MATH constants, borrowed from the owned
+    /// math face for the hook's lifetime; null when the active metric
+    /// source carries no MATH table. `glueImpl` reads every parameter it
+    /// can express from here, and layout reads the rest (radical, overbar,
+    /// underbar, accent) through `mathConstants`. The static arm keeps its
+    /// own measured rows and leaves this null.
+    math_constants: ?*const atom.MathConstants = null,
 };
 
 /// The bundled static metric tables (Latin-Modern-Math advances, 10pt base)
@@ -110,6 +158,10 @@ pub const FontHook = struct {
     ctx: *anyopaque,
     /// Font-backed glyph lookup for `ctx` at the 10pt base.
     glyph: *const fn (ctx: *anyopaque, cp: u21, style: atom.CharStyle) ?Glyph,
+    /// The owned math face's MATH constants, borrowed for the context's
+    /// lifetime; null for a hook built without a MATH table, which leaves
+    /// every parameter on its static row.
+    math_constants: ?*const atom.MathConstants = null,
 };
 
 /// Closed metric source for the layout: either the bundled static tables or
@@ -1470,20 +1522,21 @@ const InkEntry = struct {
     d: f32,
 };
 
-/// Drawn-glyph ink extents for every codepoint in the metric tables above,
-/// in em of the glyph's font-size, measured with fontTools BoundsPen on
-/// latinmodern-math.otf 2.005 (CFF outline bounds, per-mille → em; the
-/// big-op rows reproduce the `bigOpInk` table below exactly).
-/// Sorted by `cp` (binary-search invariant). layoutChar/layoutText box
-/// every normal glyph by this ink × the drawn size, so the box (and the
-/// frame/viewBox) bounds the ink that is actually drawn: the cmr10/cmmi10
-/// h/d are the Computer-Modern DESIGN box, and the LMMath ink pokes past
-/// it for digits (0.666em vs cmr10 0.644em), ascender letters (0.694 vs
-/// 0.6944 — a match), descenders (0.205 vs 0.1944), and the
-/// delimiters/operators (0.750/0.250 full box). The WIDTH stays the
-/// metric-table advance; only height/depth change. Codepoints absent from
-/// LMMath (ams-only symbols, CJK, …) get the font's design bound
-/// 0.750/0.250 via glyphInk — safe for the browser fallback fonts.
+/// Drawn-glyph ink extents in em of the glyph's font-size, measured with
+/// fontTools BoundsPen on latinmodern-math.otf 2.005 (CFF outline bounds,
+/// per-mille → em; the big-op rows reproduce the `bigOpInk` table below
+/// exactly). Sorted by `cp` (binary-search invariant).
+///
+/// This is now the FALLBACK table, read only by `mathInk` for a codepoint the
+/// active face's cmap does not carry. The primary source is `ink_metrics.zig`
+/// — the same outlines regenerated from the embedded bytes, in all five
+/// drawing faces and to six decimals instead of three. Three decimals is not
+/// enclosure: rounding a 0.684113em top down to 0.684 under-frames the ink by
+/// 0.07px at 60pt/720dpi, and one row was outright wrong (U+0391 Α 0.683
+/// against a real 0.716, 20px of clipped apex). Nothing here is measured per
+/// glyph at runtime, and a codepoint absent from LMMath (ams-only symbols,
+/// CJK, …) still gets the font's design bound 0.750/0.250 — safe for the
+/// browser's fallback fonts.
 const ink_table = [_]InkEntry{
     .{ .cp = 0x0021, .a = 0.716, .d = 0.000 }, // !
     .{ .cp = 0x0023, .a = 0.694, .d = 0.194 }, // #
@@ -2072,8 +2125,10 @@ pub fn bigOpInk(op: atom.BigOp, display: bool) BigOpInk {
         // layout.bigOpScale (2.488 — the `bigints` package's \Huge), since
         // Unicode has no big-integral codepoint. Every field is the plain
         // integral's × 2.488: ∫ 0.665/0.805/0.306 and ic 0.332em (3.32pt at
-        // 10pt) → 1.655/2.003/0.761 and 8.26; ⯯ 1.035 and ⰰ 1.405 em
-        // advance (fontTools hmtx) keep their own ratios.
+        // 10pt) → 1.655/2.003/0.761 and 8.26; ∬ and ∭ keep their own
+        // hmtx advances (fontTools: 1.035 / 1.405em) and U+222C/U+222D are
+        // drawn with the same contours and bbox as U+222F/U+2230, so those
+        // advances hold for them too.
         .bigint => BigOpInk{
             .advance = 1.655,
             .disp_advance = 1.655,
@@ -2087,14 +2142,14 @@ pub fn bigOpInk(op: atom.BigOp, display: bool) BigOpInk {
             .asc = 2.003,
             .desc = 0.761,
             .ic = 8.26,
-        }, // U+222F ∯ × 2.488
+        }, // U+222C ∬ × 2.488
         .bigiiint => BigOpInk{
             .advance = 3.496,
             .disp_advance = 3.496,
             .asc = 2.003,
             .desc = 0.761,
             .ic = 8.26,
-        }, // U+2230 ⰰ × 2.488
+        }, // U+222D ∭ × 2.488
     };
     if (!display) return base;
     // Display variants (summation.v1, integral.v1, ... — hmtx advances and
@@ -2213,14 +2268,14 @@ pub fn bigOpInk(op: atom.BigOp, display: bool) BigOpInk {
             .asc = 2.003,
             .desc = 0.761,
             .ic = 8.26,
-        }, // U+222F ∯ × 2.488
+        }, // U+222C ∬ × 2.488
         .bigiiint => BigOpInk{
             .advance = 3.496,
             .disp_advance = 3.496,
             .asc = 2.003,
             .desc = 0.761,
             .ic = 8.26,
-        }, // U+2230 ⰰ × 2.488
+        }, // U+222D ∭ × 2.488
     };
 }
 
@@ -2246,6 +2301,40 @@ fn search(tbl: []const Entry, cp: u21) ?Entry {
 /// Greek are already cmr10 in `table`, so style does not change them.
 fn isRomanLetter(cp: u21) bool {
     return (cp >= 0x41 and cp <= 0x5A) or (cp >= 0x61 and cp <= 0x7A);
+}
+
+/// True for a TEXT face drawn from one of the embedded LM Roman faces:
+/// `\textit` (text italic), `\textbf` (upright bold) and their combination
+/// (bold italic). Plain `\mathrm` / `\text` is `.roman` and keeps the
+/// Computer-Modern roman rows plus the LMRoman17 optical band — a
+/// different face history with its own goldens.
+pub fn isTextFace(style: atom.CharStyle) bool {
+    return style == .roman or style == .bold or style == .text_italic or
+        style == .bold_italic;
+}
+
+/// The generated LM Roman text-style row for `style`, or null when the style
+/// is not one of those faces (the caller then uses the Computer-Modern
+/// rows). The tables are measured from the EXACT bytes the renderer draws —
+/// `src/layout/roman_style_metrics.zig`, generated by
+/// scripts/embed_font.py — so the static path advances and boxes a bold or
+/// italic character by its own face's hmtx advance and real ink instead of
+/// an upright estimate. These are text faces: they carry no MATH table, so
+/// every row's italic correction is 0.
+pub fn textFaceGlyph(style: atom.CharStyle, cp: u21) ?Glyph {
+    const tbl: []const roman_style_metrics.Entry = switch (style) {
+        .text_italic => roman_style_metrics.italic,
+        .bold => roman_style_metrics.bold,
+        .bold_italic => roman_style_metrics.bold_italic,
+        else => return null,
+    };
+    const e = roman_style_metrics.lookup(tbl, cp) orelse return null;
+    return .{
+        .width = e.w,
+        .height = e.h,
+        .depth = e.d,
+        .italic_correction = e.ic,
+    };
 }
 
 /// True in the LMRoman17 optical band: XeTeX/fontspec's Latin Modern Roman
@@ -2287,14 +2376,16 @@ fn tableFor(cp: u21, style: atom.CharStyle, size_pt: f32) []const Entry {
 /// convention (em × 10), matching `glyph`/`lookupAscii`, so callers keep
 /// using `s(v, size_pt)`. Glyphs without a script-size font (ams fonts,
 /// cmex, composites) fall back to the 10pt table, i.e. linear scaling — the
-/// same behavior as before. When `fm` is the `.font` arm, the real font
-/// answers first (see `fontGlyph`) — EXCEPT in the LMRoman17 band (roman
-/// style, `size_pt >= 15`): there the real roman face (embedded lmroman10)
-/// does NOT match XeTeX, whose roman TEXT font optically swaps to the 17pt
-/// design, so `table_roman17` answers first (the embedded fonts have no 17
-/// variant). LM Math has no optical sizes, so the math path still scales
-/// linearly with size.
+/// same behavior as before. A wired font answers first at every size, so the
+/// measured face is the one the rasterizer draws. Only the static arm uses
+/// `table_roman17` for roman text at `size_pt >= 15`; LM Math has no optical
+/// sizes and scales linearly.
 pub fn glyphAt(fm: *const FontMetrics, cp: u21, style: atom.CharStyle, size_pt: f32) ?Glyph {
+    if (fontGlyph(fm, cp, style)) |g| return g;
+    // A generated text face is measured by its OWN face, and it answers
+    // before every optical band and the ASCII fast path below: none of
+    // those tables describe LM Roman Italic / Bold / Bold Italic.
+    if (textFaceGlyph(style, cp)) |g| return g;
     if (style == .roman and band17(size_pt)) {
         if (search(&table_roman17, cp)) |e| {
             return .{ .width = e.w, .height = e.h, .depth = e.d, .italic_correction = e.ic };
@@ -2311,7 +2402,6 @@ pub fn glyphAt(fm: *const FontMetrics, cp: u21, style: atom.CharStyle, size_pt: 
     if (!band7 and !band5) {
         if (lookupAscii(fm, cp, style)) |g| return g;
     }
-    if (fontGlyph(fm, cp, style)) |g| return g;
     if (search(tableFor(cp, style, size_pt), cp)) |e| {
         return .{ .width = e.w, .height = e.h, .depth = e.d, .italic_correction = e.ic };
     }
@@ -2325,16 +2415,14 @@ pub fn glyphAt(fm: *const FontMetrics, cp: u21, style: atom.CharStyle, size_pt: 
     return null;
 }
 
-/// Ink extents of the DRAWN glyph for `cp`, in em of the glyph's font-size
-/// (binary search over `ink_table`; the design bound 0.750/0.250 for
-/// codepoints absent from the table — the LMMath ascender/descender, safe
-/// for the browser's fallback fonts too). layoutChar/layoutText box a
-/// normal glyph by `ink × size_pt` instead of the metric-table h/d: the
-/// cmr10/cmmi10 h/d describe the Computer-Modern design box, while the
-/// Latin-Modern-Math ink is what the SVG actually draws, and it pokes past
-/// that box (digits 0.666em vs 0.644em, ∫ sup '1' 9.32pt of ink in a
-/// 9.02pt box at 14pt) — the frame/viewBox then clips the ink. The box
-/// width stays the metric-table advance; only height/depth change.
+/// Fallback vertical ink for a codepoint NO drawing face carries (see
+/// `fallbackInk`), in em of the glyph's font-size: `ink_table` by binary
+/// search, else the LM Math design bound 0.750/0.250 — the LMMath
+/// ascender/descender, safe for the browser's fallback fonts too. Boxing a
+/// glyph by the drawn ink rather than the cmr10/cmmi10 h/d is what keeps the
+/// frame from clipping (digits 0.666em vs cmr10 0.644em, ∫ sup '1' 9.32pt of
+/// ink in a 9.02pt box at 14pt), and `ink_metrics.zig` now carries the exact
+/// per-face outlines for every glyph a face does have.
 const ascii_ink_lut = blk: {
     var lut: [128]?GlyphInk = undefined;
     for (&lut) |*slot| slot.* = null;
@@ -2346,9 +2434,9 @@ const ascii_ink_lut = blk: {
     break :blk lut;
 };
 
-pub fn glyphInk(cp: u21) GlyphInk {
+fn mathInk(cp: u21) GlyphInk {
     if (cp < 128) {
-        if (ascii_ink_lut[cp]) |ink| return ink;
+        return ascii_ink_lut[cp] orelse .{ .asc = 0.750, .desc = 0.250 };
     }
     var lo: usize = 0;
     var hi: usize = ink_table.len;
@@ -2364,6 +2452,71 @@ pub fn glyphInk(cp: u21) GlyphInk {
         return .{ .asc = ink_table[lo].a, .desc = ink_table[lo].d };
     }
     return .{ .asc = 0.750, .desc = 0.250 };
+}
+
+/// The generated ink of the glyph `cp` in the face `edges`, or null when that
+/// face's cmap carries no painted glyph for it. The row is the outline's own
+/// box (`ink_metrics.Edge`), measured from the very bytes `font.zig` draws, so
+/// the frame encloses the real ink instead of a rounded estimate of it.
+fn faceInk(edges: []const ink_metrics.Edge, cp: u21) ?GlyphInk {
+    const e = ink_metrics.lookup(edges, cp) orelse return null;
+    return .{
+        .asc = e.asc,
+        .desc = e.desc,
+        .left = e.left,
+        .right_edge = e.right_edge,
+        .bottom = e.bottom,
+    };
+}
+
+/// The ink rows of the face `style` is DRAWN from — the same face
+/// `font.FontContext.faceForStyle` resolves for the metric hook and the
+/// rasterizer, so a glyph can never be framed by one face's outline while a
+/// different face draws it. Every style that is not one of the four text
+/// faces draws from LM Math.
+fn inkEdges(style: atom.CharStyle) []const ink_metrics.Edge {
+    return switch (style) {
+        .roman => ink_metrics.roman,
+        .text_italic => ink_metrics.italic,
+        .bold => ink_metrics.bold,
+        .bold_italic => ink_metrics.bold_italic,
+        else => ink_metrics.math,
+    };
+}
+
+/// Ink extents for a codepoint the drawing face has NO row for: an AMS-only
+/// symbol, a CJK glyph, anything its cmap does not carry. Nothing is known
+/// about the painted outline then, so this is the pre-table behaviour — the
+/// text face's own generated h/d where it has one, else `mathInk`'s
+/// Latin-Modern-Math rows. Both horizontal extents stay 0: no row means the
+/// face's ink was not measured, and unmeasured ink is not invented. A 0
+/// `right_edge` is a left-of-origin end, and the consumer's
+/// `max(0, right_edge × size − advance)` clamps it to 0 anyway — the frame
+/// stays the advance box, the same bounds this fallback always gave.
+fn fallbackInk(cp: u21, style: atom.CharStyle) GlyphInk {
+    if (textFaceGlyph(style, cp)) |g| {
+        return .{ .asc = g.height / em, .desc = g.depth / em };
+    }
+    return mathInk(cp);
+}
+
+/// Ink extents of the DRAWN Latin-Modern-Math glyph for `cp`: the face's own
+/// exact outline where it has one, else `fallbackInk`.
+pub fn glyphInk(cp: u21) GlyphInk {
+    // `.italic` names the math face, so a codepoint it cannot answer falls to
+    // the Latin-Modern-Math rows exactly as the pre-table path did.
+    return faceInk(ink_metrics.math, cp) orelse fallbackInk(cp, .italic);
+}
+
+/// Ink extents of the DRAWN glyph in `style`: its face's OWN real ink, in
+/// every direction. A bold or italic letter is a different design — taller,
+/// wider — and boxing it by the upright LM Math ink clips it, so `inkEdges`
+/// picks the face `font.FontContext.faceForStyle` draws it from: a `\text{f}`
+/// is framed by the upright face it is drawn from, not by the math-italic `f`
+/// beside it. Only a codepoint that face does not carry falls back
+/// (`fallbackInk`).
+pub fn glyphInkAt(cp: u21, style: atom.CharStyle) GlyphInk {
+    return faceInk(inkEdges(style), cp) orelse fallbackInk(cp, style);
 }
 
 /// One MATH-table vertical size variant of a delimiter (and the base entry):
@@ -2935,9 +3088,10 @@ fn glyphImpl(fm: *const FontMetrics, cp: u21, style: atom.CharStyle) ?Glyph {
 /// Static-table lookup at the 10pt base. Binary search over the table
 /// selected by `style` (see `tableFor`): roman-style letters come from
 /// `table_roman` (cmr10), everything else from `table` (cmmi10 letters,
-/// cmsy10/cmr10 symbols). Public so callers can reuse the rows' italic
-/// corrections (LM Math's MATH table is not parsed yet).
+/// cmsy10/cmr10 symbols). Italic correction falls back to these rows only
+/// when the active face supplies no MATH value.
 pub fn staticGlyph(cp: u21, style: atom.CharStyle) ?Glyph {
+    if (textFaceGlyph(style, cp)) |g| return g;
     if (cp < 128) {
         if (isRomanLetter(cp) and style == .roman) {
             if (roman_ascii_lut[cp]) |g| return g;
@@ -3043,10 +3197,18 @@ fn glyphEstimateImpl(self: *const FontMetrics, cp: u21, style: atom.CharStyle) G
 
 /// TeX layout parameters at 10pt (MicroTeX tex_param.res.cpp × 10, plus
 /// denom3/sub3/x_height from the standard CM set). Layout scales by size/10.
-/// Shared by both `FontMetrics` arms (spacing facts, not render geometry).
+///
+/// The `.font` arm overrides every row the face's own OpenType MATH table
+/// can express, so the geometry follows the ACTIVE font instead of a
+/// hard-wired table: for the bundled Latin Modern Math face the result is
+/// the same numbers the static rows already hold (they were measured from
+/// that same table), and a face with different constants moves the axis,
+/// the script ratios, the fraction shifts and rule, and the limit gaps with
+/// it. Nothing is invented: a parameter with no MATH counterpart
+/// (`x_height`, and `bigop_spacing5`, which fontspec's fd13 sets to 0pt on
+/// an OpenType math font) keeps its static row.
 fn glueImpl(self: *const FontMetrics) GlueParams {
-    _ = self;
-    return .{
+    var p: GlueParams = .{
         .axis_height = 2.5,
         .rule_thickness = 0.4,
         .num1 = 6.76508,
@@ -3082,6 +3244,92 @@ fn glueImpl(self: *const FontMetrics) GlueParams {
         .scriptscriptfactor = 0.5,
         .x_height = 4.30555,
     };
+    const mc = mathConstants(self) orelse return p;
+    p.math_constants = mc;
+    // MATH values are em; GlueParams is points at the 10pt base.
+    p.axis_height = mc.axis_height * em;
+    p.rule_thickness = mc.fraction_rule_thickness * em;
+    p.sup1 = mc.superscript_shift_up * em;
+    p.sup2 = mc.superscript_shift_up * em;
+    p.sup3 = mc.superscript_shift_up_cramped * em;
+    p.sub1 = mc.subscript_shift_down * em;
+    p.sub2 = mc.subscript_shift_down * em;
+    p.sub3 = mc.subscript_shift_down * em;
+    // The baseline drops are read at the SCRIPT size (tex.web reads
+    // \fontdimen20/21 of the script symbol font), so they carry the script
+    // ratio — the same 0.25em × 0.7 the static row encodes.
+    p.supdrop = mc.superscript_baseline_drop_max * mc.script_percent_scale_down * em;
+    p.subdrop = mc.subscript_baseline_drop_min * mc.script_percent_scale_down * em;
+    // Fraction shifts: the display branch uses the display-style shift,
+    // every other style the plain one. MATH has no \atop-specific value, so
+    // the ruleless branches (num3/denom3) take the same non-display shift.
+    p.num1 = mc.fraction_numerator_display_style_shift_up * em;
+    p.num2 = mc.fraction_numerator_shift_up * em;
+    p.num3 = mc.fraction_numerator_shift_up * em;
+    p.denom1 = mc.fraction_denominator_display_style_shift_down * em;
+    p.denom2 = mc.fraction_denominator_shift_down * em;
+    p.denom3 = mc.fraction_denominator_shift_down * em;
+    p.bigop_spacing1 = mc.upper_limit_gap_min * em;
+    p.bigop_spacing2 = mc.lower_limit_gap_min * em;
+    p.bigop_spacing3 = mc.upper_limit_baseline_rise_min * em;
+    p.bigop_spacing4 = mc.lower_limit_baseline_drop_min * em;
+    p.scriptfactor = mc.script_percent_scale_down;
+    p.scriptscriptfactor = mc.script_script_percent_scale_down;
+    return p;
+}
+
+/// The OpenType MATH constants of the ACTIVE metric source: the `.font`
+/// arm's borrowed face constants, or null for the bundled static tables
+/// (which carry their own measured rows). Layout reads the parameters
+/// `GlueParams` has no room for — the radical, overbar and underbar gaps,
+/// the accent base height — through this.
+pub fn mathConstants(fm: *const FontMetrics) ?*const atom.MathConstants {
+    return switch (fm.*) {
+        .static => null,
+        .font => |hook| hook.math_constants,
+    };
+}
+
+/// The drawn glyph's OpenType MATH italic correction, in points at the 10pt
+/// base (the same unit as `Glyph.italic_correction`, so a caller scales it
+/// with `s()` like every other base-unit value), read from the ACTIVE FACE
+/// only. Null when there is no face, when the face records none, or when it
+/// does not map the codepoint — so a caller keeps its own static row instead
+/// of silently using a fallback dressed up as the font's answer. (The bare
+/// `glyph` lookup cannot say this: it falls through to the static table
+/// itself.) This is the correction XeTeX+unicode-math adds after a math_char
+/// noad, so a superscript really lands at advance + this × size.
+pub fn fontItalicCorrection(fm: *const FontMetrics, cp: u21, style: atom.CharStyle) ?f32 {
+    const hook = switch (fm.*) {
+        .static => return null,
+        .font => |h| h,
+    };
+    const g = hook.glyph(hook.ctx, cp, style) orelse return null;
+    return g.italic_correction;
+}
+
+/// The drawn glyph's OpenType MATH `TopAccentAttachment`, em of the glyph's
+/// font size, from the ACTIVE FACE (see `fontItalicCorrection` for the null
+/// contract). The stored value is in base points, so it is divided down to
+/// em here to match `accentAttach`'s unit — the two are then interchangeable
+/// at the placement site. null = the face records none, and the caller falls
+/// back to the measured `accentAttach` row.
+pub fn fontTopAccentAttachment(fm: *const FontMetrics, cp: u21, style: atom.CharStyle) ?f32 {
+    const hook = switch (fm.*) {
+        .static => return null,
+        .font => |h| h,
+    };
+    const g = hook.glyph(hook.ctx, cp, style) orelse return null;
+    const attachment = g.top_accent_attachment orelse return null;
+    return attachment / em;
+}
+
+/// The accent clearance height, em: the face's MATH `AccentBaseHeight` on
+/// the font path, and Latin Modern Math's measured 0.45em otherwise (the
+/// static fallback, so a fontless render is unchanged).
+pub fn accentBaseHeightEm(fm: *const FontMetrics) f32 {
+    const mc = mathConstants(fm) orelse return 0.45;
+    return mc.accent_base_height;
 }
 
 /// Bundled default metrics (Latin-Modern-Math advance widths, 10pt base):
@@ -3146,20 +3394,6 @@ test "metrics: unknown codepoint falls back to estimate" {
     const est = glyphEstimate(&default, cp, .italic);
     try testing.expect(est.width > 0.0);
     try testing.expect(est.height > 0.0);
-}
-
-test "metrics: glue parameters are positive" {
-    const gp = glue(&default);
-    inline for (@typeInfo(GlueParams).@"struct".fields) |f| {
-        // bigop_spacing5 is 0.0 in Latin Modern Math (the MATH-table
-        // big-op padding, measured: fontspec fd13 = 0pt on the OT math
-        // font); every other parameter must be strictly positive.
-        if (comptime std.mem.eql(u8, f.name, "bigop_spacing5")) {
-            try testing.expectEqual(@as(f32, 0.0), gp.bigop_spacing5);
-        } else {
-            try testing.expect(@field(gp, f.name) > 0.0);
-        }
-    }
 }
 
 test "metrics: greek alpha present; operators upright, variables slanted" {
@@ -3554,4 +3788,189 @@ test "metrics: roman style at >= 15pt uses the LMRoman17 optical advances" {
     const m_math = glyphAt(&default, 'm', .italic, 30.0) orelse
         return error.TestUnexpectedResult;
     try testing.expectApproxEqAbs(@as(f32, 8.33), m_math.width, 0.001); // LM m
+}
+
+test "metrics: a text face is measured by its own LM Roman row" {
+    // Every generated face is a DIFFERENT design, so no upright row can
+    // stand in for one: the four real advances for 'x' are all distinct.
+    const upright = staticGlyph('x', .roman) orelse return error.TestUnexpectedResult;
+    const italic = staticGlyph('x', .text_italic) orelse return error.TestUnexpectedResult;
+    const bold = staticGlyph('x', .bold) orelse return error.TestUnexpectedResult;
+    const both = staticGlyph('x', .bold_italic) orelse return error.TestUnexpectedResult;
+    const widths = [_]f32{ upright.width, italic.width, bold.width, both.width };
+    for (widths[0 .. widths.len - 1], widths[1..]) |lo, hi| try testing.expect(lo != hi);
+    // The DRAWN bold `p` is boxed by its OWN face's ink, descender included:
+    // the layout adds `ink.desc` below the baseline, so ink the box does not
+    // carry is ink the frame cuts off.
+    const bold_p = glyphInkAt('p', .bold);
+    try testing.expect(bold_p.desc > 0);
+    try testing.expect(bold_p.asc > bold_p.desc);
+    // The generated tables answer only for the three faces they were
+    // generated from: upright roman and math keep their own rows.
+    try testing.expect(textFaceGlyph(.roman, 'x') == null);
+    try testing.expect(textFaceGlyph(.italic, 'x') == null);
+    // Accented Latin and the dotless letters are covered, not just ASCII —
+    // the text renderer emits exactly those.
+    for ([_]u21{ 0x00E9, 0x0131, 0x0237 }) |cp| {
+        try testing.expect(textFaceGlyph(.text_italic, cp) != null);
+    }
+}
+
+test "metrics: the extensible accent band is the mark's own ink" {
+    // The long \widehat / \widetilde is stroked INSIDE the narrow mark's ink
+    // band, so that band is the vertical extent the two forms share. The
+    // band runs from the mark's own lower edge (`bottom`, POSITIVE for a
+    // mark: its ink floats above the baseline) up to `asc` — it is the
+    // distance between the two, not the ascent alone, and it has to be a
+    // real positive height or the stroke collapses onto the argument.
+    for ([_]u21{ 0x0302, 0x0303 }) |cp| {
+        const ink = glyphInk(cp);
+        try testing.expect(ink.asc > 0.7);
+        try testing.expectApproxEqAbs(@as(f32, 0), ink.desc, 0.001);
+        try testing.expect(ink.bottom > 0);
+        try testing.expect(ink.asc > ink.bottom);
+    }
+}
+
+test "metrics: every generated ink row is real, non-negative, cp-ascending" {
+    // Every extent is a non-negative measurement the generator clamps at the
+    // origin: `asc`/`desc`/`left`/`bottom` are how far the outline REACHES
+    // past the baseline or the origin, `right_edge` is where it ENDS. A
+    // negative one would shrink the frame and clip the very ink it exists to
+    // contain. A row exists only because the glyph really has ink to frame
+    // there, so all five zero is not a row; and `cp`-ascending is the
+    // precondition of the binary search that finds one.
+    const tables = [_][]const ink_metrics.Edge{
+        ink_metrics.math,
+        ink_metrics.roman,
+        ink_metrics.italic,
+        ink_metrics.bold,
+        ink_metrics.bold_italic,
+    };
+    for (tables) |rows| {
+        try testing.expect(rows.len > 0);
+        var previous: u21 = 0;
+        for (rows, 0..) |row, i| {
+            try testing.expect(row.asc >= 0 and row.desc >= 0);
+            try testing.expect(row.left >= 0 and row.right_edge >= 0 and row.bottom >= 0);
+            try testing.expect(row.asc > 0 or row.desc > 0 or row.left > 0 or
+                row.right_edge > 0 or row.bottom > 0);
+            if (i > 0) try testing.expect(previous < row.cp);
+            previous = row.cp;
+        }
+    }
+}
+
+test "metrics: a glyph is framed by the face its style is drawn from" {
+    // LM Roman Italic's `x` leans further right and sits lower than the
+    // upright face's — two different designs. Framing both by one face's
+    // outline either clips the italic or pads the upright one, so each style
+    // has to answer from the face `FontContext.faceForStyle` hands the
+    // rasterizer.
+    const upright = glyphInkAt('x', .roman);
+    const italic = glyphInkAt('x', .text_italic);
+    try testing.expectApproxEqAbs(@as(f32, 0.516), upright.right_edge, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.518), italic.right_edge, 0.0001);
+    try testing.expect(italic.right_edge > upright.right_edge);
+    try testing.expect(italic.desc > upright.desc);
+    // The upright `x` keeps the plain advance box: its ink starts at the
+    // origin and sits on the baseline, so both `left` and `bottom` are 0.
+    try testing.expectApproxEqAbs(@as(f32, 0), upright.left, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0), upright.bottom, 0.0001);
+    // Math keeps the LM Math face — and its italic `j` really does start
+    // left of its origin, which is the negative side bearing the frame has
+    // to absorb.
+    try testing.expect(glyphInkAt('j', .italic).left > 0);
+}
+
+test "metrics: the right edge is measured from the origin, not past the advance" {
+    // The `f` hook is the frame's hard case in every face: its ink ends
+    // 0.357 / 0.452 / 0.437 / 0.538em from the ORIGIN, while the advance each
+    // style boxes it at is 0.276–0.400em. An overhang recorded past the face's
+    // own hmtx advance assumes the box IS that advance wide — LMRoman17 boxes
+    // `f` at 0.276em instead, so a carried-over 0.051em overhang would end
+    // the frame at 0.327em, 0.030em short of the hook. Measured from the
+    // origin, one number frames every one of them.
+    const hooks = [_]struct { style: atom.CharStyle, right_edge: f32, advance_em: f32 }{
+        .{ .style = .roman, .right_edge = 0.357, .advance_em = 0.276 },
+        .{ .style = .text_italic, .right_edge = 0.452, .advance_em = 0.307 },
+        .{ .style = .bold, .right_edge = 0.437, .advance_em = 0.351 },
+        .{ .style = .bold_italic, .right_edge = 0.538, .advance_em = 0.4 },
+    };
+    for (hooks) |h| {
+        const ink = glyphInkAt('f', h.style);
+        try testing.expectApproxEqAbs(h.right_edge, ink.right_edge, 0.0001);
+        // Every face's hook really does reach past the advance it is boxed
+        // at, so the union the consumer takes is nonzero on that axis.
+        try testing.expect(ink.right_edge > h.advance_em);
+    }
+    // A glyph whose ink ENDS inside the advance it is boxed at keeps the
+    // plain advance box: the upright `x` ends at 0.516em and the cmr10 row
+    // boxes it at 0.528em, so the union adds nothing on that axis.
+    const x = glyphInkAt('x', .roman);
+    try testing.expectApproxEqAbs(@as(f32, 0.516), x.right_edge, 0.0001);
+    try testing.expect(x.right_edge < glyphAt(&default, 'x', .roman, 10.0).?.width / em);
+}
+
+test "metrics: the drawn ink encloses the outline, not a rounded estimate" {
+    // Three decimals is not enclosure. The older rounded Latin-Modern-Math
+    // rows carried U+0391 Α at 0.683em against a real 0.716em outline and
+    // U+22C0 ⋀ at 0.750 against 0.78025, so both lost the top of their ink
+    // at every size — 0.033em is 20px of clipped apex at 60pt/720dpi. The
+    // rows regenerated from the embedded bytes are the outline's own box.
+    try testing.expectApproxEqAbs(@as(f32, 0.716), glyphInk(0x0391).asc, 0.0001);
+    const nary_and = glyphInk(0x22C0);
+    try testing.expectApproxEqAbs(@as(f32, 0.78025), nary_and.asc, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.264301), nary_and.desc, 0.0001);
+    // The math-italic `f` a bare `f` actually DRAWS is U+1D453, whose tail
+    // hangs below the baseline; the U+0066 row has no descent, so framing by
+    // the base letter cut the tail off.
+    const drawn_f = glyphInkAt(0x1D453, .italic);
+    try testing.expectApproxEqAbs(@as(f32, 0.705), drawn_f.asc, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.205), drawn_f.desc, 0.0001);
+    // Each text face answers with its OWN design: the bold `f` hook tops out
+    // lower than the italic one.
+    try testing.expectApproxEqAbs(@as(f32, 0.7), glyphInkAt('f', .bold).asc, 0.0001);
+    try testing.expectApproxEqAbs(
+        @as(f32, 0.705),
+        glyphInkAt('f', .text_italic).asc,
+        0.0001,
+    );
+    // A codepoint no embedded face carries has no measured ink at all, so
+    // the static design bound still frames it: a CJK glyph in a fallback
+    // font must not be boxed at zero height.
+    const cjk = glyphInk(0x4E2D);
+    try testing.expectApproxEqAbs(@as(f32, 0.75), cjk.asc, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.25), cjk.desc, 0.0001);
+}
+
+test "metrics: the big-integral rows are the plain integral scaled by 2.488" {
+    // The box of a scaled big integral is what keeps the painted glyph
+    // inside the frame, so every field must be the plain integral's own
+    // value times the drawn scale — a row that drifted would clip.
+    const scale: f32 = 2.488;
+    const plain = bigOpInk(.int, false);
+    const cases = [_]struct { op: atom.BigOp, advance_em: f32 }{
+        .{ .op = .bigint, .advance_em = 0.665 },
+        // ∬ and ∭ keep their OWN hmtx advance (fontTools: 1.035 / 1.405em);
+        // only the vertical extents scale.
+        .{ .op = .bigiint, .advance_em = 1.035 },
+        .{ .op = .bigiiint, .advance_em = 1.405 },
+    };
+    for (cases) |c| {
+        for ([_]bool{ false, true }) |display| {
+            const ink = bigOpInk(c.op, display);
+            try testing.expectApproxEqAbs(c.advance_em * scale, ink.advance, 0.001);
+            try testing.expectApproxEqAbs(c.advance_em * scale, ink.disp_advance, 0.001);
+            try testing.expectApproxEqAbs(plain.asc * scale, ink.asc, 0.001);
+            try testing.expectApproxEqAbs(plain.desc * scale, ink.desc, 0.001);
+            try testing.expectApproxEqAbs(plain.ic * scale, ink.ic, 0.01);
+        }
+    }
+    // The font's display VARIANT for those codepoints is a different, larger
+    // design, which is why layoutOp must not mark a scaled big integral as
+    // one (measured: integral.v1 ink 1.361/0.861em at advance 0.999em).
+    const variant = bigOpInk(.int, true);
+    try testing.expect(variant.asc > plain.asc);
+    try testing.expect(variant.desc > plain.desc);
 }

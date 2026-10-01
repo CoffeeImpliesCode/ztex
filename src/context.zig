@@ -28,9 +28,10 @@
 //! `FontMetrics` argument. The metric source is the closed `FontMetrics`
 //! union: context.zig builds the `.font` arm — a `FontHook` carrying the
 //! `*FontContext` (opaque to the layout module, which cannot import
-//! font.zig) plus the font-glyph lookup below — so `init` is one struct
-//! literal instead of hand-installed fn-pointer plumbing, and the concrete
-//! cast lives in exactly one place.
+//! font.zig), the font-glyph lookup below, and a borrowed pointer to the
+//! owned LM Math face's MATH constants — so `init` is one struct literal
+//! instead of hand-installed fn-pointer plumbing, and the concrete cast
+//! lives in exactly one place.
 
 const std = @import("std");
 const atom = @import("ztex.atom");
@@ -52,24 +53,35 @@ const root = @import("root.zig");
 /// (em × 10, so the layout's s(v, size_pt) scaling applies — LM is a 10pt
 /// design): width = the face's cached hmtx advance, height/depth = the
 /// face's OWN nominal hhea extents. The face comes from `faceForStyle`
-/// (`\text`/`\mathrm` → LM Roman regular, `\mathbf` → its bold, every other
-/// style → LM Math), the same mapping the rasterizer draws from.
-/// The italic correction stays the static row's value (LM Math's MATH table
-/// is not parsed yet), so sup/sub placement and the post-op tail keep
-/// today's values. Null when the face has no glyph for `cp` — glyph/glyphAt
-/// then fall back to the static tables, and finally to glyphEstimate.
+/// (`\text`/`\mathrm` → LM Roman regular, `\textit` → its italic,
+/// `\mathbf` → bold, `\textit{\textbf{}}` → bold italic, every other style
+/// → LM Math), the same mapping the rasterizer draws from, so a run can
+/// never measure from one face and be drawn from another.
+/// The italic correction and top accent attachment are the face's OWN MATH
+/// measurements — read once per (face, cp) by the font context, cached
+/// beside the advance and scaled with it, so sup/sub placement follows the
+/// glyph that is actually drawn (LM Math's table: 𝑓 carries a 0.09em
+/// italic correction, 𝑥 a 0.329em top accent). A face that records none —
+/// every LM Roman text face — keeps the static row's correction instead.
+/// Null when the face has no glyph for `cp`: glyph/glyphAt then fall back
+/// to the static tables, and finally to glyphEstimate.
 fn contextGlyph(ctx: *anyopaque, cp: u21, style: atom.CharStyle) ?metrics.Glyph {
     const f: *font.FontContext = @ptrCast(@alignCast(ctx));
     const face = f.faceForStyle(style);
     if (face.glyphIndex(cp) == null) return null;
     const m = f.metrics(face, cp, 10.0);
     var ic: f32 = 0;
-    if (metrics.staticGlyph(cp, style)) |e| ic = e.italic_correction;
+    if (m.italic_correction) |value| {
+        ic = value;
+    } else if (metrics.staticGlyph(cp, style)) |e| {
+        ic = e.italic_correction;
+    }
     return .{
         .width = m.width,
         .height = m.height,
         .depth = m.depth,
         .italic_correction = ic,
+        .top_accent_attachment = m.top_accent_attachment,
     };
 }
 
@@ -92,7 +104,17 @@ pub const Context = struct {
         return .{
             .gpa = gpa,
             .fonts = fonts,
-            .fm = .{ .font = .{ .ctx = fonts, .glyph = &contextGlyph } },
+            .fm = .{
+                .font = .{
+                    .ctx = fonts,
+                    .glyph = &contextGlyph,
+                    // Borrowed from the owned LM Math face and valid for the
+                    // life of `fonts`: layout reads its script sizes, axis
+                    // height, gaps and rule thicknesses from the font's own
+                    // MATH table instead of the static TeX parameters.
+                    .math_constants = fonts.math.mathConstants(),
+                },
+            },
         };
     }
 
@@ -187,4 +209,102 @@ test "context: unmapped codepoint falls back to the static table / estimate" {
     try testing.expect(g == null);
     const est = metrics.glyphEstimate(&ctx.fm, 0x1F600, .italic);
     try testing.expectApproxEqAbs(@as(f32, 5.0), est.width, 0.001);
+}
+
+/// A digest of the drawn coverage: two styles that rasterize the same face
+/// through the same code path produce the same digest.
+fn inkDigest(buffer: PixelBuffer) u64 {
+    var h: u64 = 1469598103934665603;
+    for (buffer.pixels) |px| h = (h ^ px) *% 1099511628211;
+    return h;
+}
+
+test "context: the hook reports the drawn glyph's own MATH measurements" {
+    var ctx = try Context.init(testing.allocator);
+    defer ctx.deinit();
+    // The hook borrows LM Math's decoded constants from the owned face: the
+    // very pointer layout reads its axis height and script sizes from, never
+    // a per-render copy that could outlive the face.
+    const mc = ctx.fonts.math.mathConstants() orelse return error.TestUnexpectedResult;
+    const borrowed: *const atom.MathConstants = ctx.fm.font.math_constants orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(mc == borrowed);
+    try testing.expectApproxEqAbs(@as(f32, 0.25), mc.axis_height, 0.001);
+    // 𝑓 (U+1D453) carries a 0.09em italic correction in LM Math's MATH
+    // table; the hook reports that, not the static cmmi10 row's value.
+    const f_cp: u21 = 0x1D453;
+    const f_gid = ctx.fonts.math.glyphIndex(f_cp) orelse
+        return error.TestUnexpectedResult;
+    const f_ic = ctx.fonts.math.mathValues(f_gid).italic_correction orelse
+        return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(@as(f32, 0.9), f_ic * 10.0, 0.0001);
+    const fg = metrics.glyph(&ctx.fm, f_cp, .italic) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(f_ic * 10.0, fg.italic_correction, 0.0001);
+    // 𝑥 (U+1D465) has NO italic correction but a 0.329em top accent: the
+    // absence stays absent and the accent is forwarded, both straight from
+    // the face's own table.
+    const x_cp: u21 = 0x1D465;
+    const x_gid = ctx.fonts.math.glyphIndex(x_cp) orelse
+        return error.TestUnexpectedResult;
+    const x_values = ctx.fonts.math.mathValues(x_gid);
+    try testing.expect(x_values.italic_correction == null);
+    const x_taa = x_values.top_accent_attachment orelse
+        return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(@as(f32, 3.29), x_taa * 10.0, 0.0001);
+    const xg = metrics.glyph(&ctx.fm, x_cp, .italic) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(x_taa * 10.0, xg.top_accent_attachment.?, 0.0001);
+    // A text face records no MATH data at all, so nothing is invented for it:
+    // the correction stays whatever the static path has for that style.
+    const italic_face = ctx.fonts.faceForStyle(.text_italic);
+    try testing.expect(italic_face.mathConstants() == null);
+    const tg = metrics.glyph(&ctx.fm, 'f', .text_italic) orelse
+        return error.TestUnexpectedResult;
+    const static_ic = if (metrics.staticGlyph('f', .text_italic)) |e|
+        e.italic_correction
+    else
+        0;
+    try testing.expectApproxEqAbs(static_ic, tg.italic_correction, 0.0001);
+    try testing.expect(tg.top_accent_attachment == null);
+}
+
+test "context: every text style measures and rasterizes one identical face" {
+    var ctx = try Context.init(testing.allocator);
+    defer ctx.deinit();
+    const cases = [_]struct { src: []const u8, style: atom.CharStyle }{
+        .{ .src = "\\mathrm{f}", .style = .roman },
+        .{ .src = "\\textit{f}", .style = .text_italic },
+        .{ .src = "\\mathbf{f}", .style = .bold },
+        .{ .src = "\\textit{\\textbf{f}}", .style = .bold_italic },
+    };
+    var ink: [cases.len]u64 = undefined;
+    for (cases, 0..) |c, i| {
+        // Measured from the face the rasterizer draws it from: that face's
+        // own advance for the same codepoint, at the 10pt base.
+        const face = ctx.fonts.faceForStyle(c.style);
+        const g = metrics.glyph(&ctx.fm, 'f', c.style) orelse
+            return error.TestUnexpectedResult;
+        try testing.expectApproxEqAbs(
+            ctx.fonts.metrics(face, 'f', 10.0).width,
+            g.width,
+            0.001,
+        );
+        var out = try ctx.render(c.src, .display, 20, null);
+        defer out.deinit();
+        try testing.expectEqual(@as(usize, 1), out.len());
+        try testing.expectEqual(c.style, out.items.items[0].text.style);
+        try testing.expectEqualStrings("f", out.items.items[0].text.bytes);
+        try testing.expectApproxEqAbs(g.width * 2.0, out.width, 0.001);
+        var buf = try ctx.renderPixels(c.src, .display, 20, .{ .format = .alpha8 }, null);
+        defer buf.deinit();
+        ink[i] = inkDigest(buf);
+    }
+    // Four distinct real faces draw four distinct 'f's: no style is a
+    // slanted or emboldened copy of another.
+    for (ink, 0..) |a, i| {
+        for (ink, 0..) |b, j| {
+            if (i < j) try testing.expect(a != b);
+        }
+    }
 }

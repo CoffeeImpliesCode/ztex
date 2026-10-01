@@ -4,6 +4,19 @@
 //! scanline coverage (`coverage.zig`) and exact rectangle/line fills.
 //! Supports customizable resolution (DPI), scale, foreground/background colors,
 //! and pixel formats (RGBA8888, Alpha8).
+//!
+//! FONT-BACKED ONLY. Unlike `ztex.render`, which measures from static tables,
+//! `rasterize` takes a `context.Context` and resolves every run through the
+//! face that style draws from (`FontContext.faceForStyle`), then decodes that
+//! face's outline — including the OpenType MATH size variant a display big
+//! operator, a stretchy `√` or a `\left`/`\right` fence needs. A face with no
+//! ladder for the request degrades to the unstretched base glyph rather than
+//! failing: the raster path has no per-glyph error channel, and discarding
+//! every other formula on the page because one font lacks a table would be
+//! worse than a short fence.
+//! The frame is the draw list's INK bounds (`DrawList.bounds()`), the same
+//! source svg.zig frames its viewBox from, so a bitmap and an SVG of one draw
+//! list cover the same content.
 
 const std = @import("std");
 const context = @import("context.zig");
@@ -16,32 +29,50 @@ const font = @import("font.zig");
 pub const Format = enum {
     /// 32-bit RGBA (R, G, B, A in byte order)
     rgba32,
-    /// 8-bit coverage mask (1 byte per pixel: 0 = transparent, 255 = fully inked)
+    /// 8-bit coverage mask (1 byte per pixel: 0 = transparent, 255 = fully
+    /// inked). A byte is the glyph coverage times the ALPHA byte of the ink
+    /// — `Options.fg`'s for ordinary ink, the scope color's inside `\color` /
+    /// `\textcolor` — so `fg`'s red, green and blue never reach a mask, and
+    /// the canvas is always transparent: `Options.bg` is ignored entirely.
     alpha8,
 };
 
 pub const Options = struct {
-    /// Target resolution in DPI (dots per inch). Standard web/screen is 96.0; print is 300.0+.
+    /// Target resolution in DPI (dots per inch). Standard web/screen is 96.0;
+    /// print is 300.0+. Must be a positive finite number, or
+    /// `error.InvalidArgument`: every pixel length `rasterize` derives is a
+    /// multiple of the pt → px scale, so a dpi that is not one has no frame.
     dpi: f32 = 96.0,
-    /// Additional uniform scale factor.
+    /// Additional uniform scale factor. Positive and finite, as `dpi`.
     scale: f32 = 1.0,
-    /// Padding around the content in pixels.
+    /// Padding around the content in pixels, on both axes. A margin whose
+    /// framed extent or row stride no 32-bit size can describe is
+    /// `error.OutputTooLarge`, refused before the pixel block is requested.
     padding: u32 = 0,
     /// Output pixel format.
     format: Format = .rgba32,
-    /// Foreground ink color (used when format is .rgba32). Default is black (#000000FF).
+    /// Ink color for primitives no color scope covers. Default is black
+    /// (#000000FF). A primitive an explicit color scope covers paints its own
+    /// color instead — the SCOPE decides, not the value, so an explicit black
+    /// or a transparent {0,0,0,0} still beats this one. In `.alpha8` this
+    /// field still matters, but only through its alpha byte, which is what
+    /// scales the mask (see `Format.alpha8`).
     fg: draw.Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
-    /// Background color (used when format is .rgba32; null = fully transparent).
+    /// Background color, filled before anything is drawn. `null` = fully
+    /// transparent. `.alpha8` ignores it: that canvas is always transparent.
     bg: ?draw.Color = null,
 };
 
-/// A rasterized pixel buffer owned by the caller.
+/// A rasterized pixel buffer owned by the caller. Never copy one by value:
+/// `deinit` frees `pixels` exactly once.
 pub const PixelBuffer = struct {
     gpa: std.mem.Allocator,
     /// Pixel payload. For rgba32, length is width * height * 4. For alpha8, width * height.
     pixels: []u8,
     width: u32,
     height: u32,
+    /// Bytes per row: width * 4 for rgba32, width for alpha8. Row `y` starts
+    /// at `pixels[y * stride]`, and rows run top-down.
     stride: u32,
     format: Format,
 
@@ -58,8 +89,13 @@ pub const PixelBuffer = struct {
                 const hdr = try std.fmt.bufPrint(&hdr_buf, "P6\n{d} {d}\n255\n", .{ self.width, self.height });
                 try file.writeStreamingAll(io, hdr);
                 var row_buf: [4096 * 3]u8 = undefined;
+                // usize offsets: the 32-bit frame bounds ONE row, so a
+                // payload past 4 GiB is still a legal buffer — and a row
+                // offset counted in u32 wraps halfway down one.
+                const stride: usize = self.stride;
                 for (0..self.height) |y| {
-                    const row = self.pixels[y * self.stride .. (y + 1) * self.stride];
+                    const at = @as(usize, y) * stride;
+                    const row = self.pixels[at .. at + stride];
                     var x: usize = 0;
                     while (x < self.width) {
                         const chunk: usize = @min(self.width - x, row_buf.len / 3);
@@ -150,29 +186,65 @@ const Origin = struct {
     y: f32,
 };
 
-/// Rasterize a draw list using the font context's embedded/cached fonts.
+/// Rasterize a draw list using the font context's embedded/cached faces, into a
+/// `PixelBuffer` the caller owns. The buffer is framed from `dl.bounds()` —
+/// the INK bounds, the same source svg.zig cuts its viewBox from — with
+/// `padding` added in PIXELS on both axes and one extra pixel column and row
+/// of bearing past the ink so edge antialiasing is never clamped at the last
+/// row. Pt → px is `(dpi / 72) * scale`.
+///
+/// `ctx` is required, not optional: every run and every primitive is painted
+/// with a face resolved from it (see the module header). It fails on
+/// `error.InvalidArgument` for a `dpi`/`scale` that is not a positive finite
+/// number, on `error.NonFiniteCoordinate` for a draw list with a non-finite
+/// ink extent — the same coordinate error the SVG serializer reports for it —
+/// and on `error.OutputTooLarge` for a frame, row stride or payload no 32-bit
+/// size can describe, each checked BEFORE the pixel block is requested, so a
+/// hostile option is refused rather than wrapped, clamped or trapped in an
+/// integer cast. Allocation failure and a malformed glyph outline in the face
+/// fail as before; a glyph that is merely missing is drawn as nothing.
 pub fn rasterize(
     gpa: std.mem.Allocator,
     ctx: *context.Context,
     dl: *const draw.DrawList,
     opts: Options,
-) !PixelBuffer {
+) (error{
+    OutOfMemory,
+    InvalidArgument,
+    OutputTooLarge,
+    NonFiniteCoordinate,
+} || font.FontError)!PixelBuffer {
+    // Every length below is a multiple of the pt → px scale, so a dpi or
+    // scale that is not a positive finite number — or a product that
+    // overflows to infinity — has no pixel size to compute, and rounding one
+    // out of it anyway traps in `@intFromFloat`.
+    if (!std.math.isFinite(opts.dpi) or opts.dpi <= 0) return error.InvalidArgument;
+    if (!std.math.isFinite(opts.scale) or opts.scale <= 0) return error.InvalidArgument;
     const pt_to_px = (opts.dpi / 72.0) * opts.scale;
+    if (!std.math.isFinite(pt_to_px) or pt_to_px <= 0) return error.InvalidArgument;
     const pad = opts.padding;
 
-    // Same basis as svg.zig's viewBox: the INK bounds, so a PNG and an SVG of
-    // one draw list cover the same content. `padding` and the 1px bearing
-    // below stay in pixels, as before.
+    // Same basis as svg.zig's viewBox: the INK bounds, so a bitmap and an SVG
+    // of one draw list cover the same content. `padding` and the 1px bearing
+    // below stay in pixels.
     const ink = dl.bounds();
+    // A draw list carrying a non-finite extent has no frame to cut: report
+    // the coordinate, as the SVG serializer does for the very same list,
+    // rather than turning a NaN width into a pixel count.
+    if (!std.math.isFinite(ink.width) or
+        !std.math.isFinite(ink.height) or
+        !std.math.isFinite(ink.depth)) return error.NonFiniteCoordinate;
     const origin = Origin{ .x = -ink.min_x, .y = -ink.min_y };
     const content_w = @max(1.0, ink.width * pt_to_px);
     const content_h = @max(1.0, (ink.height + ink.depth) * pt_to_px);
-    // Add 1px minimum bearing headroom to prevent subpixel antialiasing clamp at row 0
-    const width = @as(u32, @intFromFloat(@ceil(content_w))) + 2 * pad + 1;
-    const height = @as(u32, @intFromFloat(@ceil(content_h))) + 2 * pad + 1;
+    // The content plus the caller's margin on both axes plus the 1px bearing
+    // past the ink that keeps subpixel antialiasing off row 0.
+    const width = try framedExtent(content_w, pad);
+    const height = try framedExtent(content_h, pad);
     const bytes_per_pixel: u32 = if (opts.format == .rgba32) 4 else 1;
-    const stride = width * bytes_per_pixel;
-    const total_bytes = @as(usize, height) * @as(usize, stride);
+    const stride = std.math.mul(u32, width, bytes_per_pixel) catch return error.OutputTooLarge;
+    const total_bytes = std.math.mul(usize, @as(usize, height), @as(usize, stride)) catch
+        return error.OutputTooLarge;
 
     const pixels = try gpa.alloc(u8, total_bytes);
     errdefer gpa.free(pixels);
@@ -209,7 +281,8 @@ pub fn rasterize(
                     width,
                     height,
                     stride,
-                    opts,
+                    opts.format,
+                    inkOf(opts, t.color, t.color_override),
                     t,
                     pt_to_px,
                     pad_f,
@@ -221,15 +294,44 @@ pub fn rasterize(
                 const x1 = pad_f + (r.x + r.w + origin.x) * pt_to_px;
                 const y0 = pad_f + (r.y + origin.y) * pt_to_px;
                 const y1 = pad_f + (r.y + r.h + origin.y) * pt_to_px;
-                fillRect(pixels, width, height, stride, opts, x0, x1, y0, y1);
+                fillRect(
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    opts.format,
+                    inkOf(opts, r.color, r.color_override),
+                    x0,
+                    x1,
+                    y0,
+                    y1,
+                );
             },
             .line => |l| {
-                const half = 0.5 * l.width;
-                const x0 = pad_f + (@min(l.x0, l.x1) - half + origin.x) * pt_to_px;
-                const x1 = pad_f + (@max(l.x0, l.x1) + half + origin.x) * pt_to_px;
-                const y0 = pad_f + (@min(l.y0, l.y1) - half + origin.y) * pt_to_px;
-                const y1 = pad_f + (@max(l.y0, l.y1) + half + origin.y) * pt_to_px;
-                fillRect(pixels, width, height, stride, opts, x0, x1, y0, y1);
+                // A stroke, not a box: the band's half width scales with
+                // the resolution like every other length here, and the band
+                // follows the segment (see `strokeSegment`). Filling the
+                // endpoints' bounding box instead would paint the whole
+                // wedge between them for any diagonal — a hat's apex would
+                // come out as a filled triangle.
+                const half = 0.5 * l.width * pt_to_px;
+                const x0 = pad_f + (l.x0 + origin.x) * pt_to_px;
+                const x1 = pad_f + (l.x1 + origin.x) * pt_to_px;
+                const y0 = pad_f + (l.y0 + origin.y) * pt_to_px;
+                const y1 = pad_f + (l.y1 + origin.y) * pt_to_px;
+                strokeSegment(
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    opts.format,
+                    inkOf(opts, l.color, l.color_override),
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    half,
+                );
             },
         }
     }
@@ -242,6 +344,189 @@ pub fn rasterize(
         .stride = stride,
         .format = opts.format,
     };
+}
+
+/// The pixel extent of one framed axis: `content_px` rounded up, plus
+/// `2 * pad + 1` for the caller's margin and the one-pixel bearing past the
+/// ink. Every step is measured in the widest type and checked, because the
+/// frame is a 32-bit one: an extent it cannot describe is a reported
+/// `error.OutputTooLarge` instead of a wrapped, clamped or truncated picture
+/// smaller than the caller asked for.
+fn framedExtent(content_px: f32, pad: u32) error{OutputTooLarge}!u32 {
+    // f64, because f32 cannot represent 2^32 - 1: compared in f32 that
+    // bound rounds UP to 2^32, and the cast below would trap on it.
+    const ceiled: f64 = @ceil(@as(f64, content_px));
+    if (!std.math.isFinite(ceiled) or
+        ceiled > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return error.OutputTooLarge;
+    const content_u32: u32 = @intFromFloat(ceiled);
+    const margin = std.math.mul(u32, pad, 2) catch return error.OutputTooLarge;
+    const framed = std.math.add(u32, content_u32, margin) catch return error.OutputTooLarge;
+    return std.math.add(u32, framed, 1) catch return error.OutputTooLarge;
+}
+
+// ── scoped colors ─────────────────────────
+
+/// The RGBA quadruple at (x, y), y counted from the top as the rgba32
+/// payload is stored.
+fn rgbaAt(buf: PixelBuffer, x: usize, y: usize) [4]u8 {
+    const i = y * @as(usize, buf.stride) + x * 4;
+    return .{ buf.pixels[i], buf.pixels[i + 1], buf.pixels[i + 2], buf.pixels[i + 3] };
+}
+
+/// One 4 x 4 pt rule whose ink starts at the origin, painted in `c`. At
+/// 72 dpi that is pixels (0, 0)…(3, 3) exactly; pixel 4 is the 1px bearing
+/// `rasterize` leaves past the ink, so "painted" and "left alone" are
+/// distinguishable without any coverage guessing.
+fn ruleList(gpa: std.mem.Allocator, c: draw.Color, color_override: bool) !draw.DrawList {
+    var dl = draw.DrawList.init(gpa);
+    errdefer dl.deinit();
+    try dl.add(.{ .rect = .{
+        .x = 0,
+        .y = 0,
+        .w = 4,
+        .h = 4,
+        .color = c,
+        .color_override = color_override,
+        .src_start = 0,
+        .src_end = 1,
+    } });
+    dl.accInk(0, 0, 4, 4);
+    return dl;
+}
+
+test "rasterize: an explicit black scope beats a white host foreground" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    // Both draw lists carry the same black primitive; only the scope flag
+    // differs. Deciding by VALUE ("this color is black, so use the host
+    // foreground instead") would paint the scoped rule white.
+    var scoped = try ruleList(testing.allocator, .{ .r = 0, .g = 0, .b = 0 }, true);
+    defer scoped.deinit();
+    var plain = try ruleList(testing.allocator, .{ .r = 0, .g = 0, .b = 0 }, false);
+    defer plain.deinit();
+    const opts: Options = .{
+        .dpi = 72,
+        .format = .rgba32,
+        .fg = .{ .r = 255, .g = 255, .b = 255, .a = 255 },
+    };
+    var buf = try rasterize(testing.allocator, &ctx, &scoped, opts);
+    defer buf.deinit();
+    var host = try rasterize(testing.allocator, &ctx, &plain, opts);
+    defer host.deinit();
+
+    try testing.expectEqual([4]u8{ 0, 0, 0, 255 }, rgbaAt(buf, 1, 1));
+    try testing.expectEqual([4]u8{ 255, 255, 255, 255 }, rgbaAt(host, 1, 1));
+    // The untouched bearing proves both really painted where they claim:
+    // alpha 255 inside the rule, alpha 0 outside it.
+    try testing.expectEqual([4]u8{ 0, 0, 0, 0 }, rgbaAt(buf, 4, 4));
+    try testing.expectEqual([4]u8{ 0, 0, 0, 0 }, rgbaAt(host, 4, 4));
+}
+
+test "rasterize: a transparent scope paints nothing, in either pixel format" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    // {0,0,0,0} means "draw nothing", not "no color given": substituting
+    // the host foreground here would put ink where the formula asked for
+    // none.
+    var dl = try ruleList(testing.allocator, .{ .r = 0, .g = 0, .b = 0, .a = 0 }, true);
+    defer dl.deinit();
+    var rgba = try rasterize(testing.allocator, &ctx, &dl, .{
+        .dpi = 72,
+        .format = .rgba32,
+        .fg = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+        .bg = .{ .r = 255, .g = 255, .b = 255, .a = 255 },
+    });
+    defer rgba.deinit();
+    for (0..@as(usize, rgba.height)) |y| {
+        for (0..@as(usize, rgba.width)) |x| {
+            try testing.expectEqual([4]u8{ 255, 255, 255, 255 }, rgbaAt(rgba, x, y));
+        }
+    }
+    var mask = try rasterize(testing.allocator, &ctx, &dl, .{ .dpi = 72, .format = .alpha8 });
+    defer mask.deinit();
+    try testing.expectEqual(@as(usize, 0), inkedPixels(mask));
+
+    // The same scope over a glyph: the very same glyph drawn with no scope
+    // puts down ink, the scoped one puts down none.
+    var ghost = item("x", .italic);
+    ghost.color = .{ .r = 0, .g = 0, .b = 0, .a = 0 };
+    ghost.color_override = true;
+    var painted = try rasterOne(testing.allocator, &ctx, item("x", .italic));
+    defer painted.deinit();
+    var faded = try rasterOne(testing.allocator, &ctx, ghost);
+    defer faded.deinit();
+    try testing.expect(inkedPixels(painted) > 0);
+    try testing.expectEqual(@as(usize, 0), inkedPixels(faded));
+}
+
+test "rasterize: alpha8 and rgba32 agree on a scoped alpha" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    // Half-transparent ink: the mask strength and the stored alpha must be
+    // the same number, or a PGM and a PPM of one colored formula disagree
+    // about how much of it there is.
+    const half: draw.Color = .{ .r = 12, .g = 34, .b = 56, .a = 128 };
+    var dl = try ruleList(testing.allocator, half, true);
+    defer dl.deinit();
+    var mask = try rasterize(testing.allocator, &ctx, &dl, .{ .dpi = 72, .format = .alpha8 });
+    defer mask.deinit();
+    var rgba = try rasterize(testing.allocator, &ctx, &dl, .{ .dpi = 72, .format = .rgba32 });
+    defer rgba.deinit();
+    const strength = mask.pixels[0];
+    try testing.expectEqual(@as(u8, 128), strength);
+    try testing.expectEqual([4]u8{ 12, 34, 56, strength }, rgbaAt(rgba, 1, 1));
+    // ... and the bearing is still empty in both.
+    try testing.expectEqual(@as(u8, 0), mask.pixels[mask.pixels.len - 1]);
+    try testing.expectEqual([4]u8{ 0, 0, 0, 0 }, rgbaAt(rgba, 4, 4));
+}
+
+// A wide accent's apex and a tilde's wave are DIAGONAL segments, and a
+// diagonal has to paint as a band of its stroke width, not as the box
+// between its endpoints: the box of a 45° apex is a filled triangle, which
+// is the difference between a hat and a wedge. The endpoints here are the
+// shape's own corners (the ink runs the whole 0…10 square), so the frame is
+// exactly what was laid out and nothing is clipped.
+test "rasterize: a diagonal line paints its stroke band, not its bounding box" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    var dl = draw.DrawList.init(testing.allocator);
+    defer dl.deinit();
+    try dl.add(.{ .line = .{
+        .x0 = 1,
+        .y0 = 1,
+        .x1 = 9,
+        .y1 = 9,
+        .color = .{ .r = 0, .g = 0, .b = 0 },
+        .color_override = true,
+        .width = 2,
+        .src_start = 0,
+        .src_end = 6,
+    } });
+    dl.accInk(0, 0, 10, 10);
+    var buf = try rasterize(testing.allocator, &ctx, &dl, .{ .dpi = 72, .format = .alpha8 });
+    defer buf.deinit();
+    const at = struct {
+        fn f(b: PixelBuffer, x: u32, y: u32) u8 {
+            return b.pixels[y * b.stride + x];
+        }
+    }.f;
+    // The centre of the 45° line: fully covered.
+    try testing.expectEqual(@as(u8, 255), at(buf, 5, 5));
+    // Inside the endpoints' bounding box, but ~5.7px off the line: empty.
+    // A box fill would have inked it.
+    try testing.expectEqual(@as(u8, 0), at(buf, 1, 9));
+    try testing.expectEqual(@as(u8, 0), at(buf, 9, 1));
+    // Butt caps, as svg.zig's <line> declares by default (no cap attribute):
+    // the pixel past the endpoint's plane is outside the band, so nothing is
+    // painted there and the ink stops exactly where the box extents say.
+    try testing.expectEqual(@as(u8, 0), at(buf, 9, 9));
+    // Just inside the endpoint, on the line itself: covered.
+    try testing.expect(at(buf, 8, 8) > 0);
+    // A band, not a wedge: well under the 8 x 8 bounding box, and thick
+    // enough to be a stroke rather than a hairline.
+    const inked = inkedPixels(buf);
+    try testing.expect(inked > 8);
+    try testing.expect(inked < 8 * 8);
 }
 
 test "rasterize: the buffer is sized from the ink bounds, not the box bounds" {
@@ -282,6 +567,168 @@ test "rasterize: the buffer is sized from the ink bounds, not the box bounds" {
     try testing.expectEqual(@as(usize, 43 * 10), inked);
 }
 
+// The margin is a PIXEL count, and it moves the content by exactly that
+// many pixels. This also pins the one-pixel bearing: the ink starts at
+// `pad`, not at `pad + 1`.
+test "rasterize: padding shifts the content by exactly pad pixels" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    var dl = try ruleList(testing.allocator, .{ .r = 0, .g = 0, .b = 0 }, false);
+    defer dl.deinit();
+    const pad: u32 = 3;
+    var buf = try rasterize(testing.allocator, &ctx, &dl, .{ .dpi = 72, .padding = pad });
+    defer buf.deinit();
+    // 4pt of ink at 1px per pt, the margin on both sides of it, and the
+    // one-pixel bearing past that.
+    try testing.expectEqual(@as(u32, 11), buf.width);
+    try testing.expectEqual(@as(u32, 11), buf.height);
+    try testing.expectEqual(@as(u32, 44), buf.stride);
+    try testing.expectEqual([4]u8{ 0, 0, 0, 255 }, rgbaAt(buf, 3, 3));
+    try testing.expectEqual([4]u8{ 0, 0, 0, 0 }, rgbaAt(buf, 2, 2));
+    try testing.expectEqual([4]u8{ 0, 0, 0, 0 }, rgbaAt(buf, 7, 7));
+}
+
+// A margin moves the picture by exactly that many pixels, and no painted pixel
+// may fall outside that move. `f` at 60pt/720dpi is the case that broke it: the
+// ink the rasterizer paints reached a hair above the box the frame is cut from
+// (the frame puts its one-pixel bearing on the far side only), so at zero margin
+// that ink was clipped and at a 12px margin the very same ink turned up INSIDE
+// the margin ring — a margined PGM that was not the unmargined one shifted by
+// its margin, which is exactly what a caller comparing the two sees.
+test "rasterize: a margin shifts the picture and paints nothing outside it" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    var dl = try ctx.render("f", .display, 60, null);
+    defer dl.deinit();
+
+    var zero = try rasterize(testing.allocator, &ctx, &dl, .{ .dpi = 720, .format = .alpha8 });
+    defer zero.deinit();
+    const pad: u32 = 12;
+    var margined = try rasterize(testing.allocator, &ctx, &dl, .{
+        .dpi = 720,
+        .padding = pad,
+        .format = .alpha8,
+    });
+    defer margined.deinit();
+    const core_h: usize = zero.height;
+    const core_w: usize = zero.width;
+    const margin: usize = pad;
+
+    // The margin grew the frame by itself on both axes, nothing else did.
+    try testing.expectEqual(core_w + 2 * margin, @as(usize, margined.width));
+    try testing.expectEqual(core_h + 2 * margin, @as(usize, margined.height));
+
+    // Liveness: the ink really does reach the frame's first row, the edge a
+    // frame cut from the declared box can lose — otherwise this proves nothing.
+    var top_ink: usize = 0;
+    for (0..core_w) |x| top_ink += @intFromBool(zero.pixels[x] != 0);
+    try testing.expect(top_ink > 0);
+
+    // No ink outside the shift the margin makes...
+    var outside: usize = 0;
+    // ...and inside it the same picture: the frame is a pixel or more taller
+    // with a margin, so a coverage that rounds differently may differ by one
+    // level of gray, but no pixel may move further than that.
+    var worst: i32 = 0;
+    for (0..@as(usize, margined.height)) |y| {
+        for (0..@as(usize, margined.width)) |x| {
+            const value = margined.pixels[y * @as(usize, margined.stride) + x];
+            const in_core = y >= margin and y < margin + core_h and
+                x >= margin and x < margin + core_w;
+            if (!in_core) {
+                outside += @intFromBool(value != 0);
+                continue;
+            }
+            const core = zero.pixels[(y - margin) * @as(usize, zero.stride) + (x - margin)];
+            const delta = @as(i32, value) - @as(i32, core);
+            worst = @max(worst, if (delta < 0) -delta else delta);
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), outside);
+    try testing.expect(worst <= 1);
+}
+
+// Every length in the frame is a multiple of the pt → px scale, so a dpi
+// or scale that is not a positive finite number leaves nothing to round a
+// pixel count from: the product is NaN or infinite, and `@intFromFloat`
+// TRAPS on both, aborting the process whatever the caller catches.
+// `failing_allocator` answers `error.OutOfMemory` to the first byte, so an
+// `error.InvalidArgument` here also proves the frame was refused before
+// anything was allocated.
+test "rasterize: a resolution that is not a positive finite number is refused" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    var dl = try ruleList(testing.allocator, .{ .r = 0, .g = 0, .b = 0 }, false);
+    defer dl.deinit();
+    for ([_]f32{ 0, -96, std.math.nan(f32), std.math.inf(f32), -std.math.inf(f32) }) |dpi| {
+        try testing.expectError(
+            error.InvalidArgument,
+            rasterize(testing.failing_allocator, &ctx, &dl, .{ .dpi = dpi }),
+        );
+    }
+    for ([_]f32{ 0, -1, std.math.nan(f32), std.math.inf(f32) }) |scale| {
+        try testing.expectError(
+            error.InvalidArgument,
+            rasterize(testing.failing_allocator, &ctx, &dl, .{ .dpi = 96, .scale = scale }),
+        );
+    }
+    // A dpi and a scale that are each fine, whose PRODUCT is not: the scale
+    // alone overflows (dpi / 72) * scale to infinity.
+    try testing.expectError(
+        error.InvalidArgument,
+        rasterize(testing.failing_allocator, &ctx, &dl, .{
+            .dpi = 96,
+            .scale = std.math.floatMax(f32),
+        }),
+    );
+}
+
+// The frame is a 32-bit one, and a hostile margin or an enormous resolution
+// used to walk straight past that: `2 * pad` overflowed u32, a content size
+// past 2^32 - 1 trapped in the float cast, and a row stride wider than a
+// u32 wrapped. Each is refused BEFORE the pixel block is asked for — the
+// failing allocator would answer `error.OutOfMemory` to the first byte, so
+// an `error.OutputTooLarge` here means no allocation was attempted at all.
+test "rasterize: a frame no 32-bit size can describe is refused before allocating" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    var dl = try ruleList(testing.allocator, .{ .r = 0, .g = 0, .b = 0 }, false);
+    defer dl.deinit();
+    // 2 * 2^31 is one past the largest u32: the margin alone does not fit.
+    try testing.expectError(
+        error.OutputTooLarge,
+        rasterize(testing.failing_allocator, &ctx, &dl, .{ .dpi = 96, .padding = 2147483648 }),
+    );
+    // 2 * 2^30 fits, and so does the framed width — but four bytes per pixel
+    // of it do not.
+    try testing.expectError(
+        error.OutputTooLarge,
+        rasterize(testing.failing_allocator, &ctx, &dl, .{ .dpi = 96, .padding = 1073741824 }),
+    );
+    // A resolution that is finite and positive and still frames a picture
+    // no 32-bit width can hold: 1e30 dpi is 1.4e28 px per point.
+    try testing.expectError(
+        error.OutputTooLarge,
+        rasterize(testing.failing_allocator, &ctx, &dl, .{ .dpi = 1e30 }),
+    );
+}
+
+// The frame is cut from the ink bounds, so a draw list carrying a non-finite
+// extent has none to cut — and its NaN width reached `@intFromFloat` and
+// trapped. The rasterizer now answers the coordinate error the SVG
+// serializer already reports for the very same list.
+test "rasterize: a non-finite ink extent is refused as a coordinate" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    var dl = draw.DrawList.init(testing.allocator);
+    defer dl.deinit();
+    dl.accInk(0, -7, std.math.nan(f32), 2);
+    try testing.expectError(
+        error.NonFiniteCoordinate,
+        rasterize(testing.failing_allocator, &ctx, &dl, .{ .dpi = 96 }),
+    );
+}
+
 test "rasterize: \\mathbf draws the bold face, not the regular one" {
     var ctx = try context.Context.init(testing.allocator);
     defer ctx.deinit();
@@ -290,7 +737,7 @@ test "rasterize: \\mathbf draws the bold face, not the regular one" {
     // \text{x} rasterized identically — the SVG said bold, the bitmap did
     // not. Compare the two at the same size: a real bold face puts down
     // noticeably more ink for the same glyph.
-    const inkOf = struct {
+    const countInk = struct {
         fn f(
             c: *context.Context,
             src: []const u8,
@@ -306,8 +753,8 @@ test "rasterize: \\mathbf draws the bold face, not the regular one" {
         }
     }.f;
 
-    const bold = try inkOf(&ctx, "\\mathbf{x}");
-    const roman = try inkOf(&ctx, "\\text{x}");
+    const bold = try countInk(&ctx, "\\mathbf{x}");
+    const roman = try countInk(&ctx, "\\text{x}");
     try testing.expect(bold > 0);
     try testing.expect(roman > 0);
     // Equal ink is the bug: it means \mathbf drew the regular glyph.
@@ -715,6 +1162,153 @@ fn resolveGlyph(face: *const font.FontFace, cp: u21, t: *const draw.Text) ?u32 {
     return face.glyphIndex(cp);
 }
 
+/// The ink a primitive paints: its own color when an explicit color scope
+/// covers it, else the host foreground. The FLAG decides, not the value, so
+/// an explicit black or a transparent {0,0,0,0} beats a light host
+/// foreground instead of being taken for "no color given".
+fn inkOf(opts: Options, color: draw.Color, color_override: bool) draw.Color {
+    return if (color_override) color else opts.fg;
+}
+
+/// Composite one covered pixel of `ink` at `coverage_val` (0…1) over the
+/// buffer. Both formats honour the ink's alpha identically: rgba32 scales
+/// the source alpha, alpha8 scales coverage, so a half-transparent rule
+/// leaves a half-strength mask and a fully transparent one leaves nothing.
+inline fn blendPixel(
+    pixels: []u8,
+    row: usize,
+    col: usize,
+    stride: u32,
+    format: Format,
+    ink: draw.Color,
+    coverage_val: f32,
+) void {
+    const cov = @min(1.0, @max(0.0, coverage_val)) * @as(f32, @floatFromInt(ink.a)) / 255.0;
+    switch (format) {
+        .rgba32 => {
+            const idx = row * stride + col * 4;
+            // coverage already carries the ink alpha (see `cov`).
+            const src_r: f32 = @floatFromInt(ink.r);
+            const src_g: f32 = @floatFromInt(ink.g);
+            const src_b: f32 = @floatFromInt(ink.b);
+
+            const dst_r: f32 = @floatFromInt(pixels[idx]);
+            const dst_g: f32 = @floatFromInt(pixels[idx + 1]);
+            const dst_b: f32 = @floatFromInt(pixels[idx + 2]);
+            const dst_a: f32 = @as(f32, @floatFromInt(pixels[idx + 3])) / 255.0;
+
+            const out_a = cov + dst_a * (1.0 - cov);
+            if (out_a > 0.0) {
+                const out_r = (src_r * cov + dst_r * dst_a * (1.0 - cov)) / out_a;
+                const out_g = (src_g * cov + dst_g * dst_a * (1.0 - cov)) / out_a;
+                const out_b = (src_b * cov + dst_b * dst_a * (1.0 - cov)) / out_a;
+                pixels[idx] = @intFromFloat(@round(out_r));
+                pixels[idx + 1] = @intFromFloat(@round(out_g));
+                pixels[idx + 2] = @intFromFloat(@round(out_b));
+                pixels[idx + 3] = @intFromFloat(@round(out_a * 255.0));
+            }
+        },
+        .alpha8 => {
+            const idx = row * stride + col;
+            const cur_a: f32 = @as(f32, @floatFromInt(pixels[idx])) / 255.0;
+            const new_a = cur_a + cov * (1.0 - cur_a);
+            pixels[idx] = @intFromFloat(@round(new_a * 255.0));
+        },
+    }
+}
+
+/// Fill the butt-capped band of half-width `half` (pixels) along the segment
+/// (x0f,y0f)–(x1f,y1f). Coverage is the pixel centre's distance to the
+/// segment — 1 inside the band, a linear ramp across the outer half
+/// pixel, 0 outside — so a diagonal stroke is a thin diagonal band at a
+/// constant width, not the bounding box of its endpoints (which for a
+/// diagonal is the whole wedge between them). The caps match svg.zig's
+/// <line>, which declares none: the band stops at each endpoint's plane.
+fn strokeSegment(
+    pixels: []u8,
+    width: u32,
+    height: u32,
+    stride: u32,
+    format: Format,
+    ink: draw.Color,
+    x0f: f32,
+    y0f: f32,
+    x1f: f32,
+    y1f: f32,
+    half: f32,
+) void {
+    if (ink.a == 0) return;
+    // One pixel of slack past the band, so the antialiased rim is never
+    // clipped at the loop bounds.
+    const slack: f32 = 1;
+    const limit_x: i64 = @intCast(width);
+    const limit_y: i64 = @intCast(height);
+    const c0 = @max(@as(i64, @intFromFloat(@floor(@min(x0f, x1f) - half - slack))), 0);
+    const c1 = @min(@as(i64, @intFromFloat(@ceil(@max(x0f, x1f) + half + slack))), limit_x);
+    const r0 = @max(@as(i64, @intFromFloat(@floor(@min(y0f, y1f) - half - slack))), 0);
+    const r1 = @min(@as(i64, @intFromFloat(@ceil(@max(y0f, y1f) + half + slack))), limit_y);
+    if (c1 <= c0 or r1 <= r0) return;
+
+    const dx = x1f - x0f;
+    const dy = y1f - y0f;
+    const len_sq = dx * dx + dy * dy;
+    // A zero-length segment draws nothing, as a butt-capped line does.
+    if (len_sq <= 0) return;
+    const reach = half + 0.5;
+    var r = r0;
+    while (r < r1) : (r += 1) {
+        const py = @as(f32, @floatFromInt(r)) + 0.5;
+        var c = c0;
+        while (c < c1) : (c += 1) {
+            const px = @as(f32, @floatFromInt(c)) + 0.5;
+            // Where the pixel's perpendicular meets the segment.
+            const t = ((px - x0f) * dx + (py - y0f) * dy) / len_sq;
+            // BUTT caps — what svg.zig's <line> declares by default, with no
+            // cap attribute: the band stops in the plane through each
+            // endpoint instead of rounding past it. Layout sized the box's
+            // h/d from exactly this extent, so a round cap would paint
+            // outside the ink bbox (clipped at zero padding) and the two back
+            // ends would disagree on where the ink ends.
+            if (t < 0 or t > 1) continue;
+            const ex = px - (x0f + t * dx);
+            const ey = py - (y0f + t * dy);
+            const cov = reach - @sqrt(ex * ex + ey * ey);
+            if (cov <= 0) continue;
+            blendPixel(pixels, @intCast(r), @intCast(c), stride, format, ink, cov);
+        }
+    }
+}
+
+/// Fill the half-open pixel box [x0f, x1f) x [y0f, y1f) with `ink`. `row`
+/// counts from the top of the buffer, as the rgba32 payload is stored.
+fn fillRect(
+    pixels: []u8,
+    width: u32,
+    height: u32,
+    stride: u32,
+    format: Format,
+    ink: draw.Color,
+    x0f: f32,
+    x1f: f32,
+    y0f: f32,
+    y1f: f32,
+) void {
+    if (ink.a == 0) return;
+    const c0: i64 = @max(@as(i64, @intFromFloat(@floor(x0f))), 0);
+    const c1: i64 = @min(@as(i64, @intFromFloat(@ceil(x1f))), @as(i64, @intCast(width)));
+    const r0: i64 = @max(@as(i64, @intFromFloat(@floor(y0f))), 0);
+    const r1: i64 = @min(@as(i64, @intFromFloat(@ceil(y1f))), @as(i64, @intCast(height)));
+    if (c1 <= c0 or r1 <= r0) return;
+
+    var r = r0;
+    while (r < r1) : (r += 1) {
+        var c = c0;
+        while (c < c1) : (c += 1) {
+            blendPixel(pixels, @intCast(r), @intCast(c), stride, format, ink, 1.0);
+        }
+    }
+}
+
 fn drawGlyph(
     gpa: std.mem.Allocator,
     ctx: *context.Context,
@@ -722,12 +1316,14 @@ fn drawGlyph(
     width: u32,
     height: u32,
     stride: u32,
-    opts: Options,
+    format: Format,
+    ink: draw.Color,
     t: draw.Text,
     pt_to_px: f32,
     pad_f: f32,
     origin: Origin,
 ) !void {
+    if (ink.a == 0) return;
     const cp: u21 = blk: {
         if (t.bytes.len == 0) return;
         if (t.bytes.len == 1) break :blk t.bytes[0];
@@ -831,75 +1427,7 @@ fn drawGlyph(
         for (row_buf, 0..) |cov, k| {
             if (cov <= 0.0) continue;
             const x = @as(usize, @intCast(cx0)) + k;
-            blendPixel(pixels, row, x, stride, opts, cov);
+            blendPixel(pixels, row, x, stride, format, ink, cov);
         }
-    }
-}
-
-fn fillRect(
-    pixels: []u8,
-    width: u32,
-    height: u32,
-    stride: u32,
-    opts: Options,
-    x0f: f32,
-    x1f: f32,
-    y0f: f32,
-    y1f: f32,
-) void {
-    const c0: i64 = @max(@as(i64, @intFromFloat(@floor(x0f))), 0);
-    const c1: i64 = @min(@as(i64, @intFromFloat(@ceil(x1f))), @as(i64, @intCast(width)));
-    const r0: i64 = @max(@as(i64, @intFromFloat(@floor(y0f))), 0);
-    const r1: i64 = @min(@as(i64, @intFromFloat(@ceil(y1f))), @as(i64, @intCast(height)));
-    if (c1 <= c0 or r1 <= r0) return;
-
-    var r = r0;
-    while (r < r1) : (r += 1) {
-        var c = c0;
-        while (c < c1) : (c += 1) {
-            blendPixel(pixels, @intCast(r), @intCast(c), stride, opts, 1.0);
-        }
-    }
-}
-
-inline fn blendPixel(
-    pixels: []u8,
-    row: usize,
-    col: usize,
-    stride: u32,
-    opts: Options,
-    coverage_val: f32,
-) void {
-    const cov = @min(1.0, @max(0.0, coverage_val));
-    switch (opts.format) {
-        .rgba32 => {
-            const idx = row * stride + col * 4;
-            const fg_a: f32 = @as(f32, @floatFromInt(opts.fg.a)) / 255.0 * cov;
-            const src_r: f32 = @floatFromInt(opts.fg.r);
-            const src_g: f32 = @floatFromInt(opts.fg.g);
-            const src_b: f32 = @floatFromInt(opts.fg.b);
-
-            const dst_r: f32 = @floatFromInt(pixels[idx]);
-            const dst_g: f32 = @floatFromInt(pixels[idx + 1]);
-            const dst_b: f32 = @floatFromInt(pixels[idx + 2]);
-            const dst_a: f32 = @as(f32, @floatFromInt(pixels[idx + 3])) / 255.0;
-
-            const out_a = fg_a + dst_a * (1.0 - fg_a);
-            if (out_a > 0.0) {
-                const out_r = (src_r * fg_a + dst_r * dst_a * (1.0 - fg_a)) / out_a;
-                const out_g = (src_g * fg_a + dst_g * dst_a * (1.0 - fg_a)) / out_a;
-                const out_b = (src_b * fg_a + dst_b * dst_a * (1.0 - fg_a)) / out_a;
-                pixels[idx] = @intFromFloat(@round(out_r));
-                pixels[idx + 1] = @intFromFloat(@round(out_g));
-                pixels[idx + 2] = @intFromFloat(@round(out_b));
-                pixels[idx + 3] = @intFromFloat(@round(out_a * 255.0));
-            }
-        },
-        .alpha8 => {
-            const idx = row * stride + col;
-            const cur_a: f32 = @as(f32, @floatFromInt(pixels[idx])) / 255.0;
-            const new_a = cur_a + cov * (1.0 - cur_a);
-            pixels[idx] = @intFromFloat(@round(new_a * 255.0));
-        },
     }
 }

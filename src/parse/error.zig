@@ -32,6 +32,7 @@ pub const Kind = enum {
     child_count_overflow,
     source_too_large,
     nesting_too_deep,
+    misplaced_hline,
 };
 
 /// Parse-error context; the out-param is untouched when `parse` succeeds.
@@ -54,6 +55,7 @@ pub const Info = struct {
             .missing_script => "Missing script",
             .unclosed_group => "Unclosed group",
             .unexpected_middle => "Unexpected \\middle",
+            .misplaced_hline => "Misplaced \\hline",
             .unknown_environment => "Unknown environment",
             .mismatched_end => "Mismatched \\end",
             .unclosed_environment => "Unclosed environment",

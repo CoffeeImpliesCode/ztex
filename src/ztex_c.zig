@@ -5,21 +5,28 @@
 //! `ztex.svg.render` and `ztex.raster.rasterize` (reached through
 //! `Context.renderPixels`). What this module owns is the C-shaped contract:
 //!
-//! - No Zig error union crosses the boundary. Every entry point returns
+//! - No Zig error union crosses the boundary. Four entry points return
 //!   `c_int` — a `Status` — and the text of the last failure on a context
-//!   is readable with `ztex_last_error`.
-//! - Nothing is handed to C as a heap pointer. Rendered output is copied
-//!   into the caller's buffer, and the only heap the library holds is the
-//!   render context, taken from the CALLER's allocator and released by
-//!   `ztex_context_destroy` through that same allocator.
-//! - Strings cross as NUL-terminated UTF-8; the LaTeX source also carries
-//!   an explicit byte length, and that length is what the pipeline renders
-//!   (`strlen` is never called on the source).
+//!   is readable with `ztex_last_error`. The other two return what they
+//!   describe instead: `ztex_context_destroy` is `void`, and
+//!   `ztex_status_name` a pointer to a static, NUL-terminated name.
+//! - No rendered output reaches C as a heap pointer: it is copied into the
+//!   caller's buffer, which the caller frees. Everything the library DOES
+//!   allocate — the context block, the faces and glyph cache that block
+//!   owns, and the parse/layout/SVG/pixel working set of each call — comes
+//!   from the CALLER's allocator. The per-call set is released before the
+//!   call returns; `ztex_context_destroy` hands the rest back through the
+//!   same `dealloc`.
+//! - Only the font-family options and the strings ztex hands back are
+//!   NUL-terminated. The LaTeX source is COUNTED UTF-8: the pipeline
+//!   renders exactly `latex_length` bytes and never reads the byte after
+//!   them, so the C `const char *` needs no terminator and `strlen` is
+//!   never called on it. A byte that is not valid UTF-8 fails the parse.
 //!
 //! Lengths and capacities are 32-bit so include/ztex.h needs no
 //! <stdint.h> (C89 has none) and the ABI is identical on every target; a
-//! render needing more than 4 GiB fails with `.output_too_large` instead
-//! of truncating.
+//! payload above `max_payload` fails with `.output_too_large` instead of
+//! truncating, and leaves `out_length` untouched.
 
 const std = @import("std");
 const ztex = @import("ztex");
@@ -28,36 +35,52 @@ const Style = ztex.layout.Style;
 const Color = ztex.draw.Color;
 const Format = ztex.raster.Format;
 
-/// Failure codes returned by every entry point: C-shaped, an integer rather
-/// than an error union. `ztex_status_name` names one.
+/// Failure codes the int-returning entry points report: C-shaped, an
+/// integer rather than an error union. `ztex_status_name` names one.
 pub const Status = enum(c_int) {
     ok = 0,
-    /// A null handle/buffer/out-parameter, an unknown style or pixel-format
-    /// code, or a size that is not a positive finite number.
+    /// A null context or out-parameter — a null OUTPUT buffer is the size
+    /// query, not this — an unknown style or pixel-format code, a
+    /// size_pt/dpi/scale that is not positive and finite, a negative SVG
+    /// padding, a null `latex` with a non-zero `latex_length`, or a
+    /// `ztex_last_error` call with no buffer or no room for one.
     invalid_argument = 1,
     /// The LaTeX front end rejected the formula; `ztex_last_error` names the
     /// kind and the position.
     parse_error = 2,
     /// The layout stage rejected the atom tree.
     invalid_ast = 3,
+    /// The caller's `alloc` answered null, or a request did not fit the
+    /// 32-bit length ABI.
     out_of_memory = 4,
-    /// A draw-list coordinate was not finite, so no SVG can be written.
+    /// A draw-list coordinate was not finite — the rasterizer's ink extents
+    /// included — so no SVG or bitmap can be written.
     non_finite_coordinate = 5,
     /// The caller's buffer cannot hold the whole payload. Nothing was
-    /// written and the out-parameter carries the size needed.
+    /// written into it — not even a NUL — and `out_length` carries the
+    /// size needed.
     buffer_too_small = 6,
-    /// The output does not fit the 32-bit length ABI.
+    /// The output has no 32-bit size: a raster frame whose width, height or
+    /// row stride cannot be expressed, or a payload above `max_payload`
+    /// bytes. Checked before the pixel block is requested, so the caller's
+    /// `alloc` is never asked for it.
     output_too_large = 7,
     /// A font could not be read while rasterizing a glyph outline.
     font_error = 8,
 };
 
 /// "No background": a zero alpha in the packed `0xRRGGBBAA` colors below.
-/// Zero, so an all-zero options struct is the default rendering.
+/// Zero, so a zeroed `SvgOptions` background asks for the default rendering.
+/// (`RasterOptions` has no all-zero default: its `dpi` 0 is not a resolution,
+/// and a zeroed raster options struct is refused.)
 pub const color_none: u32 = 0;
 
 /// Largest payload the 32-bit length ABI can describe: a caller's buffer
-/// needs one byte more than this for the NUL the library appends.
+/// needs one byte more than this for the NUL the library appends. The
+/// rasterizer sizes its frame against the same ABI and reports
+/// `error.OutputTooLarge` for a frame, row stride or payload no 32-bit size
+/// describes, so an unrepresentable image is refused before the pixel block
+/// is requested instead of being wrapped into a smaller one here.
 const max_payload: usize = std.math.maxInt(u32) - 1;
 
 /// Bytes of failure text a context keeps. The error path never allocates,
@@ -66,14 +89,18 @@ const max_payload: usize = std.math.maxInt(u32) - 1;
 const err_text_max = 256;
 
 /// The caller's allocator, copied into the context by
-/// `ztex_context_create`: the struct itself may be a temporary, but `alloc`,
-/// `dealloc` and `user` must stay valid until `ztex_context_destroy`.
+/// `ztex_context_create`, and the only source of memory the library has:
+/// every parse, layout, SVG and pixel allocation of every call comes from
+/// it too. The struct itself may be a temporary, but `alloc`, `dealloc`
+/// and `user` must stay valid until `ztex_context_destroy`.
 ///
 /// `alloc` returns memory aligned for `max_align_t` (16 bytes on every
-/// target ztex builds for) or NULL when it cannot; `dealloc` receives the
+/// target ztex builds for) or null when it cannot; `dealloc` receives the
 /// exact `len` its matching `alloc` call was given. Growth inside the
 /// library is allocate + copy + free, so an arena works and a
-/// size-tracking free list stays exact.
+/// size-tracking free list stays exact. A null return, or a length the
+/// 32-bit ABI cannot express, is an ordinary allocation failure, so a
+/// render reports `.out_of_memory` rather than failing some other way.
 pub const CAllocator = extern struct {
     alloc: ?*const fn (user: ?*anyopaque, len: u32) callconv(.c) ?*anyopaque,
     dealloc: ?*const fn (user: ?*anyopaque, ptr: ?*anyopaque, len: u32) callconv(.c) void,
@@ -83,7 +110,9 @@ pub const CAllocator = extern struct {
 /// SVG rendering knobs. An all-zero struct is the default rendering: no
 /// padding, no background rectangle, the built-in font stacks.
 pub const SvgOptions = extern struct {
-    /// Empty margin on every side, in points.
+    /// Empty margin on every side, in points. Must be 0 or greater: a
+    /// negative margin is `.invalid_argument` and a non-finite one
+    /// `.non_finite_coordinate`.
     padding: f32 = 0,
     /// Background fill as `0xRRGGBBAA`; `color_none` emits no rectangle.
     background: u32 = color_none,
@@ -96,19 +125,28 @@ pub const SvgOptions = extern struct {
 
 /// Raster rendering knobs. Every field is the caller's to set: a NULL
 /// `ztex_raster_options` means the defaults below, but a ZEROED struct is
-/// an error (`dpi` 0 is not a resolution) and says so.
+/// an error (`dpi` 0 is not a resolution) and says so. `dpi`, `scale` and
+/// `padding` size a 32-bit frame: a resolution that is finite and positive
+/// but frames an image whose width, height or row stride has no 32-bit
+/// representation is `.output_too_large`, refused before the pixel block is
+/// requested, so a hostile option is never handed to the caller's `alloc`.
 pub const RasterOptions = extern struct {
     /// Output resolution in dots per inch; must be finite and > 0.
     dpi: f32 = 96,
     /// Uniform scale applied on top of `dpi`; must be finite and > 0.
     scale: f32 = 1,
-    /// Transparent margin around the content, in pixels.
+    /// Transparent margin around the content, in pixels, on both axes. A
+    /// margin whose framed width or row stride no 32-bit size can describe
+    /// is `.output_too_large`.
     padding: u32 = 0,
-    /// 0 = 32-bit RGBA (R, G, B, A byte order), 1 = 8-bit alpha mask.
+    /// 0 = 32-bit RGBA (R, G, B, A byte order), 1 = 8-bit alpha mask: one
+    /// byte per pixel, coverage times the INK's alpha, on a canvas that is
+    /// always transparent (so `bg` is ignored in that format).
     format: u32 = 0,
     /// Ink color as `0xRRGGBBAA` — alpha LAST, so opaque black is
-    /// `0x000000ff` and `0xff000000` is a transparent red. Unused by the
-    /// alpha mask. This default must stay the rasterizer's own
+    /// `0x000000ff` and `0xff000000` is a transparent red. The alpha mask
+    /// keeps only the alpha byte of it, so red, green and blue never reach
+    /// a mask. This default must stay the rasterizer's own
     /// (`ztex.raster.Options{}`), or every render that leaves `fg` unset
     /// paints nothing at all.
     fg: u32 = 0x000000ff,
@@ -162,7 +200,12 @@ const Context = struct {
     /// Copy `bytes` and a NUL into the caller's buffer. A buffer that cannot
     /// hold the whole payload is left UNTOUCHED and reports the size it
     /// needs, so a caller can never mistake a partial render for a whole
-    /// one.
+    /// one. `out_len` is the payload length only: the NUL lands one byte
+    /// past it, which is why the caller needs `capacity >= size + 1`. Of the
+    /// outcomes here only `output_too_large` leaves `out_len` untouched; a
+    /// call that never got this far — a refused argument, a parse, layout
+    /// or font failure, an allocation that ran out — leaves it untouched
+    /// too, which is the whole of the failure contract a caller sees.
     fn emit(self: *Context, bytes: []const u8, out: ?[*]u8, capacity: u32, out_len: *u32) Status {
         if (bytes.len > max_payload) return self.fail(
             .output_too_large,
@@ -196,9 +239,17 @@ const Context = struct {
         return switch (e) {
             error.OutOfMemory => self.fail(.out_of_memory, "out of memory"),
             error.InvalidAst => self.fail(.invalid_ast, "the layout stage rejected the atom tree"),
+            error.InvalidArgument => self.fail(
+                .invalid_argument,
+                "a rendering option is out of range: padding must be >= 0, dpi and scale > 0",
+            ),
+            error.OutputTooLarge => self.fail(
+                .output_too_large,
+                "the padded frame has no 32-bit width, height or row stride",
+            ),
             error.NonFiniteCoordinate => self.fail(
                 .non_finite_coordinate,
-                "a draw-list coordinate is not finite; no SVG can be written",
+                "a draw-list coordinate is not finite; no SVG or bitmap can be written",
             ),
             error.InvalidSfnt,
             error.MissingTable,
@@ -223,11 +274,16 @@ const Context = struct {
 /// Every failure the pipeline can report across this boundary. The font
 /// members come from the rasterizer's glyph-outline path; the C face gives
 /// all of them one status, so a font the library cannot read is a
-/// reportable outcome instead of a crash.
+/// reportable outcome instead of a crash. `InvalidArgument` and
+/// `OutputTooLarge` are the back ends refusing an option — a margin that is
+/// not a margin, a resolution that is not one, a frame no 32-bit size can
+/// describe — each reported BEFORE the payload is built or allocated.
 const PipelineError = ztex.parse.Error || ztex.font.FontError || error{
+    InvalidArgument,
     InvalidAst,
     NonFiniteCoordinate,
     OutOfMemory,
+    OutputTooLarge,
 };
 
 /// The allocator callbacks as the context stores them — inside the context,
@@ -286,6 +342,8 @@ comptime {
 
 /// The arguments both render entry points take, once validated.
 const Args = struct {
+    /// The caller's counted bytes: a null `latex` is the empty source, and
+    /// the byte after `latex_length` is never read.
     src: []const u8,
     style: Style,
     size_pt: f32,
@@ -420,13 +478,22 @@ export fn ztex_status_name(status: c_int) [*:0]const u8 {
 
 /// Render one formula to SVG in the caller's buffer.
 ///
-/// `latex` is read during the call only, and nothing is retained: the SVG
-/// is copied into `out`, which the caller owns. `out_length` always gets
-/// the payload size — on `ok` the bytes copied into `out`, on
-/// `buffer_too_small` the size needed — so `out = NULL, out_capacity = 0`
-/// is a size query, and a buffer that cannot hold the whole payload comes
-/// back UNWRITTEN rather than half filled. The payload needs
-/// `out_capacity >= size + 1`: the library always terminates it with a NUL.
+/// `latex` is COUNTED UTF-8 — exactly `latex_length` bytes are read, so
+/// the pointer needs no NUL terminator — and it is read during the call
+/// only, with nothing retained: the SVG is copied into `out`, which the
+/// caller owns. A render that got as far as building the document gives
+/// `out_length` the payload size — on `ok` the bytes copied into `out`, on
+/// `buffer_too_small` the size needed — so `out = NULL, out_capacity = 0` is
+/// a size query, and a buffer that cannot hold the whole payload comes back
+/// UNWRITTEN rather than half filled. The payload needs
+/// `out_capacity >= size + 1`: the library always terminates it with a NUL,
+/// and that NUL is the one byte `out_length` does not count.
+///
+/// A FAILED render leaves `out_length` and every byte of `out` untouched,
+/// whatever the failure: a refused argument (including a negative
+/// `options->padding`, which is checked before the document is built), a
+/// parse, layout or font error, an allocation that ran out, or a payload
+/// too large for the 32-bit length ABI.
 export fn ztex_render_svg(
     context: ?*Context,
     latex: ?[*:0]const u8,
@@ -455,10 +522,17 @@ export fn ztex_render_svg(
     return @intFromEnum(self.emit(text, out, out_capacity, len_out));
 }
 
-/// Render one formula to a pixel buffer in the caller's buffer. Ownership
-/// and sizing follow `ztex_render_svg` exactly; `out_width`/`out_height`
-/// receive the image size in pixels whenever the render itself succeeded,
-/// including on the `buffer_too_small` a size query returns.
+/// Render one formula to a pixel buffer in the caller's buffer. Ownership,
+/// the counted `latex` source and the size-query protocol follow
+/// `ztex_render_svg` exactly: the payload is `width * height * 4` bytes for
+/// `rgba32` and `width * height` for `alpha8`, and it needs one byte of
+/// capacity past that, for the NUL written after the last pixel.
+/// `out_width`/`out_height` receive the image size in pixels whenever the
+/// render itself succeeded — including on the `buffer_too_small` a size
+/// query returns — and are untouched when it failed; both must be
+/// non-NULL. A frame no 32-bit size can describe is refused as
+/// `output_too_large` before the pixel block is requested, so it leaves
+/// every out-parameter untouched and never reaches the caller's `alloc`.
 export fn ztex_render_raster(
     context: ?*Context,
     latex: ?[*:0]const u8,
@@ -504,12 +578,18 @@ export fn ztex_render_raster(
 }
 
 /// Copy the text of the last failure on `context` into `buffer`, always
-/// NUL-terminating inside `capacity`. Truncation is the caller's choice:
-/// `out_length` always receives the FULL text length, so
-/// `out_length >= capacity` means the tail was cut. A NULL `buffer` or a zero
-/// `capacity` with text to report answers ZTEX_INVALID_ARGUMENT and leaves
-/// that text intact. The text belongs to the context and is overwritten by
-/// the next call on it.
+/// NUL-terminating within `capacity`. Truncation is the caller's choice:
+/// `out_length` always receives the FULL text length, which never exceeds
+/// `err_text_max - 1`, so `out_length >= capacity` means the tail was cut.
+/// It is written before the buffer is looked at, so a NULL `buffer`, or a
+/// zero `capacity` with text to report, answers ZTEX_INVALID_ARGUMENT with
+/// the length still reported and the stored text still readable. With no
+/// failure to report the call answers ZTEX_OK, writes `out_length = 0` and
+/// touches no byte of `buffer`.
+///
+/// The text belongs to the context: every render clears it before it works,
+/// so a successful render leaves it empty and a failed one replaces it.
+/// This function never changes it.
 export fn ztex_last_error(
     context: ?*const Context,
     buffer: ?[*]u8,
@@ -541,13 +621,18 @@ test {
 }
 
 /// A `ztex_allocator` over `testing.allocator` that counts live bytes, so a
-/// test can prove a context gives every byte back.
+/// test can prove a context gives every byte back, and refuses any request
+/// above `fail_above` — the ceiling a C host's own allocator imposes, which
+/// a call that sizes a request it should have refused cannot slip past.
 const Counted = struct {
     state: State,
 
     const State = struct {
         gpa: std.mem.Allocator,
         live: usize,
+        /// Requests larger than this answer null, exactly as an allocator
+        /// that cannot get the memory does. Defaults to no ceiling.
+        fail_above: u32 = std.math.maxInt(u32),
 
         /// The state the `user` pointer addresses. `desc()` always passes
         /// `&self.state`, so an absent pointer means the fixture was wired
@@ -564,6 +649,7 @@ const Counted = struct {
 
         fn alloc(user: ?*anyopaque, len: u32) callconv(.c) ?*anyopaque {
             const self = stateOf(user) orelse return null;
+            if (len > self.fail_above) return null;
             const bytes = self.gpa.alloc(u8, len) catch return null;
             self.live += bytes.len;
             return @ptrCast(bytes.ptr);
@@ -983,6 +1069,124 @@ test "c abi: raster options are validated, and NULL means the defaults" {
         &height,
     ));
     // NULL options render at the pipeline's defaults (96 dpi).
+    try testing.expectEqual(@as(c_int, @intFromEnum(Status.buffer_too_small)), ztex_render_raster(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        null,
+        null,
+        0,
+        &len,
+        &width,
+        &height,
+    ));
+    try testing.expect(width > 0 and height > 0);
+}
+
+test "c abi: a negative SVG padding is refused before a document is built" {
+    var f: Fixture = undefined;
+    try f.create();
+    defer f.destroy();
+    const src: [:0]const u8 = "x";
+    const opts: SvgOptions = .{ .padding = -1000 };
+    var out: [4096]u8 = @splat(0xaa);
+    var len: u32 = 0xdeadbeef;
+    // The document this used to report as a success declared a negative
+    // frame: `width="-1988pt"` over a viewBox of "0 0 -1988 …".
+    try testing.expectEqual(@as(c_int, @intFromEnum(Status.invalid_argument)), ztex_render_svg(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        &opts,
+        &out,
+        @intCast(out.len),
+        &len,
+    ));
+    var msg: [err_text_max]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, try f.lastError(&msg), "padding") != null);
+    // A refused call writes nothing at all: not a document, not a NUL, and
+    // no size — it is not a size query.
+    for (out) |b| try testing.expectEqual(@as(u8, 0xaa), b);
+    try testing.expectEqual(@as(u32, 0xdeadbeef), len);
+    // The margin's own contract: 0 or more renders, and the document's
+    // declared width is the positive frame the negative case could not be.
+    const fine: SvgOptions = .{ .padding = 4 };
+    var doc: [16 * 1024]u8 = undefined;
+    try testing.expectEqual(@as(c_int, 0), ztex_render_svg(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        &fine,
+        &doc,
+        @intCast(doc.len),
+        &len,
+    ));
+    const text = doc[0..len];
+    const at = std.mem.indexOf(u8, text, " width=\"") orelse return error.MissingAttribute;
+    try testing.expect(text[at + " width=\"".len] != '-');
+}
+
+test "c abi: a raster frame the 32-bit size cannot describe is refused unallocated" {
+    var f: Fixture = undefined;
+    try f.create();
+    defer f.destroy();
+    const src: [:0]const u8 = "x";
+    // The caller's allocator answers null above a megabyte, as a host's
+    // would. A frame this library cannot describe is refused BEFORE the
+    // request, so it reports output_too_large rather than the
+    // out_of_memory that such a request would earn.
+    f.counted.state.fail_above = 1024 * 1024;
+    var out: [64]u8 = @splat(0xaa);
+    var len: u32 = 123;
+    var width: u32 = 123;
+    var height: u32 = 123;
+    // 2 * 2^31 pixels of margin is one past the largest u32: the frame has no
+    // 32-bit width, and computing it used to abort on the overflow.
+    const huge_margin: RasterOptions = .{ .dpi = 96, .padding = 2147483648 };
+    try testing.expectEqual(@as(c_int, @intFromEnum(Status.output_too_large)), ztex_render_raster(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        &huge_margin,
+        &out,
+        @intCast(out.len),
+        &len,
+        &width,
+        &height,
+    ));
+    // A resolution that is finite, positive and enormous frames an equally
+    // unrepresentable image: 1e30 dpi is 1.4e28 px per point.
+    const huge_dpi: RasterOptions = .{ .dpi = 1e30 };
+    try testing.expectEqual(@as(c_int, @intFromEnum(Status.output_too_large)), ztex_render_raster(
+        f.ctx(),
+        src.ptr,
+        @intCast(src.len),
+        @intFromEnum(Style.display),
+        20,
+        &huge_dpi,
+        &out,
+        @intCast(out.len),
+        &len,
+        &width,
+        &height,
+    ));
+    // Every out-parameter is left as the caller passed it, out included.
+    try testing.expectEqual(@as(u32, 123), len);
+    try testing.expectEqual(@as(u32, 123), width);
+    try testing.expectEqual(@as(u32, 123), height);
+    for (out) |b| try testing.expectEqual(@as(u8, 0xaa), b);
+    var msg: [err_text_max]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, try f.lastError(&msg), "32-bit") != null);
+    // The same allocator still renders an ordinary formula, so the statuses
+    // above came from the frame and not from a starving allocator.
     try testing.expectEqual(@as(c_int, @intFromEnum(Status.buffer_too_small)), ztex_render_raster(
         f.ctx(),
         src.ptr,

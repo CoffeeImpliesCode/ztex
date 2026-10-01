@@ -20,7 +20,7 @@ const std = @import("std");
 const testing = std.testing;
 
 /// A quadratic bezier in Y-up space; the shape contract shared with the
-/// font-outline side (B1). Declared here independently — no ztex import.
+/// font-outline side. Declared here independently — no ztex import.
 pub const QuadCurve = struct {
     p0: [2]f32,
     p1: [2]f32,
@@ -1344,6 +1344,175 @@ test "coverageRowFast == coverageRow on the lambda glyph" {
         coverageRow(&curves, y, x_start, sweep[0..n]);
         for (fast[0..n], sweep[0..n]) |a, e| {
             try testing.expectApproxEqAbs(e, a, 1e-4);
+        }
+    }
+}
+
+// ── band boundary: tangent apex, outside the band ───────
+// A glyph's top is a Bézier apex that grazes a pixel row. Whether the
+// sweep paints there depends on the apex's exact position relative to the
+// row's edge — and on the CONTROL HULL, not the endpoints: `coverageRow`
+// admits a curve whose p1 pokes into the row even when p0 and p2 do not,
+// so the row is genuinely live and the sweep must resolve it, not skip it.
+// Getting this wrong paints phantom ink above a glyph (the f/bold-f
+// top-ring slivers), so the boundary is pinned from both sides: exact 0
+// when the apex only touches the edge from outside, exact parabolic
+// coverage when it reaches inside.
+
+test "band boundary: a tangent apex outside the row paints exactly zero" {
+    // Symmetric cap: p0.y = p2.y = -0.4 with control y = 0.4 puts the
+    // apex at 0.25*(-0.4) + 0.5*0.4 + 0.25*(-0.4) = 0.0 exactly, at
+    // t = 0.5 — tangent to the row's BOTTOM edge from below. The control
+    // point (y = 0.4) is well inside the row, so the control-hull early-out
+    // cannot skip this curve; the apex alone decides, and one touching
+    // point encloses no area.
+    const cap = [_]QuadCurve{.{
+        .p0 = .{ 0.2, -0.4 },
+        .p1 = .{ 0.5, 0.4 },
+        .p2 = .{ 0.8, -0.4 },
+    }};
+    var out: [2]f32 = undefined;
+    coverageRow(&cap, 0, 0, &out);
+    try testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(out[0])));
+    try testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(out[1])));
+    var fast: [2]f32 = undefined;
+    coverageRowFast(&cap, 0, 0, &fast);
+    try testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(fast[0])));
+    try testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(fast[1])));
+
+    // The same cap closed along its chord, still entirely below the row:
+    // zero area, and the closing edge adds nothing.
+    const closed_below = [_]QuadCurve{
+        .{ .p0 = .{ 0.2, -0.4 }, .p1 = .{ 0.5, 0.0 }, .p2 = .{ 0.8, -0.4 } },
+        .{ .p0 = .{ 0.8, -0.4 }, .p1 = .{ 0.5, -0.4 }, .p2 = .{ 0.2, -0.4 } },
+    };
+    var out_closed: [1]f32 = undefined;
+    coverageRow(&closed_below, 0, 0, &out_closed);
+    try testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(out_closed[0])));
+    var fast_closed: [1]f32 = undefined;
+    coverageRowFast(&closed_below, 0, 0, &fast_closed);
+    try testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(fast_closed[0])));
+}
+
+test "band boundary: a tangent apex inside the row is the exact cap area" {
+    // Closed cap tangent to the row's TOP edge from inside: p0.y = p2.y =
+    // 0.6 with control y = 1.4 puts the apex at 0.25*0.6 + 0.5*1.4 +
+    // 0.25*0.6 = 1.0 exactly, at t = 0.5. Closed by the chord at y = 0.6,
+    // the shape is a parabolic segment of base 0.6 and height 0.4, whose
+    // area is (2/3)*base*height = 0.16 — the whole segment fits in the one
+    // pixel at [0,1]x[0,1), so that pixel's coverage is exactly 0.16.
+    const closed = [_]QuadCurve{
+        .{ .p0 = .{ 0.2, 0.6 }, .p1 = .{ 0.5, 1.4 }, .p2 = .{ 0.8, 0.6 } },
+        .{ .p0 = .{ 0.8, 0.6 }, .p1 = .{ 0.5, 0.6 }, .p2 = .{ 0.2, 0.6 } },
+    };
+    var out: [1]f32 = undefined;
+    coverageRow(&closed, 0, 0, &out);
+    try testing.expectApproxEqAbs(@as(f32, 0.16), out[0], 1e-6);
+    var fast: [1]f32 = undefined;
+    coverageRowFast(&closed, 0, 0, &fast);
+    try testing.expectApproxEqAbs(@as(f32, 0.16), fast[0], 1e-6);
+
+    // Same segment pulled a hair down so the apex no longer touches the
+    // row's top edge: height h = 0.399, area (2/3)*0.6*h. The coverage must
+    // track the exact analytic area, not clamp to the full pixel — this is
+    // the partial-coverage half of the boundary.
+    const h: f32 = 0.4 - 1.0e-3;
+    const partial = [_]QuadCurve{
+        .{ .p0 = .{ 0.2, 0.6 }, .p1 = .{ 0.5, 0.6 + 2.0 * h }, .p2 = .{ 0.8, 0.6 } },
+        .{ .p0 = .{ 0.8, 0.6 }, .p1 = .{ 0.5, 0.6 }, .p2 = .{ 0.2, 0.6 } },
+    };
+    const expect = (2.0 / 3.0) * 0.6 * @as(f32, h);
+    var out_partial: [1]f32 = undefined;
+    coverageRow(&partial, 0, 0, &out_partial);
+    try testing.expectApproxEqAbs(expect, out_partial[0], 1e-6);
+    var fast_partial: [1]f32 = undefined;
+    coverageRowFast(&partial, 0, 0, &fast_partial);
+    try testing.expectApproxEqAbs(expect, fast_partial[0], 1e-6);
+
+    // The open cap of the (a) case moved a hair inside the row: coverage
+    // must be small but strictly ordered — never a jump to a full pixel,
+    // never exactly zero.
+    const inside = [_]QuadCurve{.{
+        .p0 = .{ 0.2, -0.4 },
+        .p1 = .{ 0.5, 0.4 + 2.0e-6 },
+        .p2 = .{ 0.8, -0.4 },
+    }};
+    var out_inside: [2]f32 = undefined;
+    coverageRow(&inside, 0, 0, &out_inside);
+    try testing.expect(out_inside[0] > 0.0);
+    try testing.expect(out_inside[0] < 1.0 / 255.0);
+    try testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(out_inside[1])));
+}
+
+test "band boundary: no ink above the exact ink top at any sub-pixel phase" {
+    // The end-to-end shape of the defect: sweep a curve set through a full
+    // pixel of sub-pixel phases and require every row whose window lies
+    // strictly above the outline's exact top (endpoints plus the interior
+    // extremum) to be exactly zero. Both row paths, so the fast row's step
+    // scheme cannot disagree with the sweep about an empty band.
+    const shapes = [_][]const QuadCurve{
+        &[_]QuadCurve{
+            // Cap whose control point sits far above both endpoints: the
+            // hull reaches high while the curve barely leaves its chord.
+            .{ .p0 = .{ 0.1, 0.0 }, .p1 = .{ 0.5, 4.0 }, .p2 = .{ 0.9, 0.05 } },
+            .{ .p0 = .{ 0.9, 0.05 }, .p1 = .{ 0.5, 0.02 }, .p2 = .{ 0.1, 0.0 } },
+        },
+        &[_]QuadCurve{
+            // Two caps side by side with different heights.
+            .{ .p0 = .{ 0.0, 0.0 }, .p1 = .{ 0.25, 3.0 }, .p2 = .{ 0.5, 0.1 } },
+            .{ .p0 = .{ 0.5, 0.1 }, .p1 = .{ 0.75, 6.0 }, .p2 = .{ 1.0, 0.0 } },
+            .{ .p0 = .{ 1.0, 0.0 }, .p1 = .{ 0.5, 0.0 }, .p2 = .{ 0.0, 0.0 } },
+        },
+        &[_]QuadCurve{
+            // A near-flat arch: the apex grazes the row from inside with a
+            // bulge far below the 1e-3 |qa| monotonicize floor.
+            .{ .p0 = .{ 0.0, 0.0 }, .p1 = .{ 0.5, 0.0004 }, .p2 = .{ 1.0, 0.0 } },
+            .{ .p0 = .{ 1.0, 0.0 }, .p1 = .{ 0.5, 0.0 }, .p2 = .{ 0.0, 0.0 } },
+        },
+    };
+
+    for (shapes) |curves| {
+        // Exact top over the shape: endpoints plus every interior extremum.
+        var top: f32 = -std.math.inf(f32);
+        for (curves) |c| {
+            top = @max(top, @max(c.p0[1], c.p2[1]));
+            const qa = c.p0[1] - 2.0 * c.p1[1] + c.p2[1];
+            if (@abs(qa) > 1e-12) {
+                const t = (c.p0[1] - c.p1[1]) / qa;
+                if (t > 0 and t < 1) {
+                    const mt = 1.0 - t;
+                    top = @max(top, mt * mt * c.p0[1] + 2.0 * mt * t * c.p1[1] + t * t * c.p2[1]);
+                }
+            }
+        }
+
+        // 64 phases slide the shape through a full pixel.
+        var phase: usize = 0;
+        while (phase < 64) : (phase += 1) {
+            const shift = @as(f32, @floatFromInt(phase)) / 64.0;
+            var shifted: [3]QuadCurve = undefined;
+            for (curves, 0..) |c, k| {
+                shifted[k] = .{
+                    .p0 = .{ c.p0[0], c.p0[1] + shift },
+                    .p1 = .{ c.p1[0], c.p1[1] + shift },
+                    .p2 = .{ c.p2[0], c.p2[1] + shift },
+                };
+            }
+            const first_row = @as(i64, @intFromFloat(@ceil(top + shift)));
+            var wy: i64 = first_row;
+            while (wy <= first_row + 2) : (wy += 1) {
+                const y: f32 = @floatFromInt(wy);
+                var sweep: [4]f32 = undefined;
+                coverageRow(&shifted, y, 0, &sweep);
+                var fast: [4]f32 = undefined;
+                coverageRowFast(&shifted, y, 0, &fast);
+                for (sweep) |v| {
+                    try testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(v)));
+                }
+                for (fast) |v| {
+                    try testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(v)));
+                }
+            }
         }
     }
 }

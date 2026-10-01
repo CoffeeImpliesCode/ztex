@@ -1,15 +1,27 @@
 //! ztex — LaTeX math parsing + layout → SVG-style draw list.
 //!
-//! Facade over two independently usable modules:
+//! Facade over independently usable modules:
 //! - `ztex.parse` — LaTeX source → superflat atom tree
 //! - `ztex.layout` — atom tree + font metrics → box tree → draw list
+//! - `ztex.svg` — draw list → SVG document
 //!
-//! Module weight: importing `ztex` pulls ~0.9 MiB of embedded Latin Modern
-//! faces (`font.zig` → `fonts/`), because the `Context` facade measures from
-//! them. `ztex.parse` and `ztex.layout` do NOT depend on `font.zig` — they
-//! reach real fonts through an opaque `metrics.FontHook`, so a host that only
+//! plus two back ends that turn a draw list into pixels or markup:
+//! `ztex.svg.render` and `raster.rasterize` (re-exported below; the latter
+//! always needs a `Context`, because it resolves every glyph through the
+//! real faces).
+//!
+//! Module weight: importing `ztex` pulls 1,193,544 bytes (1.14 MiB) of
+//! embedded Latin Modern faces (`font.zig` → `src/fonts/`) — LM Math plus
+//! LM Roman regular, italic, bold and bold italic — because the `Context`
+//! facade measures from them and the rasterizer draws from them.
+//! `ztex.parse` and `ztex.layout` do NOT depend on `font.zig` — they reach
+//! real fonts through an opaque `metrics.FontHook`, so a host that only
 //! wants the static tables can import those two modules and never link the
-//! font bytes.
+//! font bytes. The static path answers from compiled-in numbers instead:
+//! the Computer Modern rows, plus rows generated from those SAME embedded
+//! faces for the text styles the CM tables do not describe and sparse ink
+//! edges for all five, so a glyph is framed by the outline it is drawn
+//! from.
 const std = @import("std");
 
 pub const atom = @import("ztex.atom");
@@ -25,8 +37,12 @@ pub const RasterOptions = raster.Options;
 // through `ztex.Context` below.
 const context = @import("context.zig");
 
-/// Font-backed rendering context: owns a FontContext and a FontMetrics
-/// wired to it — "initialize once, render many" (see context.zig).
+/// Font-backed rendering context: owns a FontContext (five embedded Latin
+/// Modern faces plus the per-(face, codepoint) metric cache) and a
+/// FontMetrics wired to it — "initialize once, render many" (see
+/// context.zig). Its `.font` arm also borrows LM Math's decoded MATH
+/// constants, valid for the life of the context. Rasterizing a draw list
+/// needs one: `raster.rasterize` resolves every run's face through it.
 pub const Context = context.Context;
 /// Shared parse+layout pipeline behind both facades. Internal — not part of
 /// the host-facing API: `ztex.render` and `Context.render` are the public
@@ -57,9 +73,13 @@ pub fn renderPipeline(
 
 /// Full pipeline: LaTeX source → draw list (SVG-style primitives),
 /// measured from the bundled static tables (`layout.metrics.default`).
-/// `Context.render` is the same pipeline measured from the real fonts; both
-/// share the body in `renderPipeline` above. Details on the returned draw
-/// list's lifetime and `err_info` are documented there.
+/// Those tables are compiled-in numbers — the Computer Modern rows, plus
+/// rows and ink edges generated from the same embedded faces — so this
+/// entry point touches no font file and holds no mutable state, and is
+/// shareable across threads. `Context.render` is the same pipeline measured
+/// from the real fonts; both share the body in `renderPipeline` above.
+/// Details on the returned draw list's lifetime and `err_info` are
+/// documented there.
 pub fn render(
     gpa: std.mem.Allocator,
     src: []const u8,
@@ -70,9 +90,11 @@ pub fn render(
     return renderPipeline(gpa, &layout.metrics.default, src, style, size_pt, err_info);
 }
 
-/// One-shot rasterization: initializes a temporary FontContext and rasterizes
-/// the formula to a PixelBuffer. For batch rendering, prefer initializing a
-/// persistent `ztex.Context` and calling `ctx.renderPixels`.
+/// One-shot rasterization: initializes a temporary Context — the
+/// rasterizer needs real faces, so this is not a static-table path — and
+/// rasterizes the formula to a PixelBuffer. For batch rendering, prefer
+/// initializing a persistent `ztex.Context` and calling `ctx.renderPixels`,
+/// so the faces and the metric cache are built once.
 pub fn renderPixels(
     gpa: std.mem.Allocator,
     src: []const u8,

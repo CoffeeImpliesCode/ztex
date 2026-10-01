@@ -21,6 +21,7 @@ pub const Error = atom.Error || error{
     /// \middle outside \left...\right (TeX: "You can't use \middle in math
     /// mode"; it needs the enclosing fence's required size).
     UnexpectedMiddle,
+    MisplacedHline,
     /// \begin with an unknown environment name (TeX: "Environment xxx
     /// undefined").
     UnknownEnvironment,
@@ -115,6 +116,7 @@ const Command = enum {
     /// child whose data packs the class — atom.classRowData)
     mathord,
     mathrel,
+    mathbin,
     mathopen,
     mathclose,
     mathpunct,
@@ -153,6 +155,14 @@ const Command = enum {
     hat,
     bar,
     vec,
+    /// \widehat{x} / \widetilde{x}: the EXTENSIBLE accents amsfonts picks
+    /// for an argument wider than 2em (a wide-accent row — children
+    /// [base, accent-mark char], data = wide_hat_row_data /
+    /// wide_tilde_row_data). The mark codepoint is the ordinary combining
+    /// one (\hat / \tilde): Latin Modern Math carries no U+0362 / U+0365,
+    /// the spacing forms amsfonts' narrow branch uses.
+    widehat,
+    widetilde,
     ddot,
     tilde,
     /// \overline{x} / \underline{x}: a `.overline` atom (children
@@ -212,9 +222,35 @@ const Command = enum {
     space_colon,
     /// \  — the interword space (one third of the em)
     space_control,
+    /// \arraystretch{n}: the row-strut factor for the environments that
+    /// follow (a zero-width `.space` leaf; the value rides on the env's
+    /// first row — see `Stretch`)
+    arraystretch,
+    /// \tag{n}: amsmath's equation number — a `tag_row_data` row of the
+    /// braced argument set in upright roman
+    tag,
     /// \begin{env}...\end{env}: a math environment (matrix family, cases,
     /// aligned, array) — parsed by parseBegin into a `.env` atom.
     begin,
+    /// \boxed{x}: a frame around ONE math field (amsmath \boxed =
+    /// \fbox{\m@th$\displaystyle #1$}), a `.boxed` atom
+    boxed,
+    /// \color{<spec>}: a foreground-color DECLARATION — the color applies
+    /// to the rest of the current group/row/cell and is restored when that
+    /// scope ends (intercepted by parseRow, never by parseCommand)
+    color,
+    /// \textcolor{<spec>}{<text>}: the color applied to the braced argument
+    /// only, a `.textcolor` atom of one child (an ORD GROUP — see the tag)
+    textcolor,
+    /// \hline: a full-width rule BETWEEN environment rows (a `.hline`
+    /// leaf; legal only at an environment row boundary, see parseEnvBody)
+    hline,
+    /// \textit{...}: a TEXT italic face — raw bytes in LM Roman Italic,
+    /// NOT math italic (a `.text` leaf carrying CharStyle.text_italic)
+    textit,
+    /// \textbf{...}: a TEXT bold face — a `.text` leaf carrying the
+    /// existing CharStyle.bold
+    textbf,
 };
 
 /// Comptime command table keyed by the exact command names (no backslash).
@@ -278,6 +314,7 @@ const cmd_map = std.StaticStringMap(Command).initComptime(&[_]struct { []const u
     .{ "mathop", .mathop },
     .{ "mathord", .mathord },
     .{ "mathrel", .mathrel },
+    .{ "mathbin", .mathbin },
     .{ "mathopen", .mathopen },
     .{ "mathclose", .mathclose },
     .{ "mathpunct", .mathpunct },
@@ -301,6 +338,10 @@ const cmd_map = std.StaticStringMap(Command).initComptime(&[_]struct { []const u
     .{ "vec", .vec },
     .{ "ddot", .ddot },
     .{ "tilde", .tilde },
+    // the EXTENSIBLE accents: the same marks as \hat / \tilde, but layout
+    // builds the amsfonts-style wide accent past 2em
+    .{ "widehat", .widehat },
+    .{ "widetilde", .widetilde },
     // a rule over / under the following atom/group
     .{ "overline", .overline },
     .{ "underline", .underline },
@@ -376,6 +417,16 @@ const cmd_map = std.StaticStringMap(Command).initComptime(&[_]struct { []const u
     .{ "mkern", .mkern },
     .{ ":", .space_colon },
     .{ " ", .space_control },
+    // the row-strut factor for the environments that follow, and amsmath's
+    // equation number
+    .{ "arraystretch", .arraystretch },
+    .{ "tag", .tag },
+    .{ "boxed", .boxed },
+    .{ "color", .color },
+    .{ "textcolor", .textcolor },
+    .{ "hline", .hline },
+    .{ "textit", .textit },
+    .{ "textbf", .textbf },
 });
 
 /// \displaystyle \textstyle \scriptstyle \scriptscriptstyle → forced math
@@ -764,6 +815,28 @@ const stackrel_row_data: u32 = 10;
 const underbrace_row_data: u32 = 11;
 const overbrace_row_data: u32 = 12;
 
+/// The `data` a \widehat / \widetilde row node carries (children [base,
+/// accent-mark char] — the SAME shape as accent_row_data) so layout routes
+/// it through the EXTENSIBLE-accent path. amsfonts.sty:79-86 (and
+/// amstex.sty:1931-1938) measure the argument in \textstyle and pick the
+/// narrow \mathaccent"0362 / "0365 below 2em, the wide extensible accent
+/// above it; Latin Modern Math maps neither U+0362 nor U+0365, so the mark
+/// is the ordinary combining U+0302 / U+0303 that \hat / \tilde already
+/// draw. Markers 13 (atom.ClassBits), 16 (the phantom family) and 32 (the
+/// kern family) are taken, so 14 and 15 are the first free values.
+const wide_hat_row_data: u32 = 14;
+const wide_tilde_row_data: u32 = 15;
+
+/// Bit 6 of a \tag row node's `data` marks the construct (children [the
+/// braced argument, wrapped in a `.styled` roman scope] so the digits draw
+/// upright like \operatorname's). amsmath's equation number is hoisted OUT
+/// of the math list (amsmath.sty:1210-1212 builds it as a separate
+/// \hbox{...} beside the display), so it is a noad in no list and takes no
+/// inter-atom glue on either side; bit 6 keeps it clear of the fixed
+/// markers 1..12, atom.ClassBits's 13, the phantom family's bit 4 and the
+/// kern family's bit 5.
+const tag_row_data: u32 = 1 << 6;
+
 /// Bit 5 of an explicit-kern row's `data` marks the family (\hspace / \kern /
 /// \mkern, and `\:`'s constant mu skip); bits 0-1 carry the dimension's unit
 /// (see `dim_pt`) and the magnitude rides in the row's single `.space` child
@@ -791,6 +864,17 @@ const keep_width: u32 = 1;
 const keep_height: u32 = 2;
 const keep_depth: u32 = 4;
 const keep_vertical: u32 = keep_height | keep_depth;
+
+/// Bit 7 of a \phantom-family row's `data` marks `\smash`, the ONE member
+/// of the family that DRAINS its content instead of hiding it. The keep
+/// mask alone cannot tell them apart — `\smash{tb}` and `\hphantom` are
+/// both `keep_width` — but they are not the same box: `\smash` keeps the
+/// argument as its single child and zeroes only the selected axes
+/// (measured: `\smash{b}` at 30pt is 8.86pt wide on the XeTeX reference,
+/// still PAINTED, with h 0 and d 0), while every `\phantom` variant is an
+/// empty metrics-only box. Bit 7 is free: bit 4 is the family marker, bits
+/// 0-3 the keep mask, bit 5 the kern family, bit 6 the \tag row.
+const smash_row: u32 = 1 << 7;
 
 /// Relation codepoint → its pre-composed negated form, for \not<relation>.
 /// unicode-math's \not command uses the pre-composed glyph when one exists
@@ -838,6 +922,22 @@ const not_cp_map = [_]struct { cp: u21, neg: u21 }{
 pub const max_nesting: u32 = 500;
 
 /// Recursive-descent parser over a flat token table.
+/// The `\arraystretch` state the parser carries: the factor in force and
+/// whether this factor was assigned at the level being parsed right now. The
+/// two travel together because a scope that ends one ends the other — every
+/// group, `\left … \right` pair and environment body saves the pair and hands
+/// it back — so `assigned` says "the CELL being parsed assigned a factor" and
+/// never "a group, a pair or a nested body inside it did".
+const Stretch = struct {
+    /// the factor in force, as the f32 em bits `atom.emToFixed` stores;
+    /// 0 = no assignment in effect
+    factor: u32 = 0,
+    /// 1 when `factor` was assigned by an `\arraystretch` at THIS level —
+    /// never inside a group, a `\left … \right` pair or an environment body,
+    /// each of which restores the pair it found
+    assigned: bool = false,
+};
+
 pub const Parser = struct {
     gpa: std.mem.Allocator,
     src: []const u8,
@@ -854,6 +954,31 @@ pub const Parser = struct {
     /// depth exceeds `max_nesting` the parse fails with NestingTooDeep
     /// instead of overflowing the stack.
     depth: u32 = 0,
+    /// \arraystretch's state: the factor the environments that follow are
+    /// built from, and whether it was assigned at the level being parsed.
+    ///
+    /// GROUP-LOCAL, like the LaTeX `\def\arraystretch{…}` it mirrors:
+    /// `{\arraystretch{1.4}\begin{array}…\end{array}}` must not change the
+    /// strut of a LATER environment outside the braces, so parseGroup saves
+    /// and restores this pair around the group's body, and parseLeftRight
+    /// does the same around `\left … \right`. Within one group a factor
+    /// stays in force until reassigned and applies to every environment
+    /// after it.
+    ///
+    /// CELL-LOCAL inside an environment body: parseEnvBody hands the pair
+    /// back after every cell, so an `\arraystretch` written in a cell sizes
+    /// the environments opened AFTER it in that same cell and nothing else.
+    /// What the environment's OWN rows are built from is captured apart from
+    /// this field (`env_factor` in parseEnvBody) from the cells of its FIRST
+    /// row: an assignment in one cell keeps its factor through the plain
+    /// cells after it, an assignment in a later cell replaces it, and the
+    /// last one written wins.
+    stretch: Stretch = .{},
+    /// Cells parsed so far in the environment row in progress; 0 at a row
+    /// boundary. parseRow consults it in `.env_cell` mode so `\hline` ends a
+    /// cell ONLY before the row's first `&` (TeX: \noalign is legal solely
+    /// between rows), and parseEnvBody resets it after every `\\`.
+    env_row_cells: u32 = 0,
     /// Caller-provided parse-error context: filled (when non-null) with the
     /// kind + offending span immediately before any error is returned.
     err_info: ?*parse_err.Info = null,
@@ -907,6 +1032,7 @@ pub const Parser = struct {
             .missing_script => error.MissingScript,
             .unclosed_group => error.UnclosedGroup,
             .unexpected_middle => error.UnexpectedMiddle,
+            .misplaced_hline => error.MisplacedHline,
             .unknown_environment => error.UnknownEnvironment,
             .mismatched_end => error.MismatchedEnd,
             .unclosed_environment => error.UnclosedEnvironment,
@@ -948,13 +1074,13 @@ pub const Parser = struct {
     fn createNode(
         self: *Parser,
         ast: *atom.Ast,
-        tag: atom.Tag,
+        node_kind: atom.Tag,
         first_token: u32,
         num_tokens: u32,
         children: []const atom.Node,
         data: u32,
     ) Error!u32 {
-        return ast.createNode(tag, first_token, num_tokens, children, data) catch |err| {
+        return ast.createNode(node_kind, first_token, num_tokens, children, data) catch |err| {
             if (err == error.ChildCountOverflow) {
                 return self.fail(.child_count_overflow, self.nodeSpan(first_token, num_tokens));
             }
@@ -1051,6 +1177,14 @@ pub const Parser = struct {
                     // close the environment; neither is consumed here).
                     if (mode == .env_cell and std.mem.eql(u8, nm, "\\")) break;
                     if (mode == .env_cell and std.mem.eql(u8, nm, "end")) break;
+                    // `\hline` also ends an environment cell, so parseEnvBody
+                    // sees it as a standalone token and turns it into a rule
+                    // entry between rows. ONLY as the FIRST token of the
+                    // row's first cell: TeX's \hline is \noalign, legal solely
+                    // between rows, so `a \hline b` and `a & \hline b` must
+                    // reach parseCommand and be rejected there.
+                    if (mode == .env_cell and std.mem.eql(u8, nm, "hline") and
+                        self.env_row_cells == 0 and self.pos == @as(usize, start_tok)) break;
                     // A style switch forces the style for the REST of the
                     // row (TeX rest-of-group semantics): consume the
                     // command, parse the remaining atoms as a sub-row, wrap
@@ -1080,6 +1214,39 @@ pub const Parser = struct {
                         try children.append(self.gpa, cn);
                         last_tok = cn.first_token + cn.num_tokens;
                         break; // the rest of the row is consumed
+                    }
+                    // \color{<spec>} is a DECLARATION: the color applies to
+                    // the REST of this row and is restored when the row — or
+                    // the group / cell / env body owning it — ends. Same
+                    // shape as a style switch: consume the command and its
+                    // color spec, parse the remaining atoms as a sub-row,
+                    // wrap that row in a `.color` node, and stop the loop.
+                    if (std.mem.eql(u8, nm, "color")) {
+                        const col_cmd_tok: u32 = @intCast(self.pos);
+                        _ = self.advance(); // consume \color
+                        const col = try self.parseColorSpec();
+                        // Past the command AND its spec: a trailing
+                        // `\color{red}` with no rest leaves the sub-row
+                        // empty, and the scope must still span the bytes it
+                        // was written with.
+                        const after_spec: u32 = @intCast(self.pos);
+                        const rest = try self.parseRow(ast, mode);
+                        const rn = ast.node(rest);
+                        const col_tokens = @max(rn.first_token + rn.num_tokens, after_spec) -
+                            col_cmd_tok;
+                        const col_children = [_]atom.Node{rn};
+                        const col_node = try self.createNode(
+                            ast,
+                            .color,
+                            col_cmd_tok,
+                            col_tokens,
+                            &col_children,
+                            atom.colorData(col),
+                        );
+                        const coln = ast.node(col_node);
+                        try children.append(self.gpa, coln);
+                        last_tok = coln.first_token + coln.num_tokens;
+                        break; // the rest of the row is inside the scope
                     }
                     if (std.mem.eql(u8, nm, "atop") or
                         std.mem.eql(u8, nm, "over") or
@@ -1226,6 +1393,11 @@ pub const Parser = struct {
     /// Parse `{ ... }` as a transparent group atom.
     fn parseGroup(self: *Parser, ast: *atom.Ast) Error!u32 {
         const open_tok: u32 = @intCast(self.pos - 1);
+        // \arraystretch is a LaTeX `\def`: its effect ends with the group
+        // that made it. `{\arraystretch{1.4}\begin{array}…\end{array}}`
+        // must leave a later environment's strut alone.
+        const outer_stretch = self.stretch;
+        defer self.stretch = outer_stretch;
         const inner = try self.parseRow(ast, .group);
         // Unclosed group: point at the group's opening brace.
         _ = self.advance() orelse
@@ -1407,7 +1579,7 @@ pub const Parser = struct {
                 const den = try self.parseRequiredArg(ast);
                 break :blk self.genfrac(ast, cmd_tok, ld, rd, thick, gstyle, num, den);
             },
-            .text => self.text(ast, cmd_tok),
+            .text => self.textFace(ast, .roman),
             .operatorname => self.operatorname(ast, cmd_tok),
             .style_roman => self.style(ast, cmd_tok, .roman),
             .style_bold => self.style(ast, cmd_tok, .bold),
@@ -1442,6 +1614,7 @@ pub const Parser = struct {
             .mathop => self.mathop(ast, cmd_tok),
             .mathord => self.mathClass(ast, cmd_tok, .ord),
             .mathrel => self.mathClass(ast, cmd_tok, .rel),
+            .mathbin => self.mathClass(ast, cmd_tok, .bin),
             .mathopen => self.mathClass(ast, cmd_tok, .open),
             .mathclose => self.mathClass(ast, cmd_tok, .close),
             .mathpunct => self.mathClass(ast, cmd_tok, .punct),
@@ -1470,6 +1643,8 @@ pub const Parser = struct {
             .vec => self.accent(ast, cmd_tok, 0x20D7), // combining right arrow above
             .ddot => self.accent(ast, cmd_tok, 0x0308), // combining diaeresis
             .tilde => self.accent(ast, cmd_tok, 0x0303), // combining tilde
+            .widehat => self.wideAccent(ast, cmd_tok, wide_hat_row_data, 0x0302),
+            .widetilde => self.wideAccent(ast, cmd_tok, wide_tilde_row_data, 0x0303),
             .overline => self.overunder(ast, cmd_tok, false),
             .underline => self.overunder(ast, cmd_tok, true),
             .mathchoice => self.mathchoice(ast, cmd_tok),
@@ -1482,9 +1657,9 @@ pub const Parser = struct {
             .overset => self.limitScript(ast, cmd_tok, .over, false),
             .underset => self.limitScript(ast, cmd_tok, .under, false),
             .stackrel => self.limitScript(ast, cmd_tok, .over, true),
-            .phantom => self.phantom(ast, cmd_tok, keep_width | keep_vertical),
-            .hphantom => self.phantom(ast, cmd_tok, keep_width),
-            .vphantom => self.phantom(ast, cmd_tok, keep_vertical),
+            .phantom => self.phantom(ast, cmd_tok, keep_width | keep_vertical, false),
+            .hphantom => self.phantom(ast, cmd_tok, keep_width, false),
+            .vphantom => self.phantom(ast, cmd_tok, keep_vertical, false),
             .smash => self.smash(ast, cmd_tok),
             .underbrace => self.brace(ast, cmd_tok, true),
             .overbrace => self.brace(ast, cmd_tok, false),
@@ -1492,6 +1667,30 @@ pub const Parser = struct {
             .kern, .mkern => self.kern(ast, cmd_tok, false),
             .space_colon => self.kernRow(ast, cmd_tok, 4.0, .mu),
             .space_control => self.space(ast, cmd_tok, 1.0 / 3.0),
+            .arraystretch => self.arraystretch(ast, cmd_tok),
+            .tag => self.tag(ast, cmd_tok),
+            .boxed => self.boxed(ast, cmd_tok),
+            // \color is a declaration: parseRow intercepts it in every row
+            // mode. This arm only fires where a bare atom is still expected
+            // (an unbraced script field), where the scope is that field.
+            .color => blk: {
+                const col = try self.parseColorSpec();
+                const field = try self.parseScriptArg(ast);
+                const fnode = ast.node(field);
+                const tokens = (fnode.first_token + fnode.num_tokens) - cmd_tok;
+                break :blk self.createNode(
+                    ast,
+                    .color,
+                    cmd_tok,
+                    tokens,
+                    &[_]atom.Node{fnode},
+                    atom.colorData(col),
+                );
+            },
+            .textcolor => self.textcolor(ast, cmd_tok),
+            .hline => self.fail(.misplaced_hline, self.spanAt(cmd_tok)),
+            .textit => self.textFace(ast, .text_italic),
+            .textbf => self.textFace(ast, .bold),
             .begin => self.parseBegin(ast, cmd_tok),
         };
     }
@@ -1881,24 +2080,145 @@ pub const Parser = struct {
         return self.createNode(ast, .mathchoice, cmd_tok, num_tokens, &children, 0);
     }
 
-    fn text(self: *Parser, ast: *atom.Ast, _: u32) Error!u32 {
+    /// \boxed{<field>}: a frame around ONE math field — amsmath
+    /// \newcommand\boxed[1]{\fbox{\m@th$\displaystyle #1$}}. The result is a
+    /// `.boxed` atom of exactly one child; layout draws the four rules
+    /// outside that child (fboxsep 3pt, fboxrule 0.4pt). The field is a math
+    /// FIELD like \overline's, so `\boxed x` frames the bare atom and
+    /// `\boxed{xy}` the group; the node's span covers the command through
+    /// the end of the field. The DISPLAY style is layout's concern: a
+    /// \boxed inside a script keeps the script's style, exactly like every
+    /// other construct (only \dfrac forces a style).
+    fn boxed(self: *Parser, ast: *atom.Ast, cmd_tok: u32) Error!u32 {
+        const field = try self.parseScriptArg(ast);
+        const fnode = ast.node(field);
+        const num_tokens = (fnode.first_token + fnode.num_tokens) - cmd_tok;
+        const children = [_]atom.Node{fnode};
+        return self.createNode(ast, .boxed, cmd_tok, num_tokens, &children, 0);
+    }
+
+    /// \textcolor{<spec>}{<text>}: the foreground color of the braced
+    /// argument ONLY. xcolor's \textcolor is `\leavevmode{\color…#2}`, so
+    /// the braces make the content an ORD GROUP — that is why the result is
+    /// a `.textcolor` atom and NOT a `.color` one. The two differ in the math
+    /// CLASS they report, which is measured, not assumed: at 20pt
+    /// `a\textcolor{red}{=}b` is 35.0pt wide, exactly `a\mathord{=}b`,
+    /// while `a\color{red}=b` keeps the 46.11pt of `a=b`. A colored
+    /// relation therefore loses its relation glue under \textcolor and keeps
+    /// it under \color. Both atoms carry `data` = 0xRRGGBBAA and exactly one
+    /// child, and both end their scope where the node ends.
+    ///
+    /// The second argument is a required braced group (not a math field):
+    /// LaTeX's \textcolor takes `#1` and `#2` as mandatory arguments, and
+    /// `\textcolor{red}x` is a LaTeX error, not the color of the rest of
+    /// the row.
+    fn textcolor(self: *Parser, ast: *atom.Ast, cmd_tok: u32) Error!u32 {
+        const col = try self.parseColorSpec();
+        const arg = try self.parseRequiredArg(ast);
+        const an = ast.node(arg);
+        // parseRequiredArg consumed the closing `}`, which the argument's
+        // own token range does not cover — the same +1 anchor \tag uses.
+        const num_tokens = (an.first_token + an.num_tokens + 1) - cmd_tok;
+        const children = [_]atom.Node{an};
+        const data = atom.colorData(col);
+        return self.createNode(ast, .textcolor, cmd_tok, num_tokens, &children, data);
+    }
+
+    /// The `<spec>` of \color / \textcolor: a braced group whose BYTES are
+    /// the color, read straight from the token spans (the lexer has already
+    /// split `red` or `#ff8000` into char tokens, so this never goes
+    /// through the atom parser — `#` and the hex digits are not math).
+    ///
+    /// The eleven names and the `#RRGGBB[AA]` forms come from
+    /// atom.parseColorChecked, so a typo is reported exactly as the CLI's
+    /// `-b` typo is. `none` / `transparent` mean TRANSPARENT INK there, not
+    /// "no scope": `\color{transparent}x` paints nothing, which is what
+    /// xcolor does, so the scope still exists and the {0,0,0,0} color is
+    /// recorded rather than inherited from the enclosing scope.
+    fn parseColorSpec(self: *Parser) Error!atom.Color {
+        const t = self.peek() orelse return self.fail(.missing_argument, self.spanAt(self.pos));
+        if (t.tag != .l_group) return self.fail(.missing_argument, spanOf(t));
+        const open_tok: u32 = @intCast(self.pos);
+        _ = self.advance(); // consume {
+        const start_tok: u32 = @intCast(self.pos);
+        while (self.peek()) |c| {
+            if (c.tag == .r_group) break;
+            _ = self.advance();
+        }
+        const end_tok: u32 = @intCast(self.pos);
+        const close = self.peek() orelse return self.fail(.unclosed_group, self.spanAt(open_tok));
+        if (close.tag != .r_group) return self.fail(.unclosed_group, self.spanAt(open_tok));
+        _ = self.advance(); // consume }
+        if (end_tok == start_tok) return self.fail(.missing_argument, self.spanAt(open_tok));
+        const st = self.tokens[start_tok];
+        const et = self.tokens[end_tok - 1];
+        const name = self.src[st.start..et.end];
+        // The span covers the offending color spec, braces excluded, so the
+        // caret points at `blak` and not at the whole construct. An
+        // undefined NAME reuses .unknown_command: parse_err has no
+        // "undefined identifier" kind, and this is exactly the failure of a
+        // name that is not in the table.
+        const bad: atom.Span = .{ .start = st.start, .end = et.end };
+        const parsed = atom.parseColorChecked(name) catch {
+            return self.fail(.unknown_command, bad);
+        };
+        return parsed orelse atom.Color{ .r = 0, .g = 0, .b = 0, .a = 0 };
+    }
+
+    /// \text{…} / \textit{…} / \textbf{…}: ONE raw byte run in one text face.
+    /// The result is a `.text` leaf whose `data` carries the CharStyle — the
+    /// layout text renderer re-reads the bytes from the node's span, so the run
+    /// keeps its source text verbatim (no Unicode math remapping: these are
+    /// TEXT faces, LM Roman Italic/Bold, not the MATH italic face).
+    ///
+    /// The leaf always spans the OUTER group, braces included, whatever the
+    /// argument holds: a nested \textit / \textbf / \text inside it is part of
+    /// that run's raw bytes and layout opens a face scope for each one, so the
+    /// whole-argument nest `\textit{\textbf{ab}}` and the partial nest
+    /// `\textbf{a\textit{b}c}` are the same single leaf and differ only in the
+    /// scopes layout finds inside it. Splitting the argument into several
+    /// leaves would need a per-brace AST the superflat tree has no room for,
+    /// and would drop source bytes the text renderer reads.
+    ///
+    /// Nesting COMBINES rather than overwrites (atom.combineTextStyles, applied
+    /// by that scope): \textit{\textbf{ab}} and \textbf{\textit{ab}} are both
+    /// BOLD ITALIC, because the inner command's face adds its modifiers to the
+    /// outer one's instead of replacing them.
+    fn textFace(self: *Parser, ast: *atom.Ast, face: atom.CharStyle) Error!u32 {
         const open = self.advance() orelse return self.fail(.missing_argument, self.spanAt(self.pos));
         if (open.tag != .l_group) return self.fail(.missing_argument, spanOf(open));
         const open_tok: u32 = @intCast(self.pos - 1);
+        // The whole argument, consumed ONCE: the balanced scan leaves self.pos
+        // just past the closing `}`, so whatever follows the run is the next
+        // atom of the enclosing row.
+        const close_tok = try self.scanBracedGroup(open_tok);
+        return ast.createLeaf(.text, open_tok, close_tok - open_tok + 1, @intFromEnum(face));
+    }
+
+    /// The token index of the `}` closing the group that opens at
+    /// `open_tok`, consuming every token through it. A missing `}` is
+    /// error.UnclosedGroup at the opening brace — the same site every other
+    /// braced argument reports. Nesting past `atom.max_text_nesting` is
+    /// error.NestingTooDeep, at that same opening brace: a raw text run deeper
+    /// than the bound has no layout-side face-scope stack to hold it.
+    fn scanBracedGroup(self: *Parser, open_tok: u32) Error!u32 {
         var depth: u32 = 1;
-        var close_tok: u32 = undefined;
-        while (depth > 0) {
-            // Unclosed \text group: point at its opening brace.
+        while (true) {
             const t = self.advance() orelse return self.fail(.unclosed_group, self.spanAt(open_tok));
-            if (t.tag == .l_group) {
-                depth += 1;
-            } else if (t.tag == .r_group) {
-                depth -= 1;
-                if (depth == 0) close_tok = @intCast(self.pos - 1);
+            switch (t.tag) {
+                .l_group => {
+                    depth += 1;
+                    if (depth > atom.max_text_nesting) {
+                        return self.fail(.nesting_too_deep, self.spanAt(open_tok));
+                    }
+                },
+                .r_group => {
+                    depth -= 1;
+                    if (depth == 0) return @intCast(self.pos - 1);
+                },
+                else => {},
             }
         }
-        const num_tokens = close_tok - open_tok + 1;
-        return ast.createLeaf(.text, open_tok, num_tokens, @intFromEnum(atom.CharStyle.roman));
     }
 
     /// \sqrt[degree]{radicand} → a row of the surd (U+221A, with the optional
@@ -1953,6 +2273,96 @@ pub const Parser = struct {
         const children = [_]atom.Node{ bn, mn };
         const num_tokens = (bn.first_token + bn.num_tokens) - cmd_tok;
         return self.createNode(ast, .row, cmd_tok, num_tokens, &children, accent_row_data);
+    }
+
+    /// \widehat{x} / \widetilde{x}: the EXTENSIBLE accents. The node is the
+    /// same [base, mark] accent row `accent` builds, carrying one of the two
+    /// wide markers so layout knows to pick the amsfonts branch:
+    /// amsfonts.sty:79-86 measures the argument in \textstyle and uses the
+    /// narrow \mathaccent"0362 / "0365 at or below 2em, the extensible
+    /// accent above it. Latin Modern Math maps neither U+0362 nor U+0365
+    /// (cmap lookup: both absent), so the mark is the U+0302 / U+0303 that
+    /// \hat / \tilde already draw — the same outlines amsfonts' narrow
+    /// branch resolves to. A mandatory braced group is TeX's \mathaccent
+    /// argument shape here, so a bare `\widehat x` is the one-atom form
+    /// \hat already accepts.
+    fn wideAccent(
+        self: *Parser,
+        ast: *atom.Ast,
+        cmd_tok: u32,
+        marker: u32,
+        cp: u21,
+    ) Error!u32 {
+        const base = try self.parseScriptArg(ast); // single atom or group
+        const bn = ast.node(base);
+        const mark = try ast.createLeaf(.char, cmd_tok, 1, cp);
+        const children = [_]atom.Node{ bn, ast.node(mark) };
+        const num_tokens = (bn.first_token + bn.num_tokens) - cmd_tok;
+        return self.createNode(ast, .row, cmd_tok, num_tokens, &children, marker);
+    }
+
+    /// \arraystretch{n}: a LaTeX assignment, not an atom — it sets the row
+    /// strut factor of the environments that follow. The node is a
+    /// zero-width `.space` leaf, exactly the shape a standalone \limits takes
+    /// (a space also suppresses the inter-atom glue on both sides in
+    /// layoutRow, so the assignment never shifts its neighbours), spanning
+    /// the command AND its braced argument. The factor itself travels in
+    /// `Stretch.factor` and lands on the environment's first row
+    /// (finishEnvRow), the one place layoutEnv can read it from: an `.env`
+    /// node's `data` is bit-exhausted by EnvBits, and a row's `data` is
+    /// otherwise free inside an environment because layoutEnv walks a row's
+    /// cells and never lays the row node out itself.
+    fn arraystretch(self: *Parser, ast: *atom.Ast, cmd_tok: u32) Error!u32 {
+        const arg = try self.parseRequiredArg(ast);
+        const an = ast.node(arg);
+        // The braced argument is one bare decimal factor (LaTeX's
+        // \arraystretch takes a number, not a dimension — no unit is
+        // scanned). An empty group, a non-number, or a non-finite one is
+        // MissingArgument at the argument's own span; the token span is
+        // read here rather than from the node's, which is empty for `{}`.
+        if (an.num_tokens == 0) return self.fail(.missing_argument, self.spanAt(an.first_token));
+        const st = self.tokens[an.first_token];
+        const et = self.tokens[an.first_token + an.num_tokens - 1];
+        const bad: atom.Span = .{ .start = st.start, .end = et.end };
+        const factor = std.fmt.parseFloat(f32, self.src[st.start..et.end]) catch
+            return self.fail(.missing_argument, bad);
+        if (!std.math.isFinite(factor)) return self.fail(.missing_argument, bad);
+        self.stretch = .{ .factor = atom.emToFixed(factor), .assigned = true };
+        const num_tokens = (an.first_token + an.num_tokens + 1) - cmd_tok;
+        return ast.createLeaf(.space, cmd_tok, num_tokens, atom.emToFixed(0));
+    }
+
+    /// \tag{n}: amsmath's equation number. amsmath.sty:1210-1212 typesets it
+    /// as `\hbox{\m@th\normalfont<arg>}` — upright text font, and NOT a noad
+    /// in the formula's list (it is built beside the display and placed at
+    /// the margin). The node is a `tag_row_data` row of ONE child: the
+    /// braced argument wrapped in a `.styled` roman scope, so the digits
+    /// draw exactly as \operatorname's roman letters do while the row still
+    /// reports an ord class (see layout's leftRole). The argument keeps its
+    /// own token span, so each drawn glyph aliases its real source bytes
+    /// (no synthetic flag, no arena copy) and the span lies inside `\tag{…}`.
+    fn tag(self: *Parser, ast: *atom.Ast, cmd_tok: u32) Error!u32 {
+        // At end of input there is no offending token for parseRequiredArg
+        // to point at, and its EOF span is zero-width — the CLI's caret
+        // needs real bytes, so the error covers the command itself.
+        if (self.atEnd()) return self.fail(.missing_argument, self.spanAt(cmd_tok));
+        const arg = try self.parseRequiredArg(ast);
+        const an = ast.node(arg);
+        const styled = try self.createNode(
+            ast,
+            .styled,
+            an.first_token,
+            an.num_tokens,
+            &[_]atom.Node{an},
+            @intFromEnum(atom.CharStyle.roman),
+        );
+        const sn = ast.node(styled);
+        const children = [_]atom.Node{sn};
+        // parseRequiredArg consumed the closing `}`, which the argument's own
+        // token range does not cover — the +1 is the same anchor \arraystretch
+        // uses, so the row spans `\tag{…}` whole.
+        const num_tokens = (sn.first_token + sn.num_tokens + 1) - cmd_tok;
+        return self.createNode(ast, .row, cmd_tok, num_tokens, &children, tag_row_data);
     }
 
     /// \not<relation> — the negation prefix (a diagonal slash through the
@@ -2087,9 +2497,19 @@ pub const Parser = struct {
             const leaf = try ast.createLeaf(.char, begin_tok, 1, cp);
             try children.append(self.gpa, ast.node(leaf));
         }
-        var rows = try self.parseEnvBody(ast);
-        defer rows.deinit(self.gpa);
-        for (rows.items) |r| try children.append(self.gpa, r);
+        // Each environment body starts at a row boundary. A NESTED
+        // environment's rules and cells are its own, so the enclosing
+        // body's counter is restored afterwards.
+        const outer_row_cells = self.env_row_cells;
+        defer self.env_row_cells = outer_row_cells;
+        self.env_row_cells = 0;
+        // `\arraystretch` needs nothing here: parseEnvBody hands the parser
+        // state back to the factor it opened with after every cell, so the
+        // body can neither leak an assignment out nor carry one from one
+        // cell into the next.
+        var entries = try self.parseEnvBody(ast);
+        defer entries.deinit(self.gpa);
+        for (entries.items) |r| try children.append(self.gpa, r);
         if (envCloseDelim(kind)) |cp| {
             const leaf = try ast.createLeaf(.char, begin_tok, 1, cp);
             try children.append(self.gpa, ast.node(leaf));
@@ -2110,17 +2530,64 @@ pub const Parser = struct {
     }
 
     /// The environment body: rows split on `\\` (an optional `[dimen]` row
-    /// gap is consumed and discarded), cells split on `&`. Each cell is a
-    /// row parsed in `.env_cell` mode (which stops at `&`, `\\`, `\end`,
-    /// `}`). Returns the row nodes — the children of the `.env` node.
+    /// gap is consumed and discarded), cells split on `&`, and `\hline`
+    /// entries BETWEEN rows. Each cell is a row parsed in `.env_cell` mode
+    /// (which stops at `&`, `\\`, `\end`, and at a leading `\hline`).
+    ///
+    /// Returns the `.env` node's entries — `.row` nodes and `.hline` rule
+    /// leaves interleaved in source order. A rule is NEITHER a row NOR a
+    /// cell: `\hline`, `a \\ \hline` and `a \\ \hline \\end` all yield
+    /// exactly the real rows, so a leading, intermediate or trailing rule
+    /// never fabricates an empty row. Repeated rules stay SEPARATE entries
+    /// (`\hline \hline` is two rules), exactly as written.
+    ///
+    /// `\arraystretch` is CELL-SCOPED in a body: the parser state returns to
+    /// the factor the body opened with after every cell, so the next cell —
+    /// and every environment that cell opens — reads the outer factor and
+    /// never the previous cell's assignment. The factor THIS environment's
+    /// own rows are built from is captured separately (`env_factor`) and
+    /// stamped on the first row alone.
     fn parseEnvBody(self: *Parser, ast: *atom.Ast) Error!std.ArrayList(atom.Node) {
-        var rows: std.ArrayList(atom.Node) = .empty;
-        errdefer rows.deinit(self.gpa);
+        var entries: std.ArrayList(atom.Node) = .empty;
+        errdefer entries.deinit(self.gpa);
         var cells: std.ArrayList(atom.Node) = .empty;
         defer cells.deinit(self.gpa);
+        // The state the body opened with: what every cell hands back, and
+        // what the body hands on to whatever follows it.
+        const outer_stretch = self.stretch;
+        defer self.stretch = outer_stretch;
+        // What this environment's own rows are built from. It starts at the
+        // factor the body opened with and follows the cells of the FIRST row
+        // that ASSIGN one — the row the stamp rides on. A cell that only
+        // inherits a factor leaves it alone, so a plain cell after the
+        // assigning one keeps that factor, a second assignment replaces it
+        // (the last one written wins), and
+        // `\begin{array}\hline\arraystretch{2}a…` still stretches.
+        var env_factor = outer_stretch.factor;
+        // 1 once a real `.row` entry exists. The `\arraystretch` factor rides
+        // on the FIRST ROW, so a leading `\hline` in front of it must not
+        // steal the stamp — the row is identified by its tag, not by its
+        // position in the entry list.
+        var have_row = false;
+        // 1 while the entry just appended was a rule. An all-empty row
+        // hanging off a TRAILING `\hline` is that rule's `\end` artefact,
+        // not a row the author wrote, so it is dropped instead of laid out.
+        // A plain trailing `\\` keeps the behavior it always had.
+        var after_rule = false;
         while (true) {
+            // A factor inherited from outside the body never claims the cell
+            // it lands in: only an assignment THIS cell makes is one.
+            self.stretch.assigned = false;
             const cell = try self.parseRow(ast, .env_cell);
             try cells.append(self.gpa, ast.node(cell));
+            // Only a cell that assigned a factor itself moves this
+            // environment's strut; a group, a `\left … \right` pair or a
+            // nested body inside the cell restored its own state, so its
+            // assignments never reach this line.
+            if (!have_row and self.stretch.assigned) env_factor = self.stretch.factor;
+            // Every cell hands the outer factor back, with no claim left over.
+            self.stretch = .{ .factor = outer_stretch.factor, .assigned = false };
+
             const nxt = self.peek();
             if (nxt == null) return self.fail(.unclosed_environment, self.spanAt(self.pos)); // no \end
             const t = nxt.?;
@@ -2131,16 +2598,46 @@ pub const Parser = struct {
                     // char parseRow left unparsed.
                     if (self.src[t.start] != '&') return self.fail(.unexpected_r_group, spanOf(t));
                     _ = self.advance(); // consume `&`
+                    self.env_row_cells += 1;
                 },
                 .command => {
                     const nm = self.src[t.start + 1 .. t.end];
                     if (std.mem.eql(u8, nm, "end")) {
                         // \end closes the environment: finalize the current
-                        // row only if it has cells (a trailing `\\` before
-                        // \end does not add an empty row — TeX's \crcr is
+                        // row only if it has cells — a trailing `\\` before
+                        // \end does not add an empty row (TeX's \crcr is
                         // absorbed after an explicit \cr).
-                        if (cells.items.len > 0) try self.finishEnvRow(ast, &rows, &cells);
-                        return rows;
+                        // After a TRAILING \hline there is no row left: the
+                        // empty cell parseRow returned belongs to the rule,
+                        // so it is dropped rather than laid out.
+                        if (cells.items.len > 0 and !(after_rule and self.rowIsEmpty(&cells))) {
+                            try self.finishEnvRow(ast, &entries, &cells, !have_row, env_factor);
+                        }
+                        return entries;
+                    }
+                    if (std.mem.eql(u8, nm, "hline")) {
+                        // A rule sits BETWEEN rows: finish the row above it
+                        // (when that row has real content), then emit the
+                        // rule as its own entry. An all-empty pending row —
+                        // the leading `\hline`, and every `\hline` right
+                        // after a `\\` — is dropped, never made into a row.
+                        const rule_tok: u32 = @intCast(self.pos);
+                        _ = self.advance(); // consume \hline
+                        if (self.rowIsEmpty(&cells)) {
+                            // Nothing was written on this line: drop the
+                            // placeholder cell, or the NEXT row would start
+                            // with it and gain a phantom column.
+                            cells.clearRetainingCapacity();
+                        } else {
+                            try self.finishEnvRow(ast, &entries, &cells, !have_row, env_factor);
+                            have_row = true;
+                            after_rule = false;
+                        }
+                        const rule = try ast.createLeaf(.hline, rule_tok, 1, 0);
+                        try entries.append(self.gpa, ast.node(rule));
+                        after_rule = true;
+                        self.env_row_cells = 0;
+                        continue;
                     }
                     if (std.mem.eql(u8, nm, "\\")) {
                         _ = self.advance(); // consume `\\`
@@ -2159,7 +2656,10 @@ pub const Parser = struct {
                                     return self.fail(.missing_argument, spanOf(close));
                             }
                         }
-                        try self.finishEnvRow(ast, &rows, &cells);
+                        try self.finishEnvRow(ast, &entries, &cells, !have_row, env_factor);
+                        have_row = true;
+                        after_rule = false;
+                        self.env_row_cells = 0;
                         continue;
                     }
                     return self.fail(.unexpected_r_group, spanOf(t));
@@ -2169,19 +2669,43 @@ pub const Parser = struct {
         }
     }
 
+    /// Whether the pending row carries no cell content at all — a single
+    /// empty cell. Such a row is what a leading/trailing `\hline` leaves
+    /// behind, never a row the author wrote, so it must not be appended.
+    fn rowIsEmpty(_: *Parser, cells: *const std.ArrayList(atom.Node)) bool {
+        return cells.items.len == 1 and cells.items[0].num_children == 0;
+    }
+
     /// Wrap the collected cells of the current row into a `.row` node and
-    /// append it to the env's rows.
+    /// append it to the env's entries. The FIRST ROW carries `env_factor` —
+    /// the factor this environment's rows are built from (the f32 em bits,
+    /// 0 = no assignment) — in its `data`, because a row's `data` is
+    /// otherwise unused inside an environment and `layoutEnv` reads it back
+    /// for the row struts. The caller passes `first_row`, because with
+    /// `\hline` in play "first" means the first `.row` ENTRY, not the first
+    /// entry of any kind: a leading rule must not steal the stamp from the
+    /// row behind it.
     fn finishEnvRow(
         self: *Parser,
         ast: *atom.Ast,
-        rows: *std.ArrayList(atom.Node),
+        entries: *std.ArrayList(atom.Node),
         cells: *std.ArrayList(atom.Node),
+        first_row: bool,
+        env_factor: u32,
     ) Error!void {
         const first = cells.items[0];
         const last = cells.items[cells.items.len - 1];
         const num_tokens = (last.first_token + last.num_tokens) - first.first_token;
-        const row = try self.createNode(ast, .row, first.first_token, num_tokens, cells.items, 0);
-        try rows.append(self.gpa, ast.node(row));
+        const data: u32 = if (first_row) env_factor else 0;
+        const row = try self.createNode(
+            ast,
+            .row,
+            first.first_token,
+            num_tokens,
+            cells.items,
+            data,
+        );
+        try entries.append(self.gpa, ast.node(row));
         cells.clearRetainingCapacity();
     }
 
@@ -2379,12 +2903,13 @@ pub const Parser = struct {
     /// dimensions are zeroed, never the content. `keep` is the keep mask the
     /// layout reads: \phantom keeps width AND height/depth, \vphantom only the
     /// vertical extent, \hphantom and \smash only the width.
-    fn phantom(self: *Parser, ast: *atom.Ast, cmd_tok: u32, keep: u32) Error!u32 {
+    fn phantom(self: *Parser, ast: *atom.Ast, cmd_tok: u32, keep: u32, is_smash: bool) Error!u32 {
         const content = try self.parseRequiredArg(ast);
         const cn = ast.node(content);
         const children = [_]atom.Node{cn};
         const num_tokens = (cn.first_token + cn.num_tokens) - cmd_tok;
-        return self.createNode(ast, .row, cmd_tok, num_tokens, &children, phantom_row_data | keep);
+        const flags: u32 = if (is_smash) smash_row else 0;
+        return self.createNode(ast, .row, cmd_tok, num_tokens, &children, phantom_row_data | flags | keep);
     }
 
     /// \smash[<axes>]{x} — amsmath's smash, whose optional argument selects
@@ -2426,7 +2951,10 @@ pub const Parser = struct {
                     return self.fail(.missing_argument, bad);
             }
         }
-        return self.phantom(ast, cmd_tok, keep);
+        // `smash` is the one family member whose box KEEPS its content: the
+        // bit is what tells layoutPhantom to hold the argument instead of
+        // draining it, because \smash[tb] and \hphantom share a keep mask.
+        return self.phantom(ast, cmd_tok, keep, true);
     }
 
     /// \underbrace{x}_{c} / \overbrace{x}^{c}: plain TeX's brace macro
@@ -2500,6 +3028,21 @@ pub const Parser = struct {
     /// dimension is `error.MissingArgument` at the offending span (an
     /// unclosed `{` reports `error.UnclosedGroup` at the brace, like every
     /// other braced argument here).
+    ///
+    /// The two forms scan DIFFERENTLY, because only the braced one is
+    /// delimited by `}`. A braced dimension is simply every char token
+    /// between the braces. A bare one is NOT a run of char tokens: the next
+    /// atom's letters are char tokens too, so `\kern 2mu+y` scanned as the
+    /// text `2mu+y` and was rejected. TeX's scan_dimen reads a number and
+    /// then scan_units reads letters while they can still complete a legal
+    /// unit, stopping at the first that cannot — so the bare scan is
+    /// `scanBareDim` below and `2mu+y` is a 2mu kern, then `+`, then `y`.
+    ///
+    /// The pt default for a run with no unit applies only when the run ENDS
+    /// there — `2` at end of source, or before a structural token such as `}`
+    /// or `^`. An ordinary char token right behind the digits (`2+y`, `2*3`)
+    /// means the author never closed the dimension and left the unit off,
+    /// which is TeX's "Illegal unit of measure".
     fn parseDimension(self: *Parser, braced: bool) Error!Dim {
         const open_tok: u32 = @intCast(self.pos);
         if (braced) {
@@ -2508,10 +3051,16 @@ pub const Parser = struct {
             _ = self.advance(); // consume {
         }
         const start_tok: u32 = @intCast(self.pos);
-        // The dimension is a run of char tokens (`1em`, `-2.5pt`, `4mu`).
-        while (self.peek()) |t| {
-            if (t.tag != .char) break;
-            _ = self.advance();
+        // A braced run has no unit scan at all: `}` delimits it. The bare
+        // scan reports whether it read one (see scanBareDim's contract).
+        var has_unit: bool = true;
+        if (braced) {
+            while (self.peek()) |t| {
+                if (t.tag != .char) break;
+                _ = self.advance();
+            }
+        } else {
+            has_unit = self.scanBareDim();
         }
         const end_tok: u32 = @intCast(self.pos);
         if (braced) {
@@ -2522,7 +3071,58 @@ pub const Parser = struct {
         const st = self.tokens[start_tok];
         const et = self.tokens[end_tok - 1];
         const bad: atom.Span = .{ .start = st.start, .end = et.end };
-        return parseDim(self.src[st.start..et.end]) orelse self.fail(.missing_argument, bad);
+        const dim = parseDim(self.src[st.start..et.end]) orelse
+            return self.fail(.missing_argument, bad);
+        // A bare number is a pt dimension — TeX's scan_dimen default — only
+        // when it IS the whole run. An ordinary char token right behind the
+        // digits (`2+y`, `2*3`) proves the run continued, so the unit is
+        // missing rather than defaulted: TeX's "Illegal unit of measure",
+        // reported at the run. A structural token or end of source ends it.
+        if (!braced and !has_unit and self.peekByte() != null) {
+            return self.fail(.missing_argument, bad);
+        }
+        return dim;
+    }
+
+    /// The single byte of the next token when it is a one-byte char token,
+    /// else null. A control sequence, a group delimiter or a multi-byte
+    /// glyph is never part of a dimension.
+    fn peekByte(self: *const Parser) ?u8 {
+        const t = self.peek() orelse return null;
+        if (t.tag != .char or t.end - t.start != 1) return null;
+        return self.src[t.start];
+    }
+
+    /// TeX's scan_dimen token run for a BARE `\kern` / `\mkern` dimension:
+    /// an optional sign, the digits with an optional fraction, then the
+    /// unit. The unit is scanned by TeX's scan_units rule — read letters
+    /// until they SPELL an accepted unit, then stop — so `2mu+y` is a 2mu
+    /// kern followed by `+y`, `1em+y` the same, `3pt+\alpha` a 3pt kern
+    /// followed by `+\alpha`, and `2emu` a 2em kern followed by the atom
+    /// `u`. A letter run that never spells a unit (`2zz`, `2px`, `2e`) is
+    /// consumed and then rejected by parseDim with the run's own span,
+    /// which is TeX's "Illegal unit of measure"; a number with no letters
+    /// at all is a bare pt, as in TeX. The accepted unit set is unchanged
+    /// — see `dim_unit_names`.
+    ///
+    /// Returns whether a unit was scanned. False means the run is a bare
+    /// number, which parseDimension accepts as pt only when the run ends
+    /// there.
+    fn scanBareDim(self: *Parser) bool {
+        if (self.peekByte()) |b| {
+            if (b == '-' or b == '+') _ = self.advance();
+        }
+        while (self.peekByte()) |b| {
+            if (!std.ascii.isDigit(b) and b != '.') break;
+            _ = self.advance();
+        }
+        const unit_start: u32 = @intCast(self.pos);
+        while (self.peekByte()) |b| {
+            if (!std.ascii.isAlphabetic(b)) break;
+            const t = self.advance() orelse break;
+            if (isDimUnit(self.src[self.tokens[unit_start].start..t.end])) return true;
+        }
+        return false;
     }
 
     /// Parse the \sqrt[n] degree: atoms until a `]` char at this row level.
@@ -2590,6 +3190,10 @@ pub const Parser = struct {
         const open = try self.parseDelimiter();
         self.delim_depth += 1;
         errdefer self.delim_depth -= 1;
+        // `\left … \right` bounds its interior like a group: a factor
+        // written between the delimiters ends with the pair.
+        const outer_stretch = self.stretch;
+        defer self.stretch = outer_stretch;
         const inner = try self.parseRow(ast, .delimited);
         // expect the matching \right — checked while the pair is still
         // "open" (delim_depth 1), so an error here unwinds via the
@@ -2663,6 +3267,22 @@ const Dim = struct {
     value: f32,
     unit: DimUnit,
 };
+
+/// The unit names parseDim accepts, spelled out one letter at a time by the
+/// bare `\kern` scan. This is the accepted set, unchanged: pt, bp, pc, in,
+/// cm, mm (absolute) and em, ex, mu (relative). TeX's other internal units
+/// — px, dd, cc, sp, nd, nc — stay rejected.
+const dim_unit_names = [_][]const u8{
+    "pt", "bp", "pc", "in", "cm", "mm", "em", "ex", "mu",
+};
+
+/// Whether `text` is one of the unit names parseDim accepts.
+fn isDimUnit(text: []const u8) bool {
+    for (dim_unit_names) |u| {
+        if (std.mem.eql(u8, u, text)) return true;
+    }
+    return false;
+}
 
 /// Parse `<sign><digits>[.<digits>]<unit>` (TeX's scan_dimen grammar, minus
 /// the internal units) from `text`, or null when it is not a dimension. The
@@ -3520,26 +4140,59 @@ test "parser: \\overset / \\underset / \\stackrel build a [script, base] row" {
 }
 
 test "parser: the phantom family carries its keep mask" {
-    const cases = [_]struct { src: []const u8, keep: u32 }{
+    const cases = [_]struct { src: []const u8, keep: u32, smash: bool }{
         // \phantom keeps the width AND the vertical extent
-        .{ .src = "\\phantom{ab}", .keep = keep_width | keep_vertical },
-        .{ .src = "\\vphantom{ab}", .keep = keep_vertical },
-        // \hphantom and \smash keep only the width — amsmath's \smash[tb]
-        // zeroes ht and dp and leaves the advance alone
-        .{ .src = "\\hphantom{ab}", .keep = keep_width },
-        .{ .src = "\\smash{ab}", .keep = keep_width },
-        .{ .src = "\\smash[tb]{ab}", .keep = keep_width },
-        .{ .src = "\\smash[t]{ab}", .keep = keep_width | keep_depth },
-        .{ .src = "\\smash[b]{ab}", .keep = keep_width | keep_height },
+        .{ .src = "\\phantom{ab}", .keep = keep_width | keep_vertical, .smash = false },
+        .{ .src = "\\vphantom{ab}", .keep = keep_vertical, .smash = false },
+        // \hphantom keeps only the width
+        .{ .src = "\\hphantom{ab}", .keep = keep_width, .smash = false },
+        // amsmath's \smash[<axes>] zeroes ht and/or dp and always keeps the
+        // advance, so its default [tb] shares \hphantom's mask — the smash
+        // bit is the ONLY thing that separates the two boxes.
+        .{ .src = "\\smash{ab}", .keep = keep_width, .smash = true },
+        .{ .src = "\\smash[tb]{ab}", .keep = keep_width, .smash = true },
+        .{ .src = "\\smash[t]{ab}", .keep = keep_width | keep_depth, .smash = true },
+        .{ .src = "\\smash[b]{ab}", .keep = keep_width | keep_height, .smash = true },
     };
     for (cases) |c| {
         var ast = try parseSrc(testing.allocator, c.src);
         defer ast.deinit();
         const row = ast.node(firstAtom(&ast));
         try testing.expectEqual(.row, row.tag);
-        try testing.expectEqual(phantom_row_data | c.keep, row.data);
+        const smash: u32 = if (c.smash) smash_row else 0;
+        try testing.expectEqual(phantom_row_data | smash | c.keep, row.data);
         try testing.expectEqual(@as(u16, 1), row.num_children);
     }
+}
+
+test "parser: only \\smash sets the keeps-content bit" {
+    // \smash[tb] and \hphantom are byte-identical masks, so the bit is the
+    // only discriminator layout has: set on EVERY \smash spelling, clear on
+    // every \phantom spelling.
+    const smashes = [_][]const u8{
+        "\\smash{ab}", "\\smash[t]{ab}", "\\smash[b]{ab}", "\\smash[tb]{ab}",
+    };
+    for (smashes) |src| {
+        var ast = try parseSrc(testing.allocator, src);
+        defer ast.deinit();
+        const row = ast.node(firstAtom(&ast));
+        try testing.expect(row.data & smash_row != 0);
+        try testing.expect(row.data & phantom_row_data != 0);
+    }
+    const phantoms = [_][]const u8{ "\\phantom{ab}", "\\hphantom{ab}", "\\vphantom{ab}" };
+    for (phantoms) |src| {
+        var ast = try parseSrc(testing.allocator, src);
+        defer ast.deinit();
+        const row = ast.node(firstAtom(&ast));
+        try testing.expect(row.data & smash_row == 0);
+    }
+    // the bit is disjoint from every other row marker
+    try testing.expectEqual(@as(u32, 0), smash_row & phantom_row_data);
+    try testing.expectEqual(@as(u32, 0), smash_row & kern_row_data);
+    try testing.expectEqual(@as(u32, 0), smash_row & tag_row_data);
+    try testing.expectEqual(@as(u32, 0), smash_row & keep_width);
+    try testing.expectEqual(@as(u32, 0), smash_row & keep_height);
+    try testing.expectEqual(@as(u32, 0), smash_row & keep_depth);
 }
 
 test "parser: \\underbrace takes an optional subscript annotation" {
@@ -3656,6 +4309,185 @@ fn expectSpanError(
     try testing.expectEqual(kind, info.kind);
     try testing.expect(info.span.end > info.span.start);
     try testing.expect(info.span.end <= src.len);
+}
+
+test "parser: \\arraystretch stamps its factor on the next env's first row" {
+    // The assignment is a zero-width space leaf in the enclosing row ...
+    var ast = try parseSrc(testing.allocator, "\\arraystretch{1.4}\\begin{matrix}a\\\\b\\end{matrix}");
+    defer ast.deinit();
+    const root = ast.node(ast.root);
+    try testing.expectEqual(@as(u16, 2), root.num_children);
+    const leaf = ast.child(ast.root, 0);
+    try testing.expectEqual(.space, ast.node(leaf).tag);
+    try testing.expectEqual(@as(f32, 0), atom.fixedToEm(ast.node(leaf).data));
+    // ... and the factor rides on the environment's first row.
+    const env = ast.child(ast.root, 1);
+    try testing.expectEqual(.env, ast.node(env).tag);
+    const row0 = ast.node(ast.child(env, 0));
+    try testing.expectEqual(.row, row0.tag);
+    const factor = atom.rowStretch(row0.data) orelse return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(@as(f32, 1.4), factor, 1e-6);
+    // Only the FIRST row carries it; the rest keep the "unset" encoding.
+    try testing.expectEqual(@as(u32, 0), ast.node(ast.child(env, 1)).data);
+}
+
+test "parser: an environment without \\arraystretch keeps the unset encoding" {
+    var ast = try parseSrc(testing.allocator, "\\begin{cases}a\\\\b\\end{cases}");
+    defer ast.deinit();
+    const env = firstAtom(&ast);
+    // cases brackets its rows with a `{` delimiter leaf, so row 0 is child 1.
+    try testing.expectEqual(.char, ast.node(ast.child(env, 0)).tag);
+    try testing.expectEqual(@as(u32, 0), ast.node(ast.child(env, 1)).data);
+    try testing.expect(atom.rowStretch(0) == null);
+}
+
+test "parser: \\arraystretch rejects a non-numeric factor with a span" {
+    var info: parse_err.Info = undefined;
+    try expectSpanError(
+        &info,
+        error.MissingArgument,
+        "\\arraystretch{two}\\begin{matrix}a\\end{matrix}",
+        .missing_argument,
+    );
+    try expectSpanError(
+        &info,
+        error.MissingArgument,
+        "\\arraystretch{}\\begin{matrix}a\\end{matrix}",
+        .missing_argument,
+    );
+}
+
+test "parser: \\tag is a row of the braced argument in a roman scope" {
+    var ast = try parseSrc(testing.allocator, "x=1 \\tag{3}");
+    defer ast.deinit();
+    // The \tag row is the THIRD atom of the enclosing row — "first atom" is
+    // the `x` char leaf — so pick the node the tag marker actually marks.
+    const root = ast.node(ast.root);
+    var marked: ?u32 = null;
+    for (0..root.num_children) |i| {
+        const cn = ast.node(ast.child(ast.root, i));
+        if (cn.tag == .row and cn.data == tag_row_data) {
+            marked = ast.child(ast.root, i);
+            break;
+        }
+    }
+    const tag_node = marked orelse return error.TestUnexpectedResult;
+    const row = ast.node(tag_node);
+    try testing.expectEqual(.row, row.tag);
+    try testing.expectEqual(tag_row_data, row.data);
+    try testing.expectEqual(@as(u16, 1), row.num_children);
+    // The whole construct's span, byte for byte out of the original input,
+    // so the drawn glyphs lie inside `\tag{3}`.
+    const sp = ast.span(tag_node);
+    try testing.expectEqual(@as(u32, 4), sp.start);
+    try testing.expectEqual(@as(u32, 11), sp.end);
+    try testing.expectEqualStrings("\\tag{3}", ast.src[sp.start..sp.end]);
+    const styled_idx = ast.child(tag_node, 0);
+    const styled = ast.node(styled_idx);
+    try testing.expectEqual(.styled, styled.tag);
+    try testing.expectEqual(@intFromEnum(atom.CharStyle.roman), styled.data);
+    // The argument keeps its OWN token span, so its glyph aliases the real
+    // source bytes instead of a synthesized copy.
+    const arg = ast.node(ast.child(styled_idx, 0));
+    try testing.expectEqual(.row, arg.tag);
+    const arg_sp = ast.span(styled_idx);
+    try testing.expectEqualStrings("3", ast.src[arg_sp.start..arg_sp.end]);
+}
+
+test "parser: \\tag requires its braced argument" {
+    var info: parse_err.Info = undefined;
+    try expectSpanError(&info, error.MissingArgument, "x \\tag", .missing_argument);
+    try expectSpanError(&info, error.UnclosedGroup, "x \\tag{3", .unclosed_group);
+}
+
+test "parser: \\widehat / \\widetilde build a [base, mark] wide-accent row" {
+    const cases = [_]struct { src: []const u8, data: u32, mark: u21 }{
+        .{ .src = "\\widehat{abc}", .data = wide_hat_row_data, .mark = 0x0302 },
+        .{ .src = "\\widetilde{abc}", .data = wide_tilde_row_data, .mark = 0x0303 },
+    };
+    for (cases) |c| {
+        var ast = try parseSrc(testing.allocator, c.src);
+        defer ast.deinit();
+        const wide = firstAtom(&ast);
+        const row = ast.node(wide);
+        try testing.expectEqual(.row, row.tag);
+        try testing.expectEqual(c.data, row.data);
+        try testing.expectEqual(@as(u16, 2), row.num_children);
+        // The base is the braced group; the mark is a char leaf carrying the
+        // combining codepoint in `data`, exactly like \hat / \tilde.
+        try testing.expectEqual(.group, ast.node(ast.child(wide, 0)).tag);
+        const mark = ast.node(ast.child(wide, 1));
+        try testing.expectEqual(.char, mark.tag);
+        try testing.expectEqual(c.mark, @as(u21, @truncate(mark.data)));
+        const sp = ast.span(wide);
+        try testing.expectEqualStrings(c.src, ast.src[sp.start..sp.end]);
+    }
+    // The markers must not collide with the rows layoutInner routes on.
+    try testing.expect(wide_hat_row_data != accent_row_data);
+    try testing.expect(wide_tilde_row_data != wide_hat_row_data);
+    try testing.expectEqual(@as(u32, 0), wide_hat_row_data & phantom_row_data);
+    try testing.expectEqual(@as(u32, 0), wide_tilde_row_data & phantom_row_data);
+    try testing.expectEqual(@as(u32, 0), wide_hat_row_data & kern_row_data);
+    try testing.expectEqual(@as(u32, 0), tag_row_data & (phantom_row_data | kern_row_data));
+}
+
+test "parser: a bare \\kern dimension stops before the next atom" {
+    // The scan is a number plus a recognized unit, not a greedy run of char
+    // tokens: `\kern 2mu+y` used to be read as the text `2mu+y` and fail.
+    const cases = [_]struct { src: []const u8, unit: u32, value: f32 }{
+        .{ .src = "x+\\kern 2mu+y", .unit = dim_mu, .value = 2 },
+        .{ .src = "x+\\kern1em+y", .unit = dim_em, .value = 1 },
+        .{ .src = "x+\\kern 3pt+\\alpha", .unit = dim_pt, .value = 3 },
+        .{ .src = "x+\\kern 2mu", .unit = dim_mu, .value = 2 },
+        .{ .src = "x+\\mkern-2.5mu", .unit = dim_mu, .value = -2.5 },
+        // TeX's scan_units stops as soon as the letters spell a unit, so the
+        // trailing `u` is an ordinary atom, not a rejected dimension.
+        .{ .src = "x+\\kern 2emu", .unit = dim_em, .value = 2 },
+        // The same constructs at the START of the source, where the run is
+        // terminated by the following operator rather than by end of input.
+        .{ .src = "\\kern2mu+y", .unit = dim_mu, .value = 2 },
+        .{ .src = "\\kern 3pt+\\alpha", .unit = dim_pt, .value = 3 },
+        // A bare number is still TeX's pt default when the run ENDS it.
+        .{ .src = "\\kern 2", .unit = dim_pt, .value = 2 },
+    };
+    for (cases) |c| {
+        var ast = try parseSrc(testing.allocator, c.src);
+        defer ast.deinit();
+        const root = ast.node(ast.root);
+        var found = false;
+        for (0..root.num_children) |i| {
+            const cn = ast.node(ast.child(ast.root, i));
+            if (cn.tag == .row and cn.data & kern_row_data != 0) {
+                try testing.expectEqual(kern_row_data | c.unit, cn.data);
+                const leaf = ast.node(ast.child(ast.child(ast.root, i), 0));
+                try testing.expectApproxEqAbs(c.value, atom.fixedToEm(leaf.data), 1e-5);
+                found = true;
+            }
+        }
+        try testing.expect(found);
+    }
+}
+
+test "parser: a bare \\kern with no legal unit fails with a span" {
+    var info: parse_err.Info = undefined;
+    // No unit at all, and a unit no accepted name starts with — TeX's
+    // "Illegal unit of measure", reported at the scanned run.
+    try expectSpanError(&info, error.MissingArgument, "x+\\kern 2+y", .missing_argument);
+    try expectSpanError(&info, error.MissingArgument, "x+\\kern 2zz", .missing_argument);
+    try expectSpanError(&info, error.MissingArgument, "x+\\kern 2e", .missing_argument);
+    // The unit set is unchanged: TeX's px/dd/cc/sp/nd/nc stay rejected.
+    try expectSpanError(&info, error.MissingArgument, "x+\\kern 2px", .missing_argument);
+    // The braced form still takes everything between the braces.
+    try expectSpanError(&info, error.MissingArgument, "\\hspace{2zz}", .missing_argument);
+}
+
+test "parser: a bare \\kern run with no unit reports the run's own span" {
+    var info: parse_err.Info = undefined;
+    const src = "x+\\kern 2+y";
+    try expectSpanError(&info, error.MissingArgument, src, .missing_argument);
+    // The caret covers the scanned run — the digits whose unit is missing —
+    // not the operator that proved the run never ended.
+    try testing.expectEqualStrings("2", src[info.span.start..info.span.end]);
 }
 
 // ── supported_commands ──────────────────────────
@@ -3794,11 +4626,13 @@ test "parser: the \\mathXXX family wraps a math field in a class row" {
     const cases = [_]struct { src: []const u8, cls: atom.MathClass }{
         .{ .src = "\\mathord{a}", .cls = .ord },
         .{ .src = "\\mathrel{a}", .cls = .rel },
+        .{ .src = "\\mathbin{a}", .cls = .bin },
         .{ .src = "\\mathopen{a}", .cls = .open },
         .{ .src = "\\mathclose{a}", .cls = .close },
         .{ .src = "\\mathpunct{a}", .cls = .punct },
         .{ .src = "\\mathinner{a}", .cls = .inner },
         .{ .src = "\\mathord a", .cls = .ord },
+        .{ .src = "\\mathbin a", .cls = .bin },
     };
     for (cases) |c| {
         var ast = try parseSrc(testing.allocator, c.src);
@@ -3811,6 +4645,7 @@ test "parser: the \\mathXXX family wraps a math field in a class row" {
         try testing.expectEqual(atom.classRowData(c.cls), row.data);
     }
     try testing.expectError(error.MissingScript, parseSrc(testing.allocator, "\\mathrel"));
+    try testing.expectError(error.MissingScript, parseSrc(testing.allocator, "\\mathbin"));
 }
 
 test "parser: \\colon is punctuation while a bare : is a plain char" {
@@ -3967,4 +4802,362 @@ test "parser: symbol and mathstyle tables are reachable too" {
     var ast2 = try parseSrc(testing.allocator, "\\displaystyle x");
     defer ast2.deinit();
     try testing.expectEqual(.mathstyle, ast2.node(ast2.child(ast2.root, 0)).tag);
+}
+
+test "parser: \\boxed frames exactly one math field" {
+    // A math FIELD, like \overline: the braced group is the usual form and
+    // a bare atom is accepted; either way ONE child.
+    for ([_][]const u8{ "\\boxed{x}", "\\boxed x", "\\boxed{\\frac{a}{b}}" }) |src| {
+        var ast = try parseSrc(testing.allocator, src);
+        defer ast.deinit();
+        const boxed = ast.node(firstAtom(&ast));
+        try testing.expectEqual(.boxed, boxed.tag);
+        try testing.expectEqual(@as(u16, 1), boxed.num_children);
+        try testing.expectEqual(@as(u32, 0), boxed.data);
+    }
+    // The span covers the command through the end of the field.
+    var ast = try parseSrc(testing.allocator, "\\boxed{xy}");
+    defer ast.deinit();
+    const span = ast.span(firstAtom(&ast));
+    try testing.expectEqualStrings("\\boxed{xy}", ast.src[span.start..span.end]);
+    // A script after the frame attaches to the frame, like any base.
+    var scripted = try parseSrc(testing.allocator, "\\boxed{x}^2");
+    defer scripted.deinit();
+    try testing.expectEqual(.script, scripted.node(firstAtom(&scripted)).tag);
+    try testing.expectError(error.MissingScript, parseSrc(testing.allocator, "\\boxed"));
+}
+
+test "parser: \\textcolor colors its argument only, with the full span" {
+    var ast = try parseSrc(testing.allocator, "a\\textcolor{red}{b}c");
+    defer ast.deinit();
+    // The color node is the SECOND atom; `a` and `c` stay uncolored.
+    const root = ast.node(ast.root);
+    try testing.expectEqual(@as(u16, 3), root.num_children);
+    const scope = ast.node(ast.child(ast.root, 1));
+    try testing.expectEqual(.textcolor, scope.tag);
+    try testing.expectEqual(@as(u16, 1), scope.num_children);
+    try testing.expectEqual(atom.colorData(.{ .r = 255, .g = 0, .b = 0 }), scope.data);
+    // the node spans the whole command, spec and argument
+    const span = ast.span(ast.child(ast.root, 1));
+    try testing.expectEqualStrings("\\textcolor{red}{b}", ast.src[span.start..span.end]);
+    // the single child is the argument's own content
+    const arg = ast.span(ast.child(ast.child(ast.root, 1), 0));
+    try testing.expectEqualStrings("b", ast.src[arg.start..arg.end]);
+}
+
+test "parser: the atoms before a \\color declaration stay outside its scope" {
+    // At the top level the scope runs to the end of the root row, so the
+    // atoms BEFORE the declaration are outside it.
+    var ast = try parseSrc(testing.allocator, "a\\color{red}bc");
+    defer ast.deinit();
+    const root = ast.node(ast.root);
+    try testing.expectEqual(@as(u16, 2), root.num_children);
+    const scope = ast.node(ast.child(ast.root, 1));
+    try testing.expectEqual(.color, scope.tag);
+    try testing.expectEqual(@as(u16, 1), scope.num_children);
+    // the scope's one child is the REST of the row, `bc`
+    const rest = ast.span(ast.child(ast.child(ast.root, 1), 0));
+    try testing.expectEqualStrings("bc", ast.src[rest.start..rest.end]);
+    // the scope itself spans `\color{red}bc`
+    const span = ast.span(ast.child(ast.root, 1));
+    try testing.expectEqualStrings("\\color{red}bc", ast.src[span.start..span.end]);
+}
+
+test "parser: a color declaration with nothing after it still has a span" {
+    // The sub-row is empty, so the node's token range must come from the
+    // command and its spec — a zero-token node would lose its provenance.
+    var ast = try parseSrc(testing.allocator, "\\color{red}");
+    defer ast.deinit();
+    const scope = ast.node(firstAtom(&ast));
+    try testing.expectEqual(.color, scope.tag);
+    const span = ast.span(firstAtom(&ast));
+    try testing.expectEqualStrings("\\color{red}", ast.src[span.start..span.end]);
+}
+
+test "parser: color specs accept names, hex, and the transparent forms" {
+    const cases = [_]struct { src: []const u8, color: atom.Color }{
+        .{ .src = "\\color{red}x", .color = .{ .r = 255, .g = 0, .b = 0 } },
+        .{ .src = "\\color{green}x", .color = .{ .r = 0, .g = 128, .b = 0 } },
+        .{ .src = "\\color{#00ff00}x", .color = .{ .r = 0, .g = 255, .b = 0 } },
+        .{ .src = "\\color{#0000ff80}x", .color = .{ .r = 0, .g = 0, .b = 255, .a = 128 } },
+        // `none` / `transparent` are TRANSPARENT INK here, not "no scope":
+        // the scope exists and its color really is {0,0,0,0}.
+        .{ .src = "\\color{none}x", .color = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
+        .{ .src = "\\color{transparent}x", .color = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
+    };
+    for (cases) |c| {
+        var ast = try parseSrc(testing.allocator, c.src);
+        defer ast.deinit();
+        const scope = ast.node(firstAtom(&ast));
+        try testing.expectEqual(.color, scope.tag);
+        try testing.expectEqual(c.color, atom.nodeColor(scope.data));
+    }
+}
+
+test "parser: a malformed color spec is a spanned error" {
+    var info: parse_err.Info = undefined;
+    // no brace at all: the offending token is the one that should have
+    // opened the spec
+    try expectSpanError(&info, error.MissingArgument, "\\color red", .missing_argument);
+    // an empty spec has no color to name
+    try expectSpanError(&info, error.MissingArgument, "\\color{}x", .missing_argument);
+    // the group is never closed
+    try expectSpanError(&info, error.UnclosedGroup, "\\color{red", .unclosed_group);
+    try expectSpanError(&info, error.UnclosedGroup, "\\color{red x", .unclosed_group);
+    // an undefined name: the span covers the spec text itself
+    try expectSpanError(&info, error.UnknownCommand, "\\color{blak}x", .unknown_command);
+    // a bad hex digit is the same failure as a bad name
+    try expectSpanError(&info, error.UnknownCommand, "\\color{#zz0000}x", .unknown_command);
+    // \textcolor needs BOTH arguments; the missing one at end of input has no
+    // offending token, so only the error VALUE is assertable there.
+    try testing.expectError(error.MissingArgument, parseSrc(testing.allocator, "\\textcolor{red}"));
+    try expectSpanError(&info, error.UnclosedGroup, "\\textcolor{red}{x", .unclosed_group);
+    // the caret must point at the spec, not at the whole construct
+    var ast = atom.Ast.init(testing.allocator, "\\color{blak}x");
+    defer ast.deinit();
+    try lexer.lex(&ast, &info);
+    var p = Parser.init(testing.allocator, ast.src, ast.tokens.items, &info);
+    try testing.expectError(error.UnknownCommand, p.parse(&ast));
+    try testing.expectEqualStrings("blak", ast.src[info.span.start..info.span.end]);
+}
+
+test "parser: \\text / \\textit / \\textbf are one raw text leaf in the requested face" {
+    const cases = [_]struct {
+        src: []const u8,
+        style: atom.CharStyle,
+        span: []const u8,
+        text: []const u8,
+    }{
+        .{ .src = "\\text{ab}", .style = .roman, .span = "{ab}", .text = "ab" },
+        .{ .src = "\\textit{ab}", .style = .text_italic, .span = "{ab}", .text = "ab" },
+        .{ .src = "\\textbf{ab}", .style = .bold, .span = "{ab}", .text = "ab" },
+        // an empty run is legal and still a leaf
+        .{ .src = "\\textit{}", .style = .text_italic, .span = "{}", .text = "" },
+        // a partial nest stays in the run's bytes; the leaf still carries the
+        // OUTER face (the inner scopes are layout's)
+        .{
+            .src = "\\textbf{a\\textit{b}c}",
+            .style = .bold,
+            .span = "{a\\textit{b}c}",
+            .text = "a\\textit{b}c",
+        },
+    };
+    for (cases) |c| {
+        var ast = try parseSrc(testing.allocator, c.src);
+        defer ast.deinit();
+        const leaf = ast.node(firstAtom(&ast));
+        try testing.expectEqual(.text, leaf.tag);
+        try testing.expectEqual(@as(u16, 0), leaf.num_children);
+        try testing.expectEqual(@as(u32, @intFromEnum(c.style)), leaf.data);
+        // The span is the run's OWN braces: the command is consumed (never
+        // typeset), and the drawn bytes are everything between the braces.
+        const span = ast.span(firstAtom(&ast));
+        try testing.expectEqualStrings(c.span, ast.src[span.start..span.end]);
+        try testing.expectEqualStrings(c.text, ast.src[span.start + 1 .. span.end - 1]);
+    }
+}
+
+test "parser: a nested text face is one run, and the outer cursor resumes after it" {
+    // Whole-argument and partial nests are the SAME leaf: the run keeps its raw
+    // bytes and the face it carries is the outer command's. The face scopes
+    // inside the run are layout's, not the parser's.
+    const cases = [_]struct { src: []const u8, style: atom.CharStyle }{
+        .{ .src = "\\textit{\\textbf{ab}}", .style = .text_italic },
+        .{ .src = "\\textbf{\\textit{ab}}", .style = .bold },
+        .{ .src = "\\textit{\\textbf{\\textit{ab}}}", .style = .text_italic },
+        .{ .src = "\\textit{\\text{ab}}", .style = .text_italic },
+        .{ .src = "\\text{a\\textit{b}c}", .style = .roman },
+    };
+    for (cases) |c| {
+        var ast = try parseSrc(testing.allocator, c.src);
+        defer ast.deinit();
+        const leaf = ast.node(firstAtom(&ast));
+        try testing.expectEqual(.text, leaf.tag);
+        try testing.expectEqual(@as(u16, 0), leaf.num_children);
+        try testing.expectEqual(@as(u32, @intFromEnum(c.style)), leaf.data);
+        const span = ast.span(firstAtom(&ast));
+        try testing.expectEqual(c.src.len, @as(usize, span.end));
+        try testing.expectEqual(@as(u8, '{'), c.src[span.start]);
+        try testing.expectEqual(@as(u8, '}'), c.src[span.end - 1]);
+    }
+    // The run is consumed whole, so what follows it is still the next atom of
+    // the row — the inner group's `}` never ends the run early.
+    var ast = try parseSrc(testing.allocator, "\\textbf{a\\textit{b}c}x");
+    defer ast.deinit();
+    const root = ast.node(ast.root);
+    try testing.expectEqual(@as(u16, 2), root.num_children);
+    const run = ast.node(ast.child(ast.root, 0));
+    try testing.expectEqual(.text, run.tag);
+    try testing.expectEqual(@as(u32, @intFromEnum(atom.CharStyle.bold)), run.data);
+    const tail = ast.node(ast.child(ast.root, 1));
+    try testing.expectEqual(.char, tail.tag);
+    const tail_span = ast.span(ast.child(ast.root, 1));
+    try testing.expectEqualStrings("x", ast.src[tail_span.start..tail_span.end]);
+}
+
+test "parser: a text run deeper than the face-scope bound is NestingTooDeep" {
+    // Layout opens a face scope per nested group inside the run, in a fixed
+    // stack of `atom.max_text_nesting`, so a deeper run has no representation.
+    var info: parse_err.Info = undefined;
+    const over = atom.max_text_nesting + 8;
+    const deep = "\\text{" ++ "{" ** over ++ "a" ++ "}" ** over ++ "}";
+    try expectSpanError(&info, error.NestingTooDeep, deep, .nesting_too_deep);
+    // the run's own brace counts as one level, so the bound is inclusive
+    const within = atom.max_text_nesting - 1;
+    const ok = "\\text{" ++ "{" ** within ++ "a" ++ "}" ** within ++ "}";
+    var ast = try parseSrc(testing.allocator, ok);
+    defer ast.deinit();
+    const span = ast.span(firstAtom(&ast));
+    try testing.expectEqual(ok.len, @as(usize, span.end));
+}
+
+test "parser: a text face needs its braced run" {
+    var info: parse_err.Info = undefined;
+    // At end of input there is no offending token, so only the error VALUE
+    // is assertable (the Info span is the documented zero-width EOF caret).
+    try testing.expectError(error.MissingArgument, parseSrc(testing.allocator, "\\textit"));
+    try testing.expectError(error.MissingArgument, parseSrc(testing.allocator, "\\textbf"));
+    // a bare atom is not a run: \textit takes a mandatory group
+    try expectSpanError(&info, error.MissingArgument, "\\textit ab", .missing_argument);
+    // the run must close
+    try expectSpanError(&info, error.UnclosedGroup, "\\textit{ab", .unclosed_group);
+    // nested braces are balanced, not taken literally
+    var ast = try parseSrc(testing.allocator, "\\textit{a{b}c}");
+    defer ast.deinit();
+    const span = ast.span(firstAtom(&ast));
+    try testing.expectEqualStrings("a{b}c", ast.src[span.start + 1 .. span.end - 1]);
+}
+
+test "parser: \\hline is a rule entry BETWEEN rows, never a row" {
+    const cases = [_]struct {
+        src: []const u8,
+        want: []const atom.Tag,
+    }{
+        // leading rule, then two rows
+        .{
+            .src = "\\begin{array}{cc}\\hline a&b\\\\c&d\\end{array}",
+            .want = &.{ .hline, .row, .row },
+        },
+        // intermediate rule
+        .{
+            .src = "\\begin{array}{cc}a&b\\\\\\hline c&d\\end{array}",
+            .want = &.{ .row, .hline, .row },
+        },
+        // trailing rule
+        .{
+            .src = "\\begin{array}{cc}a&b\\\\c&d\\\\\\hline\\end{array}",
+            .want = &.{ .row, .row, .hline },
+        },
+        // leading AND trailing: the integration case
+        .{
+            .src = "\\begin{array}{cc}\\hline a&b\\\\\\hline c&d\\\\\\hline\\end{array}",
+            .want = &.{ .hline, .row, .hline, .row, .hline },
+        },
+        // repeated rules stay separate entries
+        .{
+            .src = "\\begin{matrix}a\\\\\\hline\\hline b\\end{matrix}",
+            .want = &.{ .row, .hline, .hline, .row },
+        },
+        // no rules at all: unchanged
+        .{
+            .src = "\\begin{matrix}a\\\\b\\end{matrix}",
+            .want = &.{ .row, .row },
+        },
+    };
+    for (cases) |c| {
+        var ast = try parseSrc(testing.allocator, c.src);
+        defer ast.deinit();
+        const env = ast.child(ast.root, 0);
+        try testing.expectEqual(.env, ast.node(env).tag);
+        const env_node = ast.node(env);
+        try testing.expectEqual(c.want.len, @as(usize, env_node.num_children));
+        for (c.want, 0..) |tag, i| {
+            const entry = ast.node(ast.child(env, i));
+            try testing.expectEqual(tag, entry.tag);
+            // a rule is a LEAF: it has no cells and no row of its own
+            if (tag == .hline) try testing.expectEqual(@as(u16, 0), entry.num_children);
+        }
+    }
+}
+
+test "parser: a rule entry keeps the environment's delimiters outside it" {
+    // pmatrix brackets the ENTRIES, so a rule must not be mistaken for a
+    // closing delimiter.
+    var ast = try parseSrc(
+        testing.allocator,
+        "\\begin{pmatrix}\\hline a\\\\b\\end{pmatrix}",
+    );
+    defer ast.deinit();
+    const env = ast.node(ast.child(ast.root, 0));
+    // open '(' + hline + row + row + close ')'
+    try testing.expectEqual(@as(u16, 5), env.num_children);
+    try testing.expectEqual(.char, ast.node(ast.child(ast.child(ast.root, 0), 0)).tag);
+    try testing.expectEqual(.hline, ast.node(ast.child(ast.child(ast.root, 0), 1)).tag);
+    try testing.expectEqual(.row, ast.node(ast.child(ast.child(ast.root, 0), 2)).tag);
+    try testing.expectEqual(.row, ast.node(ast.child(ast.child(ast.root, 0), 3)).tag);
+    try testing.expectEqual(.char, ast.node(ast.child(ast.child(ast.root, 0), 4)).tag);
+}
+
+test "parser: \\arraystretch stamps the first ROW, not a leading rule" {
+    // The factor rides on the first `.row` entry, so a leading \hline in
+    // front of it must not steal the stamp.
+    var ast = try parseSrc(
+        testing.allocator,
+        "\\arraystretch{1.4}\\begin{array}{cc}\\hline a&b\\end{array}",
+    );
+    defer ast.deinit();
+    const env = ast.child(ast.root, 1);
+    try testing.expectEqual(.hline, ast.node(ast.child(env, 0)).tag);
+    const row0 = ast.node(ast.child(env, 1));
+    try testing.expectEqual(.row, row0.tag);
+    const factor = atom.rowStretch(row0.data) orelse return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(@as(f32, 1.4), factor, 1e-6);
+}
+
+test "parser: a repeated \\arraystretch inside one group still applies" {
+    // The LAST assignment before the environment wins.
+    var ast = try parseSrc(
+        testing.allocator,
+        "\\arraystretch{2}\\arraystretch{1.5}\\begin{matrix}a\\end{matrix}",
+    );
+    defer ast.deinit();
+    const env = ast.child(ast.root, 2);
+    const factor = atom.rowStretch(ast.node(ast.child(env, 0)).data) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(@as(f32, 1.5), factor, 1e-6);
+}
+
+test "parser: \\hline outside an environment or inside a cell is a spanned error" {
+    var info: parse_err.Info = undefined;
+    // outside any environment, at the top level and inside a group
+    try expectSpanError(&info, error.MisplacedHline, "\\hline", .misplaced_hline);
+    try expectSpanError(&info, error.MisplacedHline, "x+\\hline+y", .misplaced_hline);
+    try expectSpanError(&info, error.MisplacedHline, "{\\hline}", .misplaced_hline);
+    try expectSpanError(&info, error.MisplacedHline, "\\frac{a}{\\hline}", .misplaced_hline);
+    // inside a cell: TeX's \noalign is legal solely between rows
+    try expectSpanError(
+        &info,
+        error.MisplacedHline,
+        "\\begin{matrix}a \\hline b\\end{matrix}",
+        .misplaced_hline,
+    );
+    try expectSpanError(
+        &info,
+        error.MisplacedHline,
+        "\\begin{matrix}a & \\hline b\\end{matrix}",
+        .misplaced_hline,
+    );
+    try expectSpanError(
+        &info,
+        error.MisplacedHline,
+        "\\begin{matrix}{a \\hline}\\end{matrix}",
+        .misplaced_hline,
+    );
+    // the caret covers the offending command itself
+    var ast = atom.Ast.init(testing.allocator, "x+\\hline+y");
+    defer ast.deinit();
+    try lexer.lex(&ast, &info);
+    var p = Parser.init(testing.allocator, ast.src, ast.tokens.items, &info);
+    try testing.expectError(error.MisplacedHline, p.parse(&ast));
+    try testing.expectEqualStrings("\\hline", ast.src[info.span.start..info.span.end]);
 }

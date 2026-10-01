@@ -10,12 +10,14 @@
 //!   always; glyph outlines (`glyphOutline`) read `loca`/`glyf` (quadratic
 //!   TrueType) or execute the Type 2 charstring + Subr INDEXes from the
 //!   `CFF ` table (cubic, flattened to quadratics). The `MATH` table is
-//!   parsed when present (mathConstants/mathValues/variants/assembly) and
-//!   costs nothing when absent: a face without it reports no math data.
+//!   parsed when present (mathConstants/mathValues and the vertical AND
+//!   horizontal variants/assemblies) and costs nothing when absent: a face
+//!   without it reports no math data.
 //! - `FontContext`: the "init once, render many" core. Owns the embedded
-//!   Latin Modern fallback faces (LM Math + LM Roman regular/bold),
-//!   caches faces loaded from disk by path, memoizes disk discovery in
-//!   `findFont`, and serves per-(face, cp) metric lookups from a cache.
+//!   Latin Modern fallback faces (LM Math + LM Roman regular/italic/bold/
+//!   bold italic), caches faces loaded from disk by path, memoizes disk
+//!   discovery in `findFont`, and serves per-(face, cp) metric lookups
+//!   from a cache.
 //!
 //! All values returned in "em" units are font-relative (value ÷ unitsPerEm),
 //! so callers multiply by the desired size in points. Every number asserted
@@ -28,9 +30,13 @@ const atom = @import("ztex.atom");
 
 const lmmath = @import("fonts/lmmath.zig");
 const lmroman_regular = @import("fonts/lmroman_regular.zig");
+const lmroman_italic = @import("fonts/lmroman_italic.zig");
 const lmroman_bold = @import("fonts/lmroman_bold.zig");
+const lmroman_bold_italic = @import("fonts/lmroman_bold_italic.zig");
 
-/// Per-glyph metrics at a given size, in points.
+/// Per-glyph metrics at a given size, in points. The MATH measurements are
+/// the face's own per-glyph values when it carries a MATH table, and null
+/// when it records none (every text face is such a font).
 pub const GlyphMetrics = struct {
     /// Horizontal advance (width).
     width: f32,
@@ -40,6 +46,10 @@ pub const GlyphMetrics = struct {
     depth: f32,
     /// Nominal line gap (hhea lineGap) at this size.
     line_gap: f32,
+    /// MATH horizontal italic correction at this size; null when unknown.
+    italic_correction: ?f32 = null,
+    /// MATH horizontal accent attachment at this size; null when unknown.
+    top_accent_attachment: ?f32 = null,
 };
 
 /// Errors from parsing a font. All tables are bounds-checked.
@@ -266,85 +276,18 @@ pub const MathGlyphValues = struct {
     top_accent_attachment: ?f32,
 };
 
-/// The MATH table's font-wide constants, decoded once per face. Every
-/// length is in em units (the table's design value ÷ unitsPerEm) and
-/// every `*_percent` field is a ratio: a font that stores 70 for the
-/// script scale-down yields 0.7. Device tables — the ppem-specific
-/// adjustments a MathValueRecord may point at — are ignored, so a value
-/// is the design-unit value that layout scales to the requested size.
-pub const MathConstants = struct {
-    // Style-to-size factors and formula minimums.
-    script_percent_scale_down: f32,
-    script_script_percent_scale_down: f32,
-    delimited_sub_formula_min_height: f32,
-    display_operator_min_height: f32,
-    // Line spacing, the math axis, and accent placement.
-    math_leading: f32,
-    axis_height: f32,
-    accent_base_height: f32,
-    flattened_accent_base_height: f32,
-    // Subscripts and superscripts.
-    subscript_shift_down: f32,
-    subscript_top_max: f32,
-    subscript_baseline_drop_min: f32,
-    superscript_shift_up: f32,
-    superscript_shift_up_cramped: f32,
-    superscript_bottom_min: f32,
-    superscript_baseline_drop_max: f32,
-    sub_superscript_gap_min: f32,
-    superscript_bottom_max_with_subscript: f32,
-    space_after_script: f32,
-    // Limits stacked above or below an operator.
-    upper_limit_gap_min: f32,
-    upper_limit_baseline_rise_min: f32,
-    lower_limit_gap_min: f32,
-    lower_limit_baseline_drop_min: f32,
-    // Stacks (\atop and friends) and stretched stacks.
-    stack_top_shift_up: f32,
-    stack_top_display_style_shift_up: f32,
-    stack_bottom_shift_down: f32,
-    stack_bottom_display_style_shift_down: f32,
-    stack_gap_min: f32,
-    stack_display_style_gap_min: f32,
-    stretch_stack_top_shift_up: f32,
-    stretch_stack_bottom_shift_down: f32,
-    stretch_stack_gap_above_min: f32,
-    stretch_stack_gap_below_min: f32,
-    // Fractions, upright and skewed.
-    fraction_numerator_shift_up: f32,
-    fraction_numerator_display_style_shift_up: f32,
-    fraction_denominator_shift_down: f32,
-    fraction_denominator_display_style_shift_down: f32,
-    fraction_numerator_gap_min: f32,
-    fraction_num_display_style_gap_min: f32,
-    fraction_rule_thickness: f32,
-    fraction_denominator_gap_min: f32,
-    fraction_denom_display_style_gap_min: f32,
-    skewed_fraction_horizontal_gap: f32,
-    skewed_fraction_vertical_gap: f32,
-    // Overbar, underbar, and radical sign.
-    overbar_vertical_gap: f32,
-    overbar_rule_thickness: f32,
-    overbar_extra_ascender: f32,
-    underbar_vertical_gap: f32,
-    underbar_rule_thickness: f32,
-    underbar_extra_descender: f32,
-    radical_vertical_gap: f32,
-    radical_display_style_vertical_gap: f32,
-    radical_rule_thickness: f32,
-    radical_extra_ascender: f32,
-    radical_kern_before_degree: f32,
-    radical_kern_after_degree: f32,
-    /// Bottom of the radical degree as a fraction of the radical sign's
-    /// ascender.
-    radical_degree_bottom_raise_percent: f32,
-};
+/// The MATH table's font-wide constants. The type itself belongs to
+/// `ztex.atom` — `atom.MathConstants` — so the layout module reads the same
+/// decoded values through the FontHook without importing this file, which
+/// the module graph forbids. This alias is private to the parser below.
+const MathConstants = atom.MathConstants;
 
-/// A glyph's vertical size-variant ladder, smallest first and excluding
-/// the base glyph: `glyph(0)` is the first size variant, the glyph a
-/// renderer draws when it needs one step of growth. A view over the
-/// face's own font bytes — valid until the face is freed, and never
-/// copied or allocated per lookup.
+/// A glyph's size-variant ladder along one extension axis — vertical for a
+/// fence or a radical, horizontal for a wide bar or an extensible arrow —
+/// smallest first and excluding the base glyph: `glyph(0)` is the first size
+/// variant, the glyph a renderer draws when it needs one step of growth. A
+/// view over the face's own font bytes — valid until the face is freed, and
+/// never copied or allocated per lookup.
 pub const MathVariants = struct {
     /// Variant records — glyph id then advance measurement, 4 bytes each
     /// — sliced from the MATH table.
@@ -383,12 +326,13 @@ pub const MathAssemblyPart = struct {
     /// The part's full advance along the extension axis.
     full_advance: f32,
     /// True when the part may be skipped or repeated, which is how a
-    /// height between two exact stacks is reached.
+    /// size between two exact stacks is reached.
     extender: bool,
 };
 
-/// How to build a stretched glyph: the parts to stack, bottom to top, and
-/// the assembly's own italic correction. A view over the face's own font
+/// How to build a stretched glyph: the parts to repeat along one extension
+/// axis (bottom to top for a fence, left to right for a wide bar), and the
+/// assembly's own italic correction. A view over the face's own font
 /// bytes — valid until the face is freed.
 pub const MathAssembly = struct {
     /// Italic correction of the whole assembly, in em units.
@@ -404,8 +348,9 @@ pub const MathAssembly = struct {
         return self.parts.len / 10;
     }
 
-    /// The `i`th part, counting from the bottom. `i` must be <
-    /// partCount().
+    /// The `i`th part, counting from the first end along the axis (the
+    /// bottom for a vertical assembly, the left for a horizontal one).
+    /// `i` must be < partCount().
     pub fn part(self: MathAssembly, i: usize) MathAssemblyPart {
         std.debug.assert(i < self.partCount());
         const rec = self.parts[10 * i ..];
@@ -554,6 +499,17 @@ const MathVariantIndex = struct {
     }
 };
 
+/// The two construction indexes of one MathVariants table: the glyphs that
+/// grow up/down and the glyphs that grow left/right. Both index the same
+/// table, so a construction offset means the same thing in either half.
+/// Either half is null when the font grows nothing along that axis: the
+/// format leaves the coverage offset NULL whenever its glyph count is zero,
+/// and a lookup on an absent axis finds nothing.
+const MathVariantHalves = struct {
+    vert: ?MathVariantIndex,
+    horiz: ?MathVariantIndex,
+};
+
 /// The MATH table's structures. The constants are decoded into em units
 /// at parse time; everything else is a validated view into the face's own
 /// font bytes, so a lookup neither allocates nor re-scans the table.
@@ -567,26 +523,39 @@ const MathData = struct {
     min_connector_overlap: f32,
     italics: ?MathValueList,
     top_accent: ?MathValueList,
-    vert: MathVariantIndex,
+    variants: MathVariantHalves,
 
     /// The glyph's italic correction, em units, or null when the font
     /// records none.
-    fn italicsEm(self: MathData, gid: u32) ?f32 {
+    fn italicsEm(self: *const MathData, gid: u32) ?f32 {
         const raw = (self.italics orelse return null).get(gid) orelse return null;
         return emValue(raw, self.units_per_em);
     }
 
     /// The glyph's top accent attachment height, em units, or null when
     /// the font records none.
-    fn topAccentEm(self: MathData, gid: u32) ?f32 {
+    fn topAccentEm(self: *const MathData, gid: u32) ?f32 {
         const raw = (self.top_accent orelse return null).get(gid) orelse return null;
         return emValue(raw, self.units_per_em);
     }
 
     /// `gid`'s vertical size variants, excluding the base glyph, or null
     /// when it has no construction or the construction lists no variants.
-    fn variantsOf(self: MathData, gid: u32) ?MathVariants {
-        const c = self.vert.constructionOffset(gid) orelse return null;
+    fn verticalVariantsOf(self: *const MathData, gid: u32) ?MathVariants {
+        const index = self.variants.vert orelse return null;
+        return self.ladderOf(index.constructionOffset(gid));
+    }
+
+    /// `gid`'s horizontal size variants — the same ladder read along x.
+    fn horizontalVariantsOf(self: *const MathData, gid: u32) ?MathVariants {
+        const index = self.variants.horiz orelse return null;
+        return self.ladderOf(index.constructionOffset(gid));
+    }
+
+    /// The size-variant ladder at `at`: the construction's own records,
+    /// smallest first and excluding the base glyph.
+    fn ladderOf(self: *const MathData, at: ?usize) ?MathVariants {
+        const c = at orelse return null;
         const r: Reader = .{ .data = self.table };
         // The construction's first record is the base glyph, so the
         // ladder of size variants starts one record in.
@@ -602,8 +571,21 @@ const MathData = struct {
     }
 
     /// `gid`'s vertical glyph assembly, or null when it has none.
-    fn assemblyOf(self: MathData, gid: u32) ?MathAssembly {
-        const c = self.vert.constructionOffset(gid) orelse return null;
+    fn verticalAssemblyOf(self: *const MathData, gid: u32) ?MathAssembly {
+        const index = self.variants.vert orelse return null;
+        return self.stackedAt(index.constructionOffset(gid));
+    }
+
+    /// `gid`'s horizontal glyph assembly, or null when it has none.
+    fn horizontalAssemblyOf(self: *const MathData, gid: u32) ?MathAssembly {
+        const index = self.variants.horiz orelse return null;
+        return self.stackedAt(index.constructionOffset(gid));
+    }
+
+    /// The glyph assembly at `at`: the pieces a renderer repeats along one
+    /// axis until it has the size it needs, or null when it has none.
+    fn stackedAt(self: *const MathData, at: ?usize) ?MathAssembly {
+        const c = at orelse return null;
         const r: Reader = .{ .data = self.table };
         const rel = r.readU16(c) catch return null;
         if (rel == 0) return null;
@@ -763,29 +745,32 @@ pub const FontFace = struct {
         return self.glyphIndex(cp) != null;
     }
 
-    /// The MATH table's font-wide constants (em units), or null when the
-    /// font carries no MATH table. A copy: valid for the face's lifetime.
-    pub fn mathConstants(self: *const FontFace) ?MathConstants {
-        const m = self.math orelse return null;
-        return m.constants;
+    /// The MATH table's font-wide constants, or null when the font carries
+    /// no MATH table. A borrowed, immutable view of the face's own decoded
+    /// value: valid until `deinit`, and the same pointer on every call — a
+    /// caller may keep it for as long as it keeps the face.
+    pub fn mathConstants(self: *const FontFace) ?*const atom.MathConstants {
+        if (self.math == null) return null;
+        return &self.math.?.constants;
     }
 
     /// Minimum overlap a renderer may leave between assembled connector
     /// parts, em units. 0 when the font has no MATH table, which allows
     /// no overlap at all.
     pub fn mathMinConnectorOverlapEm(self: *const FontFace) f32 {
-        const m = self.math orelse return 0;
-        return m.min_connector_overlap;
+        if (self.math == null) return 0;
+        return self.math.?.min_connector_overlap;
     }
 
     /// The glyph's MATH measurements, em units. Both fields are null when
     /// the font records nothing for the glyph, and on a face whose font
     /// has no MATH table.
     pub fn mathValues(self: *const FontFace, gid: u32) MathGlyphValues {
-        const m = self.math orelse return .{
+        if (self.math == null) return .{
             .italic_correction = null,
             .top_accent_attachment = null,
         };
+        const m = &self.math.?;
         return .{
             .italic_correction = m.italicsEm(gid),
             .top_accent_attachment = m.topAccentEm(gid),
@@ -799,8 +784,32 @@ pub const FontFace = struct {
     /// construction lists no variants. The ladder is a view into the
     /// face's own bytes, valid until `deinit`.
     pub fn variants(self: *const FontFace, gid: u32) ?MathVariants {
-        const m = self.math orelse return null;
-        return m.variantsOf(gid);
+        if (self.math == null) return null;
+        return self.math.?.verticalVariantsOf(gid);
+    }
+
+    /// The glyph's HORIZONTAL size variants: the rungs it grows along the x
+    /// axis, smallest first and excluding the base glyph — the widths the
+    /// face itself designed for a wide bar or an extensible arrow. A glyph
+    /// can have a horizontal ladder and no vertical one (and the reverse);
+    /// each half answers only for the axis it covers. `advanceEm` is the
+    /// advance measurement along that axis. Null when the font has no MATH
+    /// table, the glyph does not grow horizontally, or its construction
+    /// lists no variants. A view into the face's own bytes, valid until
+    /// `deinit`.
+    pub fn horizontalVariants(self: *const FontFace, gid: u32) ?MathVariants {
+        if (self.math == null) return null;
+        return self.math.?.horizontalVariantsOf(gid);
+    }
+
+    /// The glyph's horizontal glyph assembly — the left cap, the repeatable
+    /// extender and the right cap a renderer repeats to reach a requested
+    /// width. Null when the font has no MATH table or the glyph's
+    /// horizontal construction carries no assembly. A view into the face's
+    /// own bytes, valid until `deinit`.
+    pub fn horizontalAssembly(self: *const FontFace, gid: u32) ?MathAssembly {
+        if (self.math == null) return null;
+        return self.math.?.horizontalAssemblyOf(gid);
     }
 
     /// The glyph's vertical glyph assembly, or null when the font has no
@@ -809,8 +818,8 @@ pub const FontFace = struct {
     /// delimiter reads both: `variants` for the rungs it has, `assembly`
     /// for the parts it stacks once it outgrows the last one.
     pub fn assembly(self: *const FontFace, gid: u32) ?MathAssembly {
-        const m = self.math orelse return null;
-        return m.assemblyOf(gid);
+        if (self.math == null) return null;
+        return self.math.?.verticalAssemblyOf(gid);
     }
 
     /// Horizontal advance for a glyph, em units (hmtx ÷ upem). Glyph ids
@@ -988,8 +997,14 @@ const math_value_record_count = 51;
 /// minimums, the MathValueRecords, then the radical degree raise percent.
 const math_constants_len = 8 + 4 * math_value_record_count + 2;
 /// Byte length of a MathVariants header: the minimum connector overlap,
-/// a vertical and a horizontal coverage offset, and both counts.
+/// the vertical and horizontal coverage offsets, and both glyph counts.
 const math_variants_header_len = 10;
+/// Header field offsets. The two coverage offsets come before the two
+/// glyph counts in this format (see `parseMathVariants`).
+const math_variants_vert_cov_off = 2;
+const math_variants_horiz_cov_off = 4;
+const math_variants_vert_count_off = 6;
+const math_variants_horiz_count_off = 8;
 
 /// The `index`th MathValueRecord of a MathConstants block, in em units.
 fn mathConstant(r: Reader, block: usize, index: usize, upem: u16) error{InvalidTable}!f32 {
@@ -1021,7 +1036,7 @@ fn parseMath(table: []const u8, upem: u16) error{InvalidTable}!MathData {
         .min_connector_overlap = emValue(try r.readU16(v_off), upem),
         .italics = try parseMathValueList(table, gi_off, try r.readU16(gi_off)),
         .top_accent = try parseMathValueList(table, gi_off, try r.readU16(gi_off + 2)),
-        .vert = try parseMathVariants(table, v_off),
+        .variants = try parseMathVariants(table, v_off),
     };
 }
 
@@ -1119,33 +1134,79 @@ fn parseMathValueList(
     };
 }
 
-/// Parse the vertical half of a MathVariants table: the coverage of the
-/// glyphs that grow vertically and the construction offset array, one
-/// entry per covered glyph, each construction checked in full. The
-/// horizontal half — a second coverage, count, and construction array —
-/// is left unread: ztex never stretches a glyph horizontally.
-fn parseMathVariants(table: []const u8, off: usize) error{InvalidTable}!MathVariantIndex {
+/// Parse one construction index of a MathVariants table: the coverage of the
+/// glyphs that grow along that axis and the construction offset array, one
+/// entry per covered glyph, each construction checked in full. `cov_field`
+/// and `count_field` are the header fields holding this half's coverage
+/// offset and glyph count; `list_at` is where this half's offset array
+/// starts, which for the horizontal half follows the vertical one.
+///
+/// Either axis is optional: the format leaves the coverage offset NULL when
+/// that axis carries no glyphs, so a NULL offset with a zero glyph count is
+/// an absent half (null) and only a NULL offset that still claims glyphs,
+/// or a coverage whose own count contradicts the header's, is malformed.
+fn parseVariantHalf(
+    table: []const u8,
+    off: usize,
+    cov_field: usize,
+    count_field: usize,
+    list_at: usize,
+) error{InvalidTable}!?MathVariantIndex {
     const r: Reader = .{ .data = table };
-    if (off + math_variants_header_len > table.len) return error.InvalidTable;
-    const cov_off = try r.readU16(off + 2);
-    const count = try r.readU16(off + 6);
-    if (cov_off == 0) return error.InvalidTable;
+    const cov_off = try r.readU16(off + cov_field);
+    const count = try r.readU16(off + count_field);
+    if (cov_off == 0) {
+        if (count != 0) return error.InvalidTable;
+        return null;
+    }
     const coverage: MathCoverage = .{ .table = try coverageTable(table, off + cov_off) };
     // One construction per covered glyph; a mismatch would index the
     // array past the glyphs it describes.
     if (coverage.count() != count) return error.InvalidTable;
-    const list = off + math_variants_header_len;
-    if (list + 2 * count > table.len) return error.InvalidTable;
+    if (list_at + 2 * count > table.len) return error.InvalidTable;
     var i: usize = 0;
     while (i < count) : (i += 1) {
-        const rel = try r.readU16(list + 2 * i);
+        const rel = try r.readU16(list_at + 2 * i);
         if (rel == 0) return error.InvalidTable;
         try checkConstruction(table, off + rel);
     }
     return .{
         .base = off,
         .coverage = coverage,
-        .offsets = table[list..][0 .. 2 * count],
+        .offsets = table[list_at..][0 .. 2 * count],
+    };
+}
+
+/// Parse both halves of a MathVariants table: the vertical constructions
+/// (fences, radicals, big operators) and the horizontal ones (wide bars,
+/// extensible arrows and signs), so a renderer grows a glyph along either
+/// axis from the font's own designs instead of stretching one shape.
+/// The header carries the two coverage offsets first and the two glyph
+/// counts after them — measured from the real face, and confirmed by each
+/// coverage's own glyph count matching the count read beside it.
+/// An axis the face grows nothing along yields a null half, leaving the other
+/// axis — and the rest of the MATH table — intact.
+fn parseMathVariants(table: []const u8, off: usize) error{InvalidTable}!MathVariantHalves {
+    const r: Reader = .{ .data = table };
+    if (off + math_variants_header_len > table.len) return error.InvalidTable;
+    const vert_count = try r.readU16(off + math_variants_vert_count_off);
+    const list = off + math_variants_header_len;
+    if (list + 2 * vert_count > table.len) return error.InvalidTable;
+    return .{
+        .vert = try parseVariantHalf(
+            table,
+            off,
+            math_variants_vert_cov_off,
+            math_variants_vert_count_off,
+            list,
+        ),
+        .horiz = try parseVariantHalf(
+            table,
+            off,
+            math_variants_horiz_cov_off,
+            math_variants_horiz_count_off,
+            list + 2 * vert_count,
+        ),
     };
 }
 
@@ -1874,10 +1935,9 @@ const CffInterp = struct {
         );
     }
 
-    /// Flatten one cubic to two midpoint-exact quadratics: split at t = 0.5
-    /// via de Casteljau, then fit each half with
-    /// Q1 = (3H1 - H0 + 3H2 - H3)/4, which passes exactly through the
-    /// cubic's endpoints and midpoint (standard practice).
+    /// Split at the cubic's coordinate extrema before fitting quadratics.
+    /// Each fit stays monotonic within its endpoints, preserving the original
+    /// ink bounds rather than painting an approximation outside the frame.
     fn appendCubic(
         self: *CffInterp,
         a0: [2]f32,
@@ -1885,31 +1945,97 @@ const CffInterp = struct {
         a2: [2]f32,
         a3: [2]f32,
     ) error{ OutOfMemory, InvalidTable }!void {
-        const m = [2]f32{
-            0.125 * (a0[0] + 3.0 * a1[0] + 3.0 * a2[0] + a3[0]),
-            0.125 * (a0[1] + 3.0 * a1[1] + 3.0 * a2[1] + a3[1]),
-        };
-        const l1 = [2]f32{ 0.5 * (a0[0] + a1[0]), 0.5 * (a0[1] + a1[1]) };
-        const l2 = [2]f32{
-            0.25 * (a0[0] + 2.0 * a1[0] + a2[0]),
-            0.25 * (a0[1] + 2.0 * a1[1] + a2[1]),
-        };
-        const r1 = [2]f32{
-            0.25 * (a1[0] + 2.0 * a2[0] + a3[0]),
-            0.25 * (a1[1] + 2.0 * a2[1] + a3[1]),
-        };
-        const r2 = [2]f32{ 0.5 * (a2[0] + a3[0]), 0.5 * (a2[1] + a3[1]) };
-        const ql = [2]f32{
-            0.25 * (3.0 * l1[0] - a0[0] + 3.0 * l2[0] - m[0]),
-            0.25 * (3.0 * l1[1] - a0[1] + 3.0 * l2[1] - m[1]),
-        };
-        const qr = [2]f32{
-            0.25 * (3.0 * r1[0] - m[0] + 3.0 * r2[0] - a3[0]),
-            0.25 * (3.0 * r1[1] - m[1] + 3.0 * r2[1] - a3[1]),
-        };
-        try self.curves.append(self.gpa, .{ .p0 = a0, .p1 = ql, .p2 = m });
-        try self.curves.append(self.gpa, .{ .p0 = m, .p1 = qr, .p2 = a3 });
+        var points: [4][2]f64 = undefined;
+        for ([_][2]f32{ a0, a1, a2, a3 }, 0..) |p, i| {
+            points[i] = .{ p[0], p[1] };
+        }
+        var cuts: [4]f64 = undefined;
+        var count: usize = 0;
+        for (0..2) |axis| {
+            const p0 = points[0][axis];
+            const p1 = points[1][axis];
+            const p2 = points[2][axis];
+            const p3 = points[3][axis];
+            const a = -p0 + 3 * p1 - 3 * p2 + p3;
+            const b = 2 * (p0 - 2 * p1 + p2);
+            const c = p1 - p0;
+            if (a == 0) {
+                if (b != 0) addCubicCut(&cuts, &count, -c / b);
+            } else {
+                const discriminant = b * b - 4 * a * c;
+                if (discriminant < 0) continue;
+                const root = @sqrt(discriminant);
+                const q = -0.5 * (b + if (b >= 0) root else -root);
+                if (q == 0) continue;
+                addCubicCut(&cuts, &count, q / a);
+                addCubicCut(&cuts, &count, c / q);
+            }
+        }
+        var previous: f64 = 0;
+        for (cuts[0..count]) |t| {
+            var left: [4][2]f64 = undefined;
+            splitCubic(&points, (t - previous) / (1 - previous), &left);
+            try self.appendCubicPiece(&left);
+            previous = t;
+        }
+        try self.appendCubicPiece(&points);
         self.cur = a3;
+    }
+
+    fn addCubicCut(cuts: *[4]f64, count: *usize, t: f64) void {
+        if (!(t > 0 and t < 1)) return;
+        var at: usize = 0;
+        while (at < count.* and cuts[at] < t) : (at += 1) {}
+        if (at < count.* and cuts[at] == t) return;
+        std.debug.assert(count.* < cuts.len);
+        var i = count.*;
+        while (i > at) : (i -= 1) cuts[i] = cuts[i - 1];
+        cuts[at] = t;
+        count.* += 1;
+    }
+
+    fn cubicLerp(a: [2]f64, b: [2]f64, t: f64) [2]f64 {
+        return .{ (1 - t) * a[0] + t * b[0], (1 - t) * a[1] + t * b[1] };
+    }
+
+    fn splitCubic(points: *[4][2]f64, t: f64, left: *[4][2]f64) void {
+        const p01 = cubicLerp(points[0], points[1], t);
+        const p12 = cubicLerp(points[1], points[2], t);
+        const p23 = cubicLerp(points[2], points[3], t);
+        const p012 = cubicLerp(p01, p12, t);
+        const p123 = cubicLerp(p12, p23, t);
+        const mid = cubicLerp(p012, p123, t);
+        left.* = .{ points[0], p01, p012, mid };
+        points.* = .{ mid, p123, p23, points[3] };
+    }
+
+    fn appendCubicPiece(
+        self: *CffInterp,
+        points: *const [4][2]f64,
+    ) std.mem.Allocator.Error!void {
+        var right = points.*;
+        var left: [4][2]f64 = undefined;
+        splitCubic(&right, 0.5, &left);
+        try self.appendCubicHalf(&left);
+        try self.appendCubicHalf(&right);
+    }
+
+    fn appendCubicHalf(
+        self: *CffInterp,
+        points: *const [4][2]f64,
+    ) std.mem.Allocator.Error!void {
+        var control: [2]f32 = undefined;
+        for (0..2) |axis| {
+            const start = points[0][axis];
+            const end = points[3][axis];
+            const fit = (3 * points[1][axis] - start + 3 * points[2][axis] - end) / 4;
+            control[axis] = @floatCast(std.math.clamp(fit, @min(start, end), @max(start, end)));
+        }
+        try self.curves.append(self.gpa, .{
+            .p0 = .{ @floatCast(points[0][0]), @floatCast(points[0][1]) },
+            .p1 = control,
+            .p2 = .{ @floatCast(points[3][0]), @floatCast(points[3][1]) },
+        });
     }
 
     /// Execute a charstring or subr. True = the glyph is finished (endchar,
@@ -2303,25 +2429,32 @@ pub const FontContext = struct {
     faces: std.StringHashMapUnmanaged(*FontFace),
     /// Font name → arena-owned discovered path; empty slice records a miss.
     found: std.StringHashMapUnmanaged([]const u8),
-    /// (face, cp) → em metrics at 1pt (scaled by size_pt on return).
+    /// (face, cp) → em metrics at 1pt, MATH values included (the caller
+    /// scales every field by size_pt).
     metrics_cache: std.AutoHashMapUnmanaged(CacheKey, GlyphMetrics),
 
     /// Embedded Latin Modern Math — default face for math glyphs.
     math: *FontFace,
     /// Embedded Latin Modern Roman regular — for \text/\mathrm.
     roman: *FontFace,
+    /// Embedded Latin Modern Roman italic — for `\textit`.
+    italic: *FontFace,
     /// Embedded Latin Modern Roman bold — for `\mathbf`.
     bold: *FontFace,
+    /// Embedded Latin Modern Roman bold italic — for `\textit{\textbf{}}`.
+    bold_italic: *FontFace,
 
-    /// Create a context preloaded with the embedded fallback faces:
-    /// LM Math (math) plus LM Roman regular and bold (text).
+    /// Create a context preloaded with the embedded fallback faces: LM Math
+    /// (math) plus LM Roman regular, italic, bold and bold italic (text).
     pub fn init(gpa: std.mem.Allocator) !FontContext {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const a = arena.allocator();
         const math = try createFace(a, lmmath.lmmath_otf[0..]);
         const roman = try createFace(a, lmroman_regular.lmroman10_regular_otf[0..]);
+        const italic = try createFace(a, lmroman_italic.lmroman10_italic_otf[0..]);
         const bold = try createFace(a, lmroman_bold.lmroman10_bold_otf[0..]);
+        const bi = try createFace(a, lmroman_bold_italic.lmroman10_bolditalic_otf[0..]);
         return .{
             .gpa = gpa,
             .arena = arena,
@@ -2331,7 +2464,9 @@ pub const FontContext = struct {
             .metrics_cache = .empty,
             .math = math,
             .roman = roman,
+            .italic = italic,
             .bold = bold,
+            .bold_italic = bi,
         };
     }
 
@@ -2343,17 +2478,21 @@ pub const FontContext = struct {
         self.* = undefined;
     }
 
-    /// The face a `CharStyle` draws from: `.roman` the Latin Modern Roman
-    /// regular face, `.bold` its bold face, and every other style the Latin
-    /// Modern Math face — whose math-italic, double-struck, script, fraktur,
-    /// sans and mono glyphs are already styled, so mapping those to a Roman
-    /// face would draw the wrong letterform. Both the metric hook and the
-    /// rasterizer resolve their face here, so a style can never measure from
-    /// one face and be drawn from another.
+    /// The face a `CharStyle` draws from. The four text styles resolve to
+    /// the four embedded LM Roman faces — regular, italic, bold and bold
+    /// italic, one real face each, never a slanted or emboldened copy of
+    /// another — and every other style resolves to the Latin Modern Math
+    /// face, whose math-italic, double-struck, script, fraktur, sans and
+    /// mono glyphs are already styled, so mapping those to a Roman face
+    /// would draw the wrong letterform. Both the metric hook and the
+    /// rasterizer resolve their face here, so a style can never measure
+    /// from one face and be drawn from another.
     pub fn faceForStyle(self: *const FontContext, style: atom.CharStyle) *FontFace {
         return switch (style) {
             .roman => self.roman,
+            .text_italic => self.italic,
             .bold => self.bold,
+            .bold_italic => self.bold_italic,
             else => self.math,
         };
     }
@@ -2392,8 +2531,12 @@ pub const FontContext = struct {
     /// Per-glyph metrics at `size_pt` points, cached per (face, cp) in em
     /// units and scaled linearly. Height/depth/line_gap are the face's OWN
     /// nominal extents (hhea) — real font data, never a hard-coded table —
-    /// and bound every glyph. Unmapped codepoints get a 0.5em advance with
-    /// the same nominal extents (the caller decides how to draw them).
+    /// and bound every glyph. The MATH values are the face's own per-glyph
+    /// corrections, read from its MATH table on the cache miss only; every
+    /// later request scales the stored em values with the same factor as
+    /// the width, never re-searching the table. Unmapped codepoints get a
+    /// 0.5em advance with the same nominal extents and no MATH value (the
+    /// caller decides how to draw them).
     pub fn metrics(self: *FontContext, face: *const FontFace, cp: u21, size_pt: f32) GlyphMetrics {
         const key: CacheKey = .{ .face = face, .cp = cp };
         const em: GlyphMetrics = if (self.metrics_cache.get(key)) |cached|
@@ -2411,6 +2554,8 @@ pub const FontContext = struct {
             .height = em.height * size_pt,
             .depth = em.depth * size_pt,
             .line_gap = em.line_gap * size_pt,
+            .italic_correction = scaleEm(em.italic_correction, size_pt),
+            .top_accent_attachment = scaleEm(em.top_accent_attachment, size_pt),
         };
     }
 
@@ -2524,7 +2669,8 @@ pub const FontContext = struct {
 
 /// Em metrics for a codepoint: real advance from hmtx when the glyph exists,
 /// nominal extents (hhea) for height/depth/line_gap always; 0.5em advance
-/// when the font has no glyph for the codepoint.
+/// when the font has no glyph for the codepoint. An uncovered MATH glyph has
+/// zero italic correction; an absent MATH table leaves it unknown.
 fn computeEmMetrics(face: *const FontFace, cp: u21) GlyphMetrics {
     const nominal: GlyphMetrics = .{
         .width = 0.5,
@@ -2533,12 +2679,21 @@ fn computeEmMetrics(face: *const FontFace, cp: u21) GlyphMetrics {
         .line_gap = face.lineGapEm(),
     };
     const gid = face.glyphIndex(cp) orelse return nominal;
+    const math = face.mathValues(gid);
     return .{
         .width = face.advanceEm(gid),
         .height = nominal.height,
         .depth = nominal.depth,
         .line_gap = nominal.line_gap,
+        .italic_correction = if (face.math != null) math.italic_correction orelse 0 else null,
+        .top_accent_attachment = math.top_accent_attachment,
     };
+}
+
+/// Scale an optional em measurement without inventing a missing value.
+fn scaleEm(value: ?f32, size_pt: f32) ?f32 {
+    const em = value orelse return null;
+    return em * size_pt;
 }
 
 /// Case-insensitive basename match; `name` may also prefix the basename
@@ -2676,6 +2831,60 @@ test "font: context loads embedded fallbacks and caches metrics" {
     try testing.expectApproxEqAbs(@as(f32, 0.607), bold.advanceEm(bx), 0.001);
 }
 
+test "font: each text style resolves to its own real Roman face" {
+    var ctx = try FontContext.init(testing.allocator);
+    defer ctx.deinit();
+    try testing.expectEqual(ctx.roman, ctx.faceForStyle(.roman));
+    try testing.expectEqual(ctx.italic, ctx.faceForStyle(.text_italic));
+    try testing.expectEqual(ctx.bold, ctx.faceForStyle(.bold));
+    try testing.expectEqual(ctx.bold_italic, ctx.faceForStyle(.bold_italic));
+    // Four different real advances for 'x' at the 10pt base, each read from
+    // its own face's hmtx: no style is a slanted or emboldened copy of
+    // another, so measuring and drawing cannot silently agree on a fake.
+    const cases = [_]struct { style: atom.CharStyle, width: f32 }{
+        .{ .style = .roman, .width = 5.28 },
+        .{ .style = .text_italic, .width = 4.64 },
+        .{ .style = .bold, .width = 6.07 },
+        .{ .style = .bold_italic, .width = 5.61 },
+    };
+    for (cases) |c| {
+        const g = ctx.metrics(ctx.faceForStyle(c.style), 'x', 10.0);
+        try testing.expectApproxEqAbs(c.width, g.width, 0.001);
+        // These are text faces with no MATH table: the metric reports the
+        // genuine absence instead of an invented zero correction.
+        try testing.expect(g.italic_correction == null);
+        try testing.expect(g.top_accent_attachment == null);
+    }
+    // Accented and dotless letters are real glyphs in every text face, so a
+    // text run never falls through to a 0.5em estimate.
+    for ([_]atom.CharStyle{ .roman, .text_italic, .bold, .bold_italic }) |s| {
+        const face = ctx.faceForStyle(s);
+        try testing.expect(face.glyphIndex(0x00E9) != null); // é
+        try testing.expect(face.glyphIndex(0x0131) != null); // ı
+    }
+}
+
+test "font: glyph metrics carry the face's MATH values, normalized once and scaled" {
+    var ctx = try FontContext.init(testing.allocator);
+    defer ctx.deinit();
+    const face = ctx.math;
+    const cp: u21 = 0x1D453; // 𝑓, the math italic LM Math does correct
+    const gid = face.glyphIndex(cp) orelse return error.TestUnexpectedResult;
+    const ic = face.mathValues(gid).italic_correction orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(ic > 0);
+    // A cache miss stores the em value, and the caller gets it scaled.
+    const at20 = ctx.metrics(face, cp, 20.0);
+    try testing.expectApproxEqAbs(ic * 20.0, at20.italic_correction.?, 0.0001);
+    // Every later request scales that one stored value — the MATH table is
+    // searched once per (face, cp), and the answer tracks the requested size
+    // exactly like the width does.
+    const at10 = ctx.metrics(face, cp, 10.0);
+    try testing.expectApproxEqAbs(ic * 10.0, at10.italic_correction.?, 0.0001);
+    try testing.expectApproxEqAbs(at20.width / 2.0, at10.width, 0.0001);
+    try testing.expectEqual(@as(usize, 1), ctx.metrics_cache.count());
+}
+
 test "font: metrics for an unmapped codepoint use nominal extents" {
     var ctx = try FontContext.init(testing.allocator);
     defer ctx.deinit();
@@ -2758,6 +2967,13 @@ fn putU32(gpa: std.mem.Allocator, out: *std.ArrayList(u8), v: u32) !void {
         @intCast((v >> 8) & 0xFF),
         @intCast(v & 0xFF),
     });
+}
+
+/// Big-endian u16 at a fixed offset (the MATH table's own fields are
+/// 16-bit, so a u32 store would spill into the next field).
+fn storeU16(out: []u8, off: usize, v: u32) void {
+    out[off] = @intCast(v >> 8);
+    out[off + 1] = @truncate(v);
 }
 
 /// Big-endian u32 at a fixed offset (sfnt fields are big-endian; @bitCast
@@ -3215,6 +3431,25 @@ test "font: glyphOutline — malformed inputs error, never panic" {
     try testing.expectError(error.InvalidTable, face.glyphOutline(testing.allocator, 3));
 }
 
+test "font: quadratic outlines stay within the original CFF ink" {
+    var face = try FontFace.fromBytes(testing.allocator, &lmmath.lmmath_otf);
+    defer face.deinit();
+    const gid = face.glyphIndex(0x1D453) orelse return error.TestUnexpectedResult;
+    var outline = try face.glyphOutline(testing.allocator, gid);
+    defer outline.deinit();
+    for (outline.curves.items) |c| {
+        try testing.expect(c.p0[1] <= 705 and c.p0[1] >= -205);
+        try testing.expect(c.p2[1] <= 705 and c.p2[1] >= -205);
+        const denominator = c.p0[1] - 2 * c.p1[1] + c.p2[1];
+        if (denominator == 0) continue;
+        const t = (c.p0[1] - c.p1[1]) / denominator;
+        if (t <= 0 or t >= 1) continue;
+        const u = 1 - t;
+        const y = u * u * c.p0[1] + 2 * u * t * c.p1[1] + t * t * c.p2[1];
+        try testing.expect(y <= 705 and y >= -205);
+    }
+}
+
 test "font: glyphOutline — embedded CFF 'x' has curves, sane bounds, an upward stroke" {
     // The vendored Latin Modern faces are CFF (`OTTO` scaler, "CFF " table,
     // no loca/glyf): outlines come from Type 2 charstrings. LM em = 1000.
@@ -3352,6 +3587,20 @@ test "font: MATH constants are the table's design values in em" {
     try testing.expectApproxEqAbs(@as(f32, 0.02), face.mathMinConnectorOverlapEm(), 0.001);
 }
 
+test "font: mathConstants is one borrowed view, not a copy per call" {
+    var face = try FontFace.fromBytes(testing.allocator, lmmath.lmmath_otf[0..]);
+    defer face.deinit();
+    const first = face.mathConstants() orelse return error.TestUnexpectedResult;
+    const second = face.mathConstants() orelse return error.TestUnexpectedResult;
+    try testing.expect(first == second);
+    try testing.expectApproxEqAbs(@as(f32, 0.25), first.axis_height, 0.001);
+    // The storage lives inside the face, so the pointer outlives the call:
+    // a holder keeps valid constants for as long as it keeps the face.
+    const field = @intFromPtr(&first.axis_height);
+    const base = @intFromPtr(&face);
+    try testing.expect(field > base and field < base + @sizeOf(FontFace));
+}
+
 test "font: MATH variants name the sum's .v1 — the id the rasterizer hardcodes" {
     var face = try FontFace.fromBytes(testing.allocator, lmmath.lmmath_otf[0..]);
     defer face.deinit();
@@ -3392,6 +3641,67 @@ test "font: MATH radical has four size variants and a three-part assembly" {
     const top = a.part(2);
     try testing.expectEqual(@as(u32, 3080), top.glyph);
     try testing.expectApproxEqAbs(@as(f32, 0.32), top.start_connector_length, 0.001);
+}
+
+test "font: MATH grows a wide hat along x — horizontal ladder, not vertical" {
+    var face = try FontFace.fromBytes(testing.allocator, lmmath.lmmath_otf[0..]);
+    defer face.deinit();
+    // The combining circumflex (U+0302) grows along x only: seven designed
+    // widths for \widehat over a long run, and no vertical ladder at all.
+    // The two halves answer independently, so a renderer picks the right one.
+    const hat = face.glyphIndex(0x0302) orelse return error.TestUnexpectedResult;
+    try testing.expect(face.variants(hat) == null);
+    try testing.expect(face.assembly(hat) == null);
+    const h = face.horizontalVariants(hat) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 7), h.len());
+    try testing.expectEqual(@as(u32, 2280), h.glyph(0));
+    try testing.expectEqual(@as(u32, 2340), h.glyph(6));
+    try testing.expectApproxEqAbs(@as(f32, 0.645), h.advanceEm(0), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 1.897), h.advanceEm(6), 0.001);
+    for (1..h.len()) |i| {
+        try testing.expect(h.advanceEm(i) > h.advanceEm(i - 1));
+    }
+    try testing.expect(face.horizontalAssembly(hat) == null);
+
+    // The combining tilde (U+0303) has its own ladder: same shape family,
+    // the face's own widths, never the hat's.
+    const tilde = face.glyphIndex(0x0303) orelse return error.TestUnexpectedResult;
+    const t = face.horizontalVariants(tilde) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 7), t.len());
+    try testing.expectEqual(@as(u32, 2282), t.glyph(0));
+    try testing.expectApproxEqAbs(@as(f32, 1.916), t.advanceEm(6), 0.001);
+    try testing.expect(t.glyph(0) != h.glyph(0));
+
+    // A spacing overline (U+0305) is both: one exact variant, then caps and
+    // a repeatable extender to reach any wider width.
+    const over = face.glyphIndex(0x0305) orelse return error.TestUnexpectedResult;
+    try testing.expect(face.assembly(over) == null);
+    const ov = face.horizontalVariants(over) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), ov.len());
+    try testing.expectEqual(@as(u32, 2256), ov.glyph(0));
+    try testing.expectApproxEqAbs(@as(f32, 0.569), ov.advanceEm(0), 0.001);
+    const a = face.horizontalAssembly(over) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 3), a.partCount());
+    const left = a.part(0);
+    try testing.expectEqual(@as(u32, 2257), left.glyph);
+    try testing.expect(!left.extender);
+    try testing.expectApproxEqAbs(@as(f32, 0.189), left.full_advance, 0.001);
+    const extender = a.part(1);
+    try testing.expectEqual(@as(u32, 2258), extender.glyph);
+    try testing.expect(extender.extender);
+    try testing.expectApproxEqAbs(@as(f32, 0.19), extender.full_advance, 0.001);
+    const right = a.part(2);
+    try testing.expectEqual(@as(u32, 2259), right.glyph);
+    try testing.expect(!right.extender);
+    try testing.expectApproxEqAbs(@as(f32, 0.189), right.full_advance, 0.001);
+
+    // The equals sign carries no horizontal variant — only the assembly —
+    // so a renderer that wants an exact width stacks parts instead.
+    const eq = face.glyphIndex('=') orelse return error.TestUnexpectedResult;
+    try testing.expect(face.horizontalVariants(eq) == null);
+    const eqa = face.horizontalAssembly(eq) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 3), eqa.partCount());
+    try testing.expect(eqa.part(1).extender);
 }
 
 test "font: MATH delimiter carries a stretch ladder and an extensible assembly" {
@@ -3490,5 +3800,57 @@ test "font: a malformed MATH table fails through InvalidTable" {
     const variants = math + std.mem.readInt(u16, bytes[math + 8 ..][0..2], .big);
     bytes[variants + 6] = 0xFF;
     bytes[variants + 7] = 0xFF;
+    try testing.expectError(error.InvalidTable, FontFace.fromBytes(testing.allocator, bytes));
+}
+
+// A null coverage offset with zero constructions is a legal absent axis.
+test "font: a MathVariants half with no constructions loads and stays empty" {
+    const bytes = try testing.allocator.dupe(u8, lmmath.lmmath_otf[0..]);
+    defer testing.allocator.free(bytes);
+    const math = tableOffset(bytes, tag("MATH")) orelse return error.TestUnexpectedResult;
+    const variants = math + readBeU16(bytes[math + 8 ..]);
+    storeU16(bytes, variants + math_variants_horiz_cov_off, 0);
+    storeU16(bytes, variants + math_variants_horiz_count_off, 0);
+
+    var face = try FontFace.fromBytes(testing.allocator, bytes);
+    defer face.deinit();
+    try testing.expect(face.mathConstants() != null);
+
+    // The surviving axis is untouched: the radical's four rungs and its
+    // three-piece assembly, the same glyphs as the unmodified face.
+    const radical = face.glyphIndex(0x221A) orelse return error.TestUnexpectedResult;
+    const ladder = face.variants(radical) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 4), ladder.len());
+    try testing.expectEqual(@as(u32, 3081), ladder.glyph(0));
+    const stack = face.assembly(radical) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 3), stack.partCount());
+    try testing.expect(stack.part(1).extender);
+
+    // The absent axis grows nothing — including for the combining
+    // circumflex, which carries a seven-rung ladder along x here.
+    const hat = face.glyphIndex(0x0302) orelse return error.TestUnexpectedResult;
+    try testing.expect(face.horizontalVariants(hat) == null);
+    try testing.expect(face.horizontalAssembly(hat) == null);
+    try testing.expect(face.horizontalVariants(radical) == null);
+    try testing.expect(face.horizontalAssembly(radical) == null);
+}
+
+// A populated axis requires coverage with the same construction count.
+test "font: a populated MathVariants half without coverage is invalid" {
+    const bytes = try testing.allocator.dupe(u8, lmmath.lmmath_otf[0..]);
+    defer testing.allocator.free(bytes);
+    const math = tableOffset(bytes, tag("MATH")) orelse return error.TestUnexpectedResult;
+    const variants = math + readBeU16(bytes[math + 8 ..]);
+    const cov_off = readBeU16(bytes[variants + math_variants_horiz_cov_off ..]);
+    const count = readBeU16(bytes[variants + math_variants_horiz_count_off ..]);
+    try testing.expect(count > 0);
+    // This face does grow glyphs horizontally, so a NULL coverage here
+    // leaves its constructions belonging to nothing.
+    storeU16(bytes, variants + math_variants_horiz_cov_off, 0);
+    try testing.expectError(error.InvalidTable, FontFace.fromBytes(testing.allocator, bytes));
+    // A coverage claiming more glyphs than the header count indexes
+    // constructions past the glyphs they describe.
+    storeU16(bytes, variants + math_variants_horiz_cov_off, cov_off);
+    storeU16(bytes, variants + math_variants_horiz_count_off, count + 1);
     try testing.expectError(error.InvalidTable, FontFace.fromBytes(testing.allocator, bytes));
 }

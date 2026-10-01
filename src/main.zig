@@ -111,7 +111,7 @@ pub fn main(init: std.process.Init) !void {
                 try printUsageErrorArg(io, "option '", arg, "' needs a color\n");
                 std.process.exit(usage_status);
             };
-            bg = ztex.svg.parseColorChecked(v) catch |e| switch (e) {
+            bg = ztex.atom.parseColorChecked(v) catch |e| switch (e) {
                 error.UnrecognizedColor => {
                     try printUsageErrorArg(io, "unrecognized background color '", v, "' (use a color name, #RRGGBB[AA], or 'none'/'transparent')\n");
                     std.process.exit(usage_status);
@@ -124,6 +124,15 @@ pub fn main(init: std.process.Init) !void {
             try printUsageErrorArg(io, "unknown argument '", arg, "'; try 'ztex --help'\n");
             std.process.exit(usage_status);
         }
+    }
+
+    // `-p` is a margin in POINTS for the SVG and a count of PIXELS for a
+    // raster. Either way the frame is built from it, so a negative or
+    // non-finite one is a bad command line: it would frame the content
+    // from inside itself, or reach no frame at all.
+    if (!std.math.isFinite(pad) or pad < 0) {
+        try printUsageError(io, "padding '-p' must be a finite length of 0 or more\n");
+        std.process.exit(usage_status);
     }
 
     if (out_path) |p| {
@@ -158,13 +167,36 @@ pub fn main(init: std.process.Init) !void {
     };
 
     if (raster_format) |fmt| {
-        const pad_u: u32 = @intFromFloat(@max(0.0, pad));
-        var pix = try ztex.raster.rasterize(gpa, &ctx, &dl, .{
+        // The margin is a pixel COUNT here, and the frame is a 32-bit one:
+        // a value that count cannot hold is a bad command line, not an
+        // integer cast to trap on.
+        const pad_px: f64 = pad;
+        if (pad_px > @as(f64, @floatFromInt(std.math.maxInt(u32)))) {
+            try printUsageError(io, "padding '-p' is too many pixels to frame a raster in\n");
+            std.process.exit(usage_status);
+        }
+        const pad_u: u32 = @intFromFloat(pad_px);
+        // A resolution the pixel scale cannot be built from, and a frame no
+        // 32-bit size can describe, are both reported here rather than
+        // unwinding as a Zig error trace: the formula is fine, the request
+        // is not. Out of memory and a font the library cannot read are
+        // render failures and leave through main's error return.
+        var pix = ztex.raster.rasterize(gpa, &ctx, &dl, .{
             .dpi = dpi,
             .padding = pad_u,
             .format = fmt,
             .bg = bg,
-        });
+        }) catch |e| switch (e) {
+            error.InvalidArgument => {
+                try printUsageError(io, "'--dpi' must be a positive finite resolution\n");
+                std.process.exit(usage_status);
+            },
+            error.OutputTooLarge => {
+                try printUsageError(io, "the padded frame is too large to rasterize\n");
+                std.process.exit(usage_status);
+            },
+            else => return e,
+        };
         if (out_path) |path| {
             var file = try std.Io.Dir.cwd().createFile(io, path, .{});
             defer file.close(io);
@@ -174,7 +206,6 @@ pub fn main(init: std.process.Init) !void {
         }
         return;
     }
-
     const opts: ztex.svg.Options = .{ .padding = pad, .background = bg };
 
     if (out_path) |path| {

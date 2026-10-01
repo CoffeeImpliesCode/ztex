@@ -131,3 +131,688 @@ test "integration: text mode emits one full-size primitive per character" {
         try testing.expect(t.src_end <= 8);
     }
 }
+
+// The forced math classes rank by the glue TeX's spacing table gives them
+// against an ord neighbour: `\mathord` takes nothing, `\mathpunct` a thin
+// space after it, `\mathinner` a thin space on each side, `\mathbin` a medium
+// space on each side, `\mathrel` a thick space on each side. Rendering one row
+// per wrapper measures that ladder end to end, the parser's `\mathXXX` mapping
+// included. The ORDER is the contract, never the points: a new face or a
+// corrected table can move every width without breaking the ranking.
+test "integration: the forced classes space in the order ord < punct < inner < bin < rel" {
+    const rows = [_][]const u8{
+        "a\\mathord{X}b",
+        "a\\mathpunct{X}b",
+        "a\\mathinner{X}b",
+        "a\\mathbin{X}b",
+        "a\\mathrel{X}b",
+    };
+    var widths: [rows.len]f32 = undefined;
+    for (rows, 0..) |src, i| {
+        var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
+        defer out.deinit();
+        widths[i] = out.width;
+    }
+    // Each rung measures strictly narrower than the next: an equal pair means
+    // that wrapper never reached the glue table.
+    for (widths[0 .. widths.len - 1], widths[1..]) |lower, upper| {
+        try testing.expect(lower < upper);
+    }
+}
+
+test "integration: boxed draws a closed frame outside the formula" {
+    var plain = try ztex.render(testing.allocator, "x", .display, size_pt, null);
+    defer plain.deinit();
+    var framed = try ztex.render(testing.allocator, "\\boxed{x}", .display, size_pt, null);
+    defer framed.deinit();
+    try testing.expect(framed.width > plain.width);
+    try testing.expect(framed.height > plain.height);
+    try testing.expect(framed.depth > plain.depth);
+    var horizontal: usize = 0;
+    var vertical: usize = 0;
+    for (framed.items.items) |d| {
+        if (d == .rect) {
+            const r = d.rect;
+            if (r.w > r.h) horizontal += 1 else vertical += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), horizontal);
+    try testing.expectEqual(@as(usize, 2), vertical);
+}
+
+test "integration: nested color scopes restore the surrounding foreground" {
+    const src = "a{\\color{red}b\\textcolor{blue}{c}d}e";
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
+    defer out.deinit();
+    const expected = [_][3]u8{
+        .{ 0, 0, 0 }, .{ 255, 0, 0 }, .{ 0, 0, 255 }, .{ 255, 0, 0 }, .{ 0, 0, 0 },
+    };
+    var glyph: usize = 0;
+    for (out.items.items) |d| {
+        if (d == .text) {
+            try testing.expect(glyph < expected.len);
+            const c = d.text.color;
+            try testing.expectEqualSlices(u8, &expected[glyph], &.{ c.r, c.g, c.b });
+            glyph += 1;
+        }
+    }
+    try testing.expectEqual(expected.len, glyph);
+}
+
+test "integration: textcolor has the ordinary-group spacing of xcolor" {
+    var plain = try ztex.render(testing.allocator, "a\\mathord{=}b", .display, size_pt, null);
+    defer plain.deinit();
+    var colored = try ztex.render(
+        testing.allocator,
+        "a\\textcolor{red}{=}b",
+        .display,
+        size_pt,
+        null,
+    );
+    defer colored.deinit();
+    try testing.expectApproxEqAbs(plain.width, colored.width, 0.001);
+}
+
+test "integration: hline surrounds rows without introducing empty cells" {
+    const src =
+        "\\begin{array}{cc}\\hline a&b\\\\\\hline c&d\\\\\\hline\\end{array}";
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
+    defer out.deinit();
+    var rules: [3]f32 = undefined;
+    var rows = [_]?f32{ null, null };
+    var rule_count: usize = 0;
+    for (out.items.items) |d| {
+        switch (d) {
+            .rect => |r| {
+                try testing.expect(rule_count < rules.len);
+                try testing.expect(r.w > r.h);
+                rules[rule_count] = r.y;
+                rule_count += 1;
+            },
+            .text => |t| {
+                const bytes = src[t.src_start..t.src_end];
+                if (std.mem.eql(u8, bytes, "a")) rows[0] = t.y;
+                if (std.mem.eql(u8, bytes, "c")) rows[1] = t.y;
+            },
+            .line => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqual(rules.len, rule_count);
+    std.mem.sort(f32, &rules, {}, std.sort.asc(f32));
+    const first_row = rows[0] orelse return error.TestUnexpectedResult;
+    const last_row = rows[1] orelse return error.TestUnexpectedResult;
+    try testing.expect(rules[0] < first_row);
+    try testing.expect(first_row < rules[1]);
+    try testing.expect(rules[1] < last_row);
+    try testing.expect(last_row < rules[2]);
+}
+
+test "integration: textit and textbf keep text glyphs in their requested faces" {
+    const cases = .{
+        .{ "\\textit{ab}", "text_italic" },
+        .{ "\\textbf{ab}", "bold" },
+    };
+    inline for (cases) |c| {
+        var out = try ztex.render(testing.allocator, c[0], .display, size_pt, null);
+        defer out.deinit();
+        for (out.items.items, 0..) |d, i| {
+            const t = d.text;
+            try testing.expectEqualStrings(c[1], @tagName(t.style));
+            try testing.expectEqualStrings(if (i == 0) "a" else "b", t.bytes);
+        }
+    }
+}
+
+test "integration: font-backed superscripts use the drawn glyph's MATH correction" {
+    var ctx = try ztex.Context.init(testing.allocator);
+    defer ctx.deinit();
+    const face = ctx.fonts.math;
+    for ([_]u21{ 0x1D453, 0x1D465 }, [_][]const u8{ "f^2", "x^2" }) |cp, src| {
+        const gid = face.glyphIndex(cp) orelse return error.TestUnexpectedResult;
+        const ic = face.mathValues(gid).italic_correction orelse 0;
+        const advance = ctx.fonts.metrics(face, cp, size_pt).width;
+        var out = try ctx.render(src, .display, size_pt, null);
+        defer out.deinit();
+        const base = out.items.items[0].text;
+        const sup = out.items.items[1].text;
+        try testing.expectApproxEqAbs(advance + ic * size_pt, sup.x - base.x, 0.001);
+    }
+}
+
+test "integration: nested text weights and slants combine and restore" {
+    const cases = .{
+        .{ "\\textbf{a\\textit{b}c}", "bold", "bold_italic" },
+        .{ "\\textit{a\\textbf{b}c}", "text_italic", "bold_italic" },
+    };
+    inline for (cases) |c| {
+        var out = try ztex.render(testing.allocator, c[0], .display, size_pt, null);
+        defer out.deinit();
+        try testing.expectEqual(@as(usize, 3), out.items.items.len);
+        for (out.items.items, 0..) |d, i| {
+            try testing.expectEqualStrings(if (i == 1) c[2] else c[1], @tagName(d.text.style));
+            try testing.expectEqualStrings("abc"[i .. i + 1], d.text.bytes);
+        }
+    }
+}
+
+test "integration: runtime MATH parameters control nested scripts and fraction rules" {
+    var ctx = try ztex.Context.init(testing.allocator);
+    defer ctx.deinit();
+    const parsed = ctx.fonts.math.mathConstants() orelse return error.TestUnexpectedResult;
+    var constants = parsed.*;
+    constants.script_percent_scale_down = 0.6;
+    constants.script_script_percent_scale_down = 0.4;
+    constants.fraction_rule_thickness = 0.08;
+    constants.fraction_num_display_style_gap_min = 0.8;
+    constants.fraction_denom_display_style_gap_min = 0.8;
+    ctx.fm.font.math_constants = &constants;
+
+    var scripts = try ctx.render("x^{y^2}", .display, size_pt, null);
+    defer scripts.deinit();
+    try testing.expectApproxEqAbs(size_pt * 0.6, scripts.items.items[1].text.size, 0.001);
+    try testing.expectApproxEqAbs(size_pt * 0.4, scripts.items.items[2].text.size, 0.001);
+
+    const src = "\\frac{a}{b}";
+    var fraction = try ctx.render(src, .display, size_pt, null);
+    defer fraction.deinit();
+    var bar: ?ztex.draw.Rect = null;
+    var baselines = [_]?f32{ null, null };
+    for (fraction.items.items) |d| {
+        switch (d) {
+            .rect => |r| bar = r,
+            .text => |t| {
+                const bytes = src[t.src_start..t.src_end];
+                if (std.mem.eql(u8, bytes, "a")) baselines[0] = t.y;
+                if (std.mem.eql(u8, bytes, "b")) baselines[1] = t.y;
+            },
+            .line => return error.TestUnexpectedResult,
+        }
+    }
+    const rule = bar orelse return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(size_pt * constants.fraction_rule_thickness, rule.h, 0.001);
+    var numerator = try ctx.render("a", .text, size_pt, null);
+    defer numerator.deinit();
+    var denominator = try ctx.render("b", .text, size_pt, null);
+    defer denominator.deinit();
+    const num_y = baselines[0] orelse return error.TestUnexpectedResult;
+    const den_y = baselines[1] orelse return error.TestUnexpectedResult;
+    const num_bounds = numerator.bounds();
+    const num_bottom = num_y + num_bounds.depth;
+    try testing.expect(rule.y - num_bottom >= size_pt * 0.8 - 0.01);
+    try testing.expect(den_y + denominator.bounds().min_y - rule.y - rule.h >= size_pt * 0.8 - 0.01);
+}
+
+test "integration: scoped frame paint overrides host ink in RGBA and alpha masks" {
+    var ctx = try ztex.Context.init(testing.allocator);
+    defer ctx.deinit();
+    const cases = .{
+        .{ "\\boxed{x}", [4]u8{ 0, 0, 255, 255 } },
+        .{ "\\textcolor{black}{\\boxed{x}}", [4]u8{ 0, 0, 0, 255 } },
+        .{ "\\textcolor{#ff000080}{\\boxed{x}}", [4]u8{ 255, 0, 0, 128 } },
+        .{ "\\textcolor{transparent}{\\boxed{x}}", [4]u8{ 0, 0, 0, 0 } },
+    };
+    inline for (cases) |c| {
+        var out = try ctx.render(c[0], .display, size_pt, null);
+        defer out.deinit();
+        var top: ?ztex.draw.Rect = null;
+        for (out.items.items) |d| {
+            if (d == .rect and d.rect.w > d.rect.h) {
+                if (top == null or d.rect.y < top.?.y) top = d.rect;
+            }
+        }
+        const rule = top orelse return error.TestUnexpectedResult;
+        const bounds = out.bounds();
+        const x: usize = @intFromFloat(@floor(4 + rule.x + rule.w / 2 - bounds.min_x));
+        const y: usize = @intFromFloat(@floor(4 + rule.y + rule.h / 2 - bounds.min_y));
+        for ([_]ztex.raster.Format{ .rgba32, .alpha8 }) |format| {
+            var pixels = try ztex.raster.rasterize(testing.allocator, &ctx, &out, .{
+                .dpi = 72,
+                .padding = 4,
+                .format = format,
+                .fg = .{ .r = 0, .g = 0, .b = 255 },
+            });
+            defer pixels.deinit();
+            if (format == .rgba32) {
+                const offset = y * pixels.stride + x * 4;
+                const expected = c[1];
+                try testing.expectEqualSlices(u8, &expected, pixels.pixels[offset .. offset + 4]);
+            } else {
+                try testing.expectEqual(c[1][3], pixels.pixels[y * pixels.stride + x]);
+            }
+        }
+    }
+}
+
+test "integration: a color declaration does not change relation spacing" {
+    var plain = try ztex.render(testing.allocator, "a=b", .display, size_pt, null);
+    defer plain.deinit();
+    var colored = try ztex.render(testing.allocator, "\\color{red}a=b", .display, size_pt, null);
+    defer colored.deinit();
+    try testing.expectApproxEqAbs(plain.width, colored.width, 0.001);
+}
+
+test "integration: smash suppresses vertical metrics but preserves visible ink" {
+    var plain = try ztex.render(testing.allocator, "b", .display, size_pt, null);
+    defer plain.deinit();
+    var smashed = try ztex.render(testing.allocator, "\\smash{b}", .display, size_pt, null);
+    defer smashed.deinit();
+    try testing.expectApproxEqAbs(plain.width, smashed.width, 0.001);
+    try testing.expectEqual(@as(f32, 0), smashed.height);
+    try testing.expectEqual(@as(f32, 0), smashed.depth);
+    try testing.expectEqual(@as(usize, 1), smashed.items.items.len);
+    try testing.expectEqualStrings(plain.items.items[0].text.bytes, smashed.items.items[0].text.bytes);
+    const before = plain.bounds();
+    const after = smashed.bounds();
+    try testing.expectApproxEqAbs(before.min_y, after.min_y, 0.001);
+    try testing.expectApproxEqAbs(before.depth, after.depth, 0.001);
+}
+
+test "integration: tag draws a roman parenthesized equation number" {
+    const src = "x=1\\tag{3}";
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
+    defer out.deinit();
+    const expected = [_][]const u8{ "(", "3", ")" };
+    try testing.expect(out.items.items.len >= expected.len);
+    const number = out.items.items[out.items.items.len - expected.len ..];
+    for (number, expected, 0..) |d, bytes, i| {
+        const t = d.text;
+        try testing.expectEqualStrings(bytes, t.bytes);
+        try testing.expectEqual(ztex.atom.CharStyle.roman, t.style);
+        if (i != 1) {
+            try testing.expectEqualStrings("\\tag{3}", src[t.src_start..t.src_end]);
+        }
+    }
+}
+
+test "integration: a color declaration ends at its environment cell" {
+    const src = "\\begin{matrix}\\color{red}a&b\\\\c&d\\end{matrix}";
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
+    defer out.deinit();
+    var glyph: usize = 0;
+    for (out.items.items) |d| {
+        if (d != .text) continue;
+        const text = d.text;
+        const expected: ztex.atom.Color = if (glyph == 0)
+            .{ .r = 255, .g = 0, .b = 0 }
+        else
+            .{ .r = 0, .g = 0, .b = 0 };
+        try testing.expectEqual(expected, text.color);
+        glyph += 1;
+    }
+    try testing.expectEqual(@as(usize, 4), glyph);
+}
+
+fn twoRowGap(out: *const ztex.draw.DrawList) !f32 {
+    var first: ?f32 = null;
+    for (out.items.items) |d| {
+        if (d != .text) continue;
+        if (first) |y| return d.text.y - y;
+        first = d.text.y;
+    }
+    return error.TestUnexpectedResult;
+}
+
+/// The x of the first glyph whose source window is exactly `bytes` — where a
+/// cell's width measurement becomes visible to the caller.
+fn glyphX(out: *const ztex.draw.DrawList, src: []const u8, bytes: []const u8) !f32 {
+    for (out.items.items) |d| {
+        if (d != .text) continue;
+        const t = d.text;
+        if (std.mem.eql(u8, src[t.src_start..t.src_end], bytes)) return t.x;
+    }
+    return error.TestUnexpectedResult;
+}
+
+/// The horizontal distance between two glyphs located by what the source
+/// wrote — a cell's width measurement as the caller sees it.
+fn glyphSpan(
+    out: *const ztex.draw.DrawList,
+    src: []const u8,
+    from: []const u8,
+    to: []const u8,
+) !f32 {
+    return (try glyphX(out, src, to)) - (try glyphX(out, src, from));
+}
+
+/// The baseline distance between the first two glyphs whose source window is
+/// exactly `bytes` — the row pitch of a two-row environment, located by what
+/// the source wrote rather than by emission order.
+fn glyphRowGap(out: *const ztex.draw.DrawList, src: []const u8, bytes: []const u8) !f32 {
+    var first: ?f32 = null;
+    for (out.items.items) |d| {
+        if (d != .text) continue;
+        const t = d.text;
+        if (!std.mem.eql(u8, src[t.src_start..t.src_end], bytes)) continue;
+        if (first) |y| return t.y - y;
+        first = t.y;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "integration: arraystretch ends at its group" {
+    const plain_src = "\\begin{matrix}x\\\\x\\end{matrix}";
+    const stretched_src = "\\arraystretch{2}" ++ plain_src;
+    const grouped_src = "{" ++ stretched_src ++ "}" ++ plain_src;
+    var plain = try ztex.render(testing.allocator, plain_src, .display, size_pt, null);
+    defer plain.deinit();
+    var stretched = try ztex.render(testing.allocator, stretched_src, .display, size_pt, null);
+    defer stretched.deinit();
+    var grouped = try ztex.render(testing.allocator, grouped_src, .display, size_pt, null);
+    defer grouped.deinit();
+    var baselines: [4]f32 = undefined;
+    var glyph: usize = 0;
+    for (grouped.items.items) |d| {
+        if (d != .text) continue;
+        try testing.expect(glyph < baselines.len);
+        baselines[glyph] = d.text.y;
+        glyph += 1;
+    }
+    try testing.expectEqual(baselines.len, glyph);
+    try testing.expectApproxEqAbs(try twoRowGap(&stretched), baselines[1] - baselines[0], 0.001);
+    try testing.expectApproxEqAbs(try twoRowGap(&plain), baselines[3] - baselines[2], 0.001);
+}
+
+test "integration: a nested environment keeps its horizontal rule inside its cell" {
+    const src = "\\begin{matrix}a&\\begin{matrix}x\\\\\\hline x\\end{matrix}\\\\d\\end{matrix}";
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
+    defer out.deinit();
+    var rule: ?ztex.draw.Rect = null;
+    var inner: [2]ztex.draw.Text = undefined;
+    var glyph: usize = 0;
+    for (out.items.items) |d| {
+        switch (d) {
+            .rect => |r| {
+                try testing.expect(rule == null);
+                rule = r;
+            },
+            .text => |t| {
+                if (!std.mem.eql(u8, src[t.src_start..t.src_end], "x")) continue;
+                try testing.expect(glyph < inner.len);
+                inner[glyph] = t;
+                glyph += 1;
+            },
+            .line => return error.TestUnexpectedResult,
+        }
+    }
+    try testing.expectEqual(inner.len, glyph);
+    const r = rule orelse return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(inner[0].x, r.x, 0.001);
+    try testing.expectApproxEqAbs(inner[1].x, r.x, 0.001);
+    try testing.expect(inner[0].y < r.y);
+    try testing.expect(inner[1].y > r.y + r.h);
+    var plain = try ztex.render(testing.allocator, "x", .display, size_pt, null);
+    defer plain.deinit();
+    try testing.expectApproxEqAbs(plain.width, r.w, 0.001);
+}
+
+// A color scope paints the atoms under it and changes no geometry, so the
+// cell it ends in measures exactly what the plain cell measures — including
+// the italic correction the column appends after its last character. The
+// distance to the NEXT column's glyph is that measurement made visible: at
+// 20pt the plain `f & Q` holds 21.6pt, and a scope over the `f` must not
+// drop it to 19.8pt.
+test "integration: a color scope keeps the italic correction of the cell's last character" {
+    const plain_src = "\\begin{matrix}f&Q\\end{matrix}";
+    const declared_src = "\\begin{matrix}\\color{red}f&Q\\end{matrix}";
+    const grouped_src = "\\begin{matrix}\\textcolor{red}{f}&Q\\end{matrix}";
+    const bare_src = "\\begin{matrix}f{}&Q\\end{matrix}";
+    var plain = try ztex.render(testing.allocator, plain_src, .display, size_pt, null);
+    defer plain.deinit();
+    const corrected = try glyphSpan(&plain, plain_src, "f", "Q");
+    for ([_][]const u8{ declared_src, grouped_src }) |src| {
+        var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
+        defer out.deinit();
+        try testing.expectApproxEqAbs(corrected, try glyphSpan(&out, src, "f", "Q"), 0.001);
+    }
+    // The correction is part of that measurement and not merely equal between
+    // the plain and the colored render: `f{}` is the same cell content and
+    // the same advance with no character left to correct, so its next column
+    // sits nearer than the corrected one.
+    var bare = try ztex.render(testing.allocator, bare_src, .display, size_pt, null);
+    defer bare.deinit();
+    try testing.expect(corrected > try glyphSpan(&bare, bare_src, "f", "Q"));
+}
+
+// An `\arraystretch` written inside an environment body is a declaration the
+// body reads and hands back: it sizes the environment it was written in and
+// no other. The environment after it keeps the default row pitch.
+test "integration: an arraystretch assigned inside a cell stops at its environment" {
+    const plain_src = "\\begin{matrix}c\\\\c\\end{matrix}";
+    const src = "\\begin{matrix}\\arraystretch{2}a\\\\a\\end{matrix}" ++ plain_src;
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
+    defer out.deinit();
+    var plain = try ztex.render(testing.allocator, plain_src, .display, size_pt, null);
+    defer plain.deinit();
+    const assigned = try glyphRowGap(&out, src, "a");
+    const following = try glyphRowGap(&out, src, "c");
+    // The assignment reaches the environment it was written in: its rows sit
+    // at twice the default distance.
+    try testing.expect(assigned > following);
+    // The next environment reads the default factor, exactly as the same
+    // environment does on its own.
+    try testing.expectApproxEqAbs(try glyphRowGap(&plain, plain_src, "c"), following, 0.001);
+}
+
+// The same scope in the other direction: an override inside a NESTED
+// environment sizes that nested environment, and the factor the outer body
+// started with is what the environment after it reads.
+test "integration: an outer arraystretch survives an override in a nested environment" {
+    const src = "\\arraystretch{2}\\begin{matrix}a\\\\a\\end{matrix}" ++
+        "\\begin{matrix}b\\\\\\arraystretch{0.5}\\begin{matrix}c\\\\c\\end{matrix}\\end{matrix}" ++
+        "\\begin{matrix}d\\\\d\\end{matrix}";
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
+    defer out.deinit();
+    const outer = try glyphRowGap(&out, src, "a");
+    const nested = try glyphRowGap(&out, src, "c");
+    const restored = try glyphRowGap(&out, src, "d");
+    // The override sizes the nested environment only ...
+    try testing.expect(nested < outer);
+    // ... and the outer factor is what the environment after it reads.
+    try testing.expectApproxEqAbs(outer, restored, 0.001);
+}
+
+// A frame follows the INK, not the box that measured it. At a size inside
+// the LMRoman17 optical band a `\text` glyph is boxed by that band's optical
+// advance, which is narrower than the advance of the 10pt design the ink is
+// measured on, and both metric sources paint the SAME `f` hook. So the
+// static frame has to reach exactly as far as the embedded face's frame, and
+// both have to reach past the advance box that frames the glyph otherwise.
+test "integration: the static frame reaches the ink a narrower optical advance would clip" {
+    const src = "\\text{f}";
+    var ctx = try ztex.Context.init(testing.allocator);
+    defer ctx.deinit();
+    var static = try ztex.render(testing.allocator, src, .display, size_pt, null);
+    defer static.deinit();
+    var fonted = try ctx.render(src, .display, size_pt, null);
+    defer fonted.deinit();
+    const framed = static.bounds().min_x + static.bounds().width;
+    try testing.expectApproxEqAbs(
+        fonted.bounds().min_x + fonted.bounds().width,
+        framed,
+        0.01,
+    );
+    try testing.expect(framed > static.width);
+}
+
+// An `\arraystretch` written in a cell belongs to that cell. It still sizes
+// the environment it was written in — that is the first row, and one
+// environment's rows share its strut — but the rows and cells after it read
+// the outer factor again, including the nested environment one of them
+// opens: the nested rows here keep the default pitch while the outer rows
+// open up to twice it.
+test "integration: a cell's arraystretch does not reach the rows and cells after it" {
+    const src = "\\begin{matrix}\\arraystretch{2}x\\\\" ++
+        "\\begin{matrix}b\\\\b\\end{matrix}\\\\x\\end{matrix}";
+    const plain_outer = "\\begin{matrix}x\\\\\\begin{matrix}b\\\\b\\end{matrix}\\\\x\\end{matrix}";
+    const plain_nested = "\\begin{matrix}b\\\\b\\end{matrix}";
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
+    defer out.deinit();
+    var outer = try ztex.render(testing.allocator, plain_outer, .display, size_pt, null);
+    defer outer.deinit();
+    var nested = try ztex.render(testing.allocator, plain_nested, .display, size_pt, null);
+    defer nested.deinit();
+    // The outer rows (the `x` cells) open up ...
+    try testing.expect(
+        (try glyphRowGap(&out, src, "x")) > (try glyphRowGap(&outer, plain_outer, "x")),
+    );
+    // ... and the nested environment in the NEXT row keeps the default pitch.
+    try testing.expectApproxEqAbs(
+        try glyphRowGap(&nested, plain_nested, "b"),
+        try glyphRowGap(&out, src, "b"),
+        0.001,
+    );
+}
+
+// `\left … \right` bounds its interior the way a group does, so a factor
+// written between the delimiters ends with the pair: the environment inside
+// it is stretched, and the environment that follows reads the default.
+test "integration: an arraystretch inside a left-right pair ends with the pair" {
+    const plain_src = "\\begin{matrix}c\\\\c\\end{matrix}";
+    const src = "\\left(\\arraystretch{2}\\begin{matrix}a\\\\a\\end{matrix}\\right)" ++ plain_src;
+    const stretched_src = "\\arraystretch{2}\\begin{matrix}a\\\\a\\end{matrix}";
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
+    defer out.deinit();
+    var stretched = try ztex.render(testing.allocator, stretched_src, .display, size_pt, null);
+    defer stretched.deinit();
+    var plain = try ztex.render(testing.allocator, plain_src, .display, size_pt, null);
+    defer plain.deinit();
+    try testing.expectApproxEqAbs(
+        try glyphRowGap(&stretched, stretched_src, "a"),
+        try glyphRowGap(&out, src, "a"),
+        0.001,
+    );
+    try testing.expectApproxEqAbs(
+        try glyphRowGap(&plain, plain_src, "c"),
+        try glyphRowGap(&out, src, "c"),
+        0.001,
+    );
+}
+
+// The cells of the first row decide this environment's strut together: a
+// cell that only INHERITS a factor changes nothing, so the plain cells after
+// the assigning one still stand at the doubled pitch.
+test "integration: a first-row assignment survives the plain cells after it" {
+    const src = "\\begin{matrix}\\arraystretch{2}x&y\\\\x&z\\end{matrix}";
+    const stretched_src = "\\arraystretch{2}\\begin{matrix}x&y\\\\x&z\\end{matrix}";
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
+    defer out.deinit();
+    var stretched = try ztex.render(testing.allocator, stretched_src, .display, size_pt, null);
+    defer stretched.deinit();
+    try testing.expectApproxEqAbs(
+        try glyphRowGap(&stretched, stretched_src, "x"),
+        try glyphRowGap(&out, src, "x"),
+        0.001,
+    );
+}
+
+// A second assignment in the first row REPLACES the first one — the last one
+// written is the factor the environment's rows are built from, here back to
+// the default the plain matrix has.
+test "integration: the last first-row assignment wins" {
+    const src = "\\begin{matrix}\\arraystretch{2}x&\\arraystretch{1}y\\\\x&z\\end{matrix}";
+    const plain_src = "\\begin{matrix}x&y\\\\x&z\\end{matrix}";
+    const stretched_src = "\\arraystretch{2}\\begin{matrix}x&y\\\\x&z\\end{matrix}";
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
+    defer out.deinit();
+    var plain = try ztex.render(testing.allocator, plain_src, .display, size_pt, null);
+    defer plain.deinit();
+    var stretched = try ztex.render(testing.allocator, stretched_src, .display, size_pt, null);
+    defer stretched.deinit();
+    try testing.expectApproxEqAbs(
+        try glyphRowGap(&plain, plain_src, "x"),
+        try glyphRowGap(&out, src, "x"),
+        0.001,
+    );
+    try testing.expect(
+        (try glyphRowGap(&out, src, "x")) < (try glyphRowGap(&stretched, stretched_src, "x")),
+    );
+}
+
+// A nested environment in a LATER cell reads the factor the body opened
+// with: the first cell's assignment sized the rows around it (the `x` cells)
+// and stops there, so the nested rows keep the default pitch.
+test "integration: a nested environment in a later cell reads the outer factor" {
+    const nested = "\\begin{matrix}y\\\\y\\end{matrix}";
+    const src = "\\begin{matrix}\\arraystretch{2}x&" ++ nested ++ "\\\\x&z\\end{matrix}";
+    const stretched_src = "\\arraystretch{2}\\begin{matrix}x&{\\arraystretch{1}" ++
+        nested ++ "}\\\\x&z\\end{matrix}";
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
+    defer out.deinit();
+    var stretched = try ztex.render(testing.allocator, stretched_src, .display, size_pt, null);
+    defer stretched.deinit();
+    var plain = try ztex.render(testing.allocator, nested, .display, size_pt, null);
+    defer plain.deinit();
+    try testing.expectApproxEqAbs(
+        try glyphRowGap(&stretched, stretched_src, "x"),
+        try glyphRowGap(&out, src, "x"),
+        0.001,
+    );
+    try testing.expectApproxEqAbs(
+        try glyphRowGap(&plain, nested, "y"),
+        try glyphRowGap(&out, src, "y"),
+        0.001,
+    );
+}
+
+// An assignment the parser meets inside a NESTED environment is that
+// environment's own: the enclosing cell did not make it, so the enclosing
+// rows keep the default pitch while the nested rows carry the factor.
+test "integration: a nested environment's assignment is not the enclosing cell's" {
+    const nested = "\\begin{matrix}y\\\\y\\end{matrix}";
+    const src = "\\begin{matrix}\\begin{matrix}\\arraystretch{2}y\\\\y\\end{matrix}" ++
+        "&z\\\\z&w\\end{matrix}";
+    const plain_src = "\\begin{matrix}{\\arraystretch{2}" ++ nested ++
+        "}&z\\\\z&w\\end{matrix}";
+    const stretched_nested = "\\arraystretch{2}" ++ nested;
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
+    defer out.deinit();
+    var plain = try ztex.render(testing.allocator, plain_src, .display, size_pt, null);
+    defer plain.deinit();
+    var stretched = try ztex.render(testing.allocator, stretched_nested, .display, size_pt, null);
+    defer stretched.deinit();
+    // The enclosing rows are the default ones ...
+    try testing.expectApproxEqAbs(
+        try glyphRowGap(&plain, plain_src, "z"),
+        try glyphRowGap(&out, src, "z"),
+        0.001,
+    );
+    // ... and the nested rows are the stretched ones.
+    try testing.expectApproxEqAbs(
+        try glyphRowGap(&stretched, stretched_nested, "y"),
+        try glyphRowGap(&out, src, "y"),
+        0.001,
+    );
+}
+
+// A `\def` inside a GROUP is local to it, so it neither reaches the enclosing
+// cell's factor nor the environment's rows — the same rule that ends a
+// factor at the closing brace of any group.
+test "integration: a group's assignment is not the enclosing cell's" {
+    const src = "\\begin{matrix}{\\arraystretch{2}}x&y\\\\x&z\\end{matrix}";
+    const plain_src = "\\begin{matrix}x&y\\\\x&z\\end{matrix}";
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
+    defer out.deinit();
+    var plain = try ztex.render(testing.allocator, plain_src, .display, size_pt, null);
+    defer plain.deinit();
+    try testing.expectApproxEqAbs(
+        try glyphRowGap(&plain, plain_src, "x"),
+        try glyphRowGap(&out, src, "x"),
+        0.001,
+    );
+}
+
+test "integration: a nested body preserves its enclosing cell's stretch assignment" {
+    const body = "\\begin{matrix}x\\begin{matrix}y\\end{matrix}\\\\x\\end{matrix}";
+    const src = "\\arraystretch{3}\\begin{matrix}\\arraystretch{2}x" ++
+        "\\begin{matrix}y\\end{matrix}\\\\x\\end{matrix}";
+    const ref_src = "\\arraystretch{2}" ++ body;
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
+    defer out.deinit();
+    var reference = try ztex.render(testing.allocator, ref_src, .display, size_pt, null);
+    defer reference.deinit();
+    try testing.expectApproxEqAbs(
+        try glyphRowGap(&reference, ref_src, "x"),
+        try glyphRowGap(&out, src, "x"),
+        0.001,
+    );
+}

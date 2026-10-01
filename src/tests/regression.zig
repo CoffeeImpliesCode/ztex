@@ -83,7 +83,7 @@ pub const golden = [_]struct { src: []const u8, dump: []const u8 }{
     },
     .{ .src = "\\mathbf{ab}", .dump =
     \\T:a,0,0,20[8,9]
-    \\T:b,10,0,20[9,10]
+    \\T:b,11.18,0,20[9,10]
     \\
     },
 };
@@ -110,47 +110,47 @@ pub fn dumpSvg(gpa: std.mem.Allocator, src: []const u8, size_pt: f32, padding: f
 /// Golden SVG snapshots for the corpus, at size_pt = 20.
 pub const golden_svg = [_]struct { src: []const u8, padding: f32, svg: []const u8 }{
     .{ .src = "x", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="14.639999pt" height="13.06pt" viewBox="0 0 14.639999 13.06">
-    \\<text x="1.5999999pt" y="8.84pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="11.44pt" height="13.06pt" viewBox="0 0 11.44 13.06">
+    \\<text x="0" y="8.84" font-size="20" font-style="normal" fill="#000000ff">𝑥</text>
     \\</svg>
     \\
     },
     .{ .src = "x^2", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="21.96pt" height="20.803999pt" viewBox="0 0 21.96 20.803999">
-    \\<text x="1.5999999pt" y="16.584pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
-    \\<text x="13.359999pt" y="9.323999pt" font-size="14pt" font-style="italic" fill="#000000ff">2</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="18.759998pt" height="20.803999pt" viewBox="0 0 18.759998 20.803999">
+    \\<text x="0" y="16.584" font-size="20" font-style="normal" fill="#000000ff">𝑥</text>
+    \\<text x="11.759999" y="9.323999" font-size="14" font-style="normal" fill="#000000ff">2</text>
     \\</svg>
     \\
     },
     .{ .src = "\\frac{1}{2}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="13.2pt" height="44.56918pt" viewBox="0 0 13.2 44.56918">
-    \\<text x="1.5999999pt" y="13.319999pt" font-size="20pt" font-style="italic" fill="#000000ff">1</text>
-    \\<rect x="1.5999999pt" y="21.45016pt" width="10pt" height="0.8pt" fill="#000000ff"/>
-    \\<text x="1.5999999pt" y="40.56918pt" font-size="20pt" font-style="italic" fill="#000000ff">2</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="10pt" height="44.56918pt" viewBox="0 0 10 44.56918">
+    \\<text x="0" y="13.319999" font-size="20" font-style="normal" fill="#000000ff">1</text>
+    \\<rect x="0" y="21.45016" width="10" height="0.8" fill="#000000ff"/>
+    \\<text x="0" y="40.56918" font-size="20" font-style="normal" fill="#000000ff">2</text>
     \\</svg>
     \\
     },
     .{ .src = "\\sum_{i=1}^{n}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="32.08pt" height="55.16pt" viewBox="0 0 32.08 55.16">
-    \\<text x="11.84pt" y="6.1879997pt" font-size="14pt" font-style="italic" fill="#000000ff">𝑛</text>
-    \\<text x="1.5999999pt" y="29.342pt" font-size="20pt" font-style="italic" fill="#000000ff">∑</text>
-    \\<text x="4.6790004pt" y="51.006pt" font-size="14pt" font-style="italic" fill="#000000ff">𝑖</text>
-    \\<text x="9.509001pt" y="51.006pt" font-size="14pt" font-style="italic" fill="#000000ff">=</text>
-    \\<text x="20.401001pt" y="51.006pt" font-size="14pt" font-style="italic" fill="#000000ff">1</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="28.880001pt" height="55.16pt" viewBox="0 0 28.880001 55.16">
+    \\<text x="10.240001" y="6.1879997" font-size="14" font-style="normal" fill="#000000ff">𝑛</text>
+    \\<text x="0" y="29.342" font-size="20" font-style="normal" fill="#000000ff">∑</text>
+    \\<text x="3.0790005" y="51.006" font-size="14" font-style="normal" fill="#000000ff">𝑖</text>
+    \\<text x="7.9090004" y="51.006" font-size="14" font-style="normal" fill="#000000ff">=</text>
+    \\<text x="18.801" y="51.006" font-size="14" font-style="normal" fill="#000000ff">1</text>
     \\</svg>
     \\
     },
     .{ .src = "\\text{hi}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="18.42pt" height="17.880001pt" viewBox="0 0 18.42 17.880001">
-    \\<text x="1.5999999pt" y="13.88pt" font-size="20pt" font-style="normal" fill="#000000ff">h</text>
-    \\<text x="11.82pt" y="13.88pt" font-size="20pt" font-style="normal" fill="#000000ff">i</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="15.22pt" height="17.880001pt" viewBox="0 0 15.22 17.880001">
+    \\<text x="0" y="13.88" font-size="20" font-style="normal" fill="#000000ff">h</text>
+    \\<text x="10.22" y="13.88" font-size="20" font-style="normal" fill="#000000ff">i</text>
     \\</svg>
     \\
     },
     .{ .src = "x^2", .padding = 5, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="31.96pt" height="30.803999pt" viewBox="0 0 31.96 30.803999">
-    \\<text x="6.6pt" y="21.584pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
-    \\<text x="18.359999pt" y="14.323999pt" font-size="14pt" font-style="italic" fill="#000000ff">2</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="28.759998pt" height="30.803999pt" viewBox="0 0 28.759998 30.803999">
+    \\<text x="5" y="21.584" font-size="20" font-style="normal" fill="#000000ff">𝑥</text>
+    \\<text x="16.759998" y="14.323999" font-size="14" font-style="normal" fill="#000000ff">2</text>
     \\</svg>
     \\
     },

@@ -81,8 +81,8 @@ pub fn render(
 fn arityOk(tag: atom.Tag, n: atom.Node) bool {
     return switch (tag) {
         .row => true,
-        .group, .styled, .mathstyle, .opname, .overline => n.num_children == 1,
-        .char, .space, .text, .op => n.num_children == 0,
+        .group, .styled, .mathstyle, .opname, .overline, .boxed, .color, .textcolor => n.num_children == 1,
+        .char, .space, .text, .op, .hline => n.num_children == 0,
         .script => n.num_children ==
             1 +
                 @as(u16, @intFromBool(n.data & atom.ScriptBits.sup != 0)) +
