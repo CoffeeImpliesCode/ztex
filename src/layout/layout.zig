@@ -95,6 +95,53 @@ const bmod_row_data: u32 = 6;
 /// row path.
 const mod_row_data: u32 = 7;
 
+/// The `data` an \overset / \underset / \stackrel row node carries (set by the
+/// parser): children [script, base]. layoutInner routes it through
+/// layoutLimits — a \mathop with FORCED limits (amsmath's \overset) — instead
+/// of the ordinary row path. The three markers share one geometry and differ
+/// only in the class the row reports (see leftRole).
+const overset_row_data: u32 = 8;
+const underset_row_data: u32 = 9;
+const stackrel_row_data: u32 = 10;
+
+/// The `data` an \underbrace / \overbrace row node carries (set by the
+/// parser): children [content] or [content, annotation]. layoutInner routes
+/// it through layoutBrace — the brace band below/above the content plus the
+/// optional forced-limit annotation — instead of the ordinary row path.
+const underbrace_row_data: u32 = 11;
+const overbrace_row_data: u32 = 12;
+
+/// A class-override row (\mathord \mathrel \mathbin \mathopen \mathclose
+/// \mathpunct \mathinner, and \colon) carries `atom.classRowData`: the low
+/// four bits are the marker 13 and bits 8-10 the class. It deliberately has
+/// NO layoutInner arm — the construct is a single-child row, so the
+/// ordinary row path boxes it exactly as it boxes the bare field, and the
+/// class reaches the glue only through leftRole/rightRole.
+/// Bit 5 of an explicit-kern row's `data` marks the family (\hspace / \kern /
+/// \mkern and `\:`'s constant mu skip); bits 0-1 carry the dimension's unit
+/// and the magnitude rides in the row's single `.space` child (a space leaf's
+/// f32 em payload). Mirrors the parser's encoding.
+const kern_row_data: u32 = 1 << 5;
+const dim_unit_mask: u32 = 3;
+
+/// Dimension units of an explicit kern (see layoutKern for how each scales).
+const dim_pt: u32 = 0;
+const dim_em: u32 = 1;
+const dim_ex: u32 = 2;
+const dim_mu: u32 = 3;
+
+/// Bit 4 of a \phantom-family row's `data` marks the family; the low bits are
+/// the keep mask — which of the argument box's dimensions survive. \phantom
+/// keeps all three, \vphantom the height and depth, \hphantom the width, and
+/// \smash the width alone (amsmath's `\smash[<axes>]` zeroes ht and/or dp and
+/// always keeps the advance, so its default `[tb]` IS \hphantom's geometry).
+/// Mirrors the parser's encoding. Bit 4 ALONE routes the row to layoutPhantom:
+/// the fixed markers 1..12 (bits 0-3) and the kern family's bit 5 never set it.
+const phantom_row_data: u32 = 1 << 4;
+const keep_width: u32 = 1;
+const keep_height: u32 = 2;
+const keep_depth: u32 = 4;
+
 /// Lay out the atom tree rooted at `idx` into the box pool.
 ///
 /// `size_pt` is the current font size; `current_style` is the effective font
@@ -141,6 +188,35 @@ fn layoutInner(
             layoutBmod(list, ast, idx, fm, style, size_pt, current_style, cramped)
         else if (n.data == mod_row_data)
             layoutMod(list, ast, idx, fm, style, size_pt, current_style, cramped)
+        else if (n.data == overset_row_data or n.data == underset_row_data or
+            n.data == stackrel_row_data)
+            layoutLimits(
+                list,
+                ast,
+                idx,
+                fm,
+                style,
+                size_pt,
+                current_style,
+                cramped,
+                n.data != overset_row_data,
+            )
+        else if (n.data == underbrace_row_data or n.data == overbrace_row_data)
+            layoutBrace(
+                list,
+                ast,
+                idx,
+                fm,
+                style,
+                size_pt,
+                current_style,
+                cramped,
+                n.data == underbrace_row_data,
+            )
+        else if ((n.data & phantom_row_data) != 0)
+            layoutPhantom(list, ast, idx, fm, style, size_pt, current_style, cramped)
+        else if ((n.data & kern_row_data) != 0)
+            layoutKern(list, ast, idx, fm, style, size_pt)
         else
             layoutRow(list, ast, idx, fm, style, size_pt, current_style, cramped),
         .group => layoutInner(
@@ -221,7 +297,12 @@ fn unwrapAtom(ast: *const atom.Ast, idx: u32) u32 {
     var i = idx;
     while (true) {
         const n = ast.node(i);
-        if (n.tag != .group and n.tag != .styled and n.tag != .mathstyle) return i;
+        // A class-override row holds exactly ONE atom, so it is transparent
+        // for TeX's single-noad purposes: `\mathrel{x}^2` places its scripts
+        // from the x, exactly like `{x}^2`. The class is read from `data` by
+        // leftRole/rightRole, never from the child.
+        const class_row = n.tag == .row and atom.isClassRow(n.data) and n.num_children == 1;
+        if (n.tag != .group and n.tag != .styled and n.tag != .mathstyle and !class_row) return i;
         if (n.num_children == 0) return i;
         i = ast.child(i, 0);
     }
@@ -364,12 +445,36 @@ fn roleOfCp(cp: u21) Role {
         0x27F5, 0x27F6, 0x27F7, 0x27F8, 0x27F9, 0x27FA => .rel,
         0x2AAF, 0x2AB0 => .rel,
 
+        // The colon family: RATIO ∶, PROPORTION ∷ (\Colon), COLON EQUALS ⋔
+        // (\coloneqq) and EQUALS COLON ⋕ (\coloneq) — all relations in both
+        // references (unicode-math's symbol table classes every one of them
+        // \mathrel; mathtools builds \coloneqq/\Coloneqq as \mathrel). A
+        // bare `:` stays a relation here; `\colon` never reaches roleOfCp as
+        // a bare char — the parser wraps it in a forced-class row.
+        0x2236, 0x2237, 0x2254, 0x2255 => .rel,
         0x27E8, 0x2308, 0x230A => .open,
         0x27E9, 0x2309, 0x230B => .close,
 
         0x2211, 0x220F, 0x222B, 0x2210, 0x222E, 0x2A06, 0x22C0, 0x22C1, 0x2A00, 0x2A01, 0x2A02, 0x2A04, 0x2A05 => .op,
 
         else => .ord,
+    };
+}
+
+/// The layout mirror of `atom.MathClass`: the same eight TeX classes, so a
+/// parser-recorded override (`\mathrel{...}`, `\colon`) enters the glue
+/// table on its own row. Written as an explicit switch so a class added to
+/// one enum but not the other fails to compile here.
+fn roleOfClass(cls: atom.MathClass) Role {
+    return switch (cls) {
+        .ord => .ord,
+        .op => .op,
+        .bin => .bin,
+        .rel => .rel,
+        .open => .open,
+        .close => .close,
+        .punct => .punct,
+        .inner => .inner,
     };
 }
 
@@ -403,12 +508,31 @@ fn leftRole(ast: *const atom.Ast, idx: u32) Role {
         .fraction => .ord,
         .group, .styled, .mathstyle, .row => blk: {
             if (n.num_children == 0) break :blk .ord;
+            // A forced class (\mathord \mathrel \mathbin \mathopen
+            // \mathclose \mathpunct \mathinner, and \colon) is the atom's
+            // class on BOTH sides of its content — the wrapped atom's own
+            // role is discarded, which is the whole point: `a\mathrel{-}b`
+            // spaces like `a-b` with the relation glue, and `\mathord{+}`
+            // loses the binary's med spaces.
+            if (n.tag == .row and atom.isClassRow(n.data)) {
+                break :blk roleOfClass(atom.classRowClass(n.data));
+            }
             // \mod: the style-dependent leading \mkern is NOT a noad — the
             // construct's first atom is the ord "mod" group (amsmath:
             // \mod#1{\allowbreak \if@display\mkern18mu\else\mkern12mu\fi
             // {\operator@font mod}\,\,#1}), so the preceding atom gets NO
             // glue (unlike the opname word's op role).
             if (n.tag == .row and n.data == mod_row_data) break :blk .ord;
+            // \stackrel IS a \mathrel (measured: the thick 5mu of a rel on
+            // both sides), while amsmath's \overset / \underset expand to an
+            // EMPTY \mathrel before the construct — an atom with no class, so
+            // the row itself is ord (measured: `x\overset{a}{b}` carries no
+            // inter-atom glue at all).
+            if (n.tag == .row and n.data == stackrel_row_data) break :blk .rel;
+            // \underbrace / \overbrace are \mathop atoms: no glue before, a
+            // thin space after (measured: `x\underbrace{ab}y` = 3mu).
+            if (n.tag == .row and (n.data == underbrace_row_data or
+                n.data == overbrace_row_data)) break :blk .op;
             break :blk leftRole(ast, ast.child(idx, 0));
         },
         // Operator words are TeX \mathop atoms — role OP — so the inter-atom
@@ -458,6 +582,15 @@ fn rightRole(ast: *const atom.Ast, idx: u32) Role {
         .fraction => .ord,
         .group, .styled, .mathstyle, .row => blk: {
             if (n.num_children == 0) break :blk .ord;
+            // A forced class reports itself on both sides (see leftRole).
+            if (n.tag == .row and atom.isClassRow(n.data)) {
+                break :blk roleOfClass(atom.classRowClass(n.data));
+            }
+            // \stackrel is a \mathrel and \underbrace / \overbrace are
+            // \mathop atoms (see leftRole).
+            if (n.tag == .row and n.data == stackrel_row_data) break :blk .rel;
+            if (n.tag == .row and (n.data == underbrace_row_data or
+                n.data == overbrace_row_data)) break :blk .op;
             break :blk rightRole(ast, ast.child(idx, n.num_children - 1));
         },
         // Operator words are \mathop atoms: OP role (see leftRole).
@@ -1536,6 +1669,316 @@ fn layoutMod(
         depth = @max(depth, b.depth);
     }
     return list.create(.hbox, x, height, depth, list.scratch.items[saved_len..], 0, cstyle, 0, span);
+}
+
+/// Forced-limit geometry for a \mathop carrying `\limits` — amsmath's
+/// \overset / \underset, the kernel's \stackrel, and the `_{...}` / `^{...}`
+/// annotation of \underbrace / \overbrace. Em × 10 at the 10pt base,
+/// measured on the XeTeX+unicode-math reference with Latin Modern Math
+/// (em × 10 so they scale linearly with size_pt; measured in a script:
+/// `\scriptstyle\overset{ab}{y}` reproduces them × 0.7 to 1e-5).
+///
+/// The limits box stacks the script over/under the base with the BASE'S OWN
+/// baseline as the reference point, so the base keeps its ink position
+/// exactly:
+///   over  — the script box's BOTTOM clears the base's TOP by `over_gap`,
+///           whatever the script's size (measured: `\overset{a}{b}` and
+///           `\overset{\frac12}{b}` put the limit's bottom at the same
+///           height; the depth enters only through the script's own box)
+///   under — the script box's TOP sits at least `under_min` below the base's
+///           BASELINE, and at least `under_gap` plus the script's height.
+///           The base's DEPTH does not enter: `\underset{ab}{b}` and
+///           `\underset{ab}{y}` (depth 2.05pt) drop the limit identically.
+const limit_over_gap: f32 = 3.19967;
+const limit_under_min: f32 = 7.19924;
+const limit_under_gap: f32 = 2.86969;
+
+/// Stack a forced limit over/under an already-laid-out `base` box: the limit
+/// goes one step down the style ladder (script from display/text,
+/// scriptscript from script), is centred on max(base, limit), and the base
+/// stays on its own baseline. A limit's style is cramped for a subscript and
+/// inherits the base's for a superscript (tex.web make_scripts).
+fn limitBox(
+    list: *box.BoxList,
+    ast: *const atom.Ast,
+    script_idx: u32,
+    base: u32,
+    fm: *const metrics.FontMetrics,
+    style: Style,
+    size_pt: f32,
+    cstyle: atom.CharStyle,
+    cramped: bool,
+    under: bool,
+    span: atom.Span,
+) !u32 {
+    const gl = metrics.glue(fm);
+    const l_style: Style = switch (style) {
+        .display, .text => .script,
+        .script, .script_script => .script_script,
+    };
+    const l_size = size_pt * (styleScale(gl, l_style) / styleScale(gl, style));
+    const script = try layoutInner(
+        list,
+        ast,
+        script_idx,
+        fm,
+        l_style,
+        l_size,
+        cstyle,
+        if (under) true else cramped,
+    );
+    const bb = list.get(base);
+    const sb = list.get(script);
+    const width = @max(bb.width, sb.width);
+    // Distance from the base's baseline to the script box's nearest edge.
+    const rise: f32 = if (under)
+        @max(s(limit_under_min, size_pt), sb.height + s(limit_under_gap, size_pt))
+    else
+        bb.height + s(limit_over_gap, size_pt);
+    const height = if (under) bb.height else rise + sb.height + sb.depth;
+    const depth = if (under) bb.depth + rise + sb.depth else bb.depth;
+    const saved_len = list.scratch.items.len;
+    defer list.scratch.items.len = saved_len;
+    try list.scratch.append(list.gpa, .{
+        .idx = base,
+        .x_shift = (width - bb.width) / 2,
+        .shift = 0,
+    });
+    try list.scratch.append(list.gpa, .{
+        .idx = script,
+        .x_shift = (width - sb.width) / 2,
+        .shift = if (under) rise else -rise,
+    });
+    return list.create(.vbox, width, height, depth, list.scratch.items[saved_len..], 0, cstyle, 0, span);
+}
+
+/// \overset{top}{base} / \underset{bot}{base} / \stackrel{top}{base} (a row
+/// carrying one of the three markers; children [script, base]): a \mathop
+/// with FORCED limits, so the script is centred over/under the base in EVERY
+/// math style — measured: `\overset{a}{b}` is identical in display and text
+/// style, where a bare `\sum^{a}` would set its script beside. The three
+/// markers differ only in the class the row reports (see leftRole): amsmath's
+/// pair expands to `\mathrel{\nonscript\relax{}}` before the construct, and
+/// that empty \mathrel takes no class, while the kernel's \stackrel IS a
+/// \mathrel (measured: `x\overset{a}{b}` has no inter-atom glue on either
+/// side, `x\stackrel{a}{b}` the thick 5mu of a rel).
+///
+/// One deviation: XeTeX axis-centres a single-character \stackrel base (the
+/// char-nucleus path of make_op), ztex keeps every base on its own baseline —
+/// the same choice layoutOpLimits makes for an operator WORD base (`\lim`).
+/// The reference's own `\overset{ab}{y}` box keeps its base on the baseline.
+fn layoutLimits(
+    list: *box.BoxList,
+    ast: *const atom.Ast,
+    idx: u32,
+    fm: *const metrics.FontMetrics,
+    style: Style,
+    size_pt: f32,
+    cstyle: atom.CharStyle,
+    cramped: bool,
+    under: bool,
+) !u32 {
+    const base = try layoutInner(
+        list,
+        ast,
+        ast.child(idx, 1),
+        fm,
+        style,
+        size_pt,
+        cstyle,
+        cramped,
+    );
+    return limitBox(
+        list,
+        ast,
+        ast.child(idx, 0),
+        base,
+        fm,
+        style,
+        size_pt,
+        cstyle,
+        cramped,
+        under,
+        ast.span(idx),
+    );
+}
+
+/// The band \underbrace / \overbrace occupies beyond the content, em × 10 at
+/// the 10pt base, measured on the XeTeX+unicode-math reference: `\underbrace{ab}`
+/// is 9.72 × 6.94 × 3.64 for a 9.72 × 6.94 × 0.11 content (the band hangs
+/// `underbrace_band` below), `\overbrace{ab}` is 9.72 × 10.27 × 0.11 (the band
+/// stands `overbrace_band` above). Both scale linearly with size_pt.
+const underbrace_band: f32 = 3.53;
+const overbrace_band: f32 = 3.33;
+
+/// \underbrace{x}_{c} / \overbrace{x}^{c} (a row carrying one of the two
+/// markers; children [content] or [content, annotation]): a \mathop — so
+/// class OP, no glue before and a thin space after (measured:
+/// `x\underbrace{ab}` has none, `x\underbrace{ab}y` a 3mu thin space) —
+/// carrying a brace band below (underbrace) or above (overbrace) the content
+/// and an optional forced-limit annotation. TeX assembles the band from the
+/// math font's extensible brace pieces (\downbracefill = \braceld + \braceru +
+/// \bracelu + \bracerd); the XeTeX reference resolves those to Latin Modern
+/// Math's square-brace assembly, whose per-piece ink is not in the bundled
+/// metric tables, so ztex draws the same band from three rules — a spine
+/// across the content width centred in the band and a tip at each end
+/// reaching toward the content.
+fn layoutBrace(
+    list: *box.BoxList,
+    ast: *const atom.Ast,
+    idx: u32,
+    fm: *const metrics.FontMetrics,
+    style: Style,
+    size_pt: f32,
+    cstyle: atom.CharStyle,
+    cramped: bool,
+    under: bool,
+) !u32 {
+    const n = ast.node(idx);
+    const span = ast.span(idx);
+    const gl = metrics.glue(fm);
+    const content = try layoutInner(
+        list,
+        ast,
+        ast.child(idx, 0),
+        fm,
+        style,
+        size_pt,
+        cstyle,
+        cramped,
+    );
+    const cb = list.get(content);
+    const rt = s(gl.rule_thickness, size_pt);
+    const band = s(if (under) underbrace_band else overbrace_band, size_pt);
+    // The band is a square brace: a spine across the content width centred in
+    // the band, plus a tip at each end filling the half that faces the
+    // content. A rule box drawn at `shift` covers [shift − rt, shift] DOWN
+    // from the parent's baseline, so `shift` is minus the rule's lower edge
+    // measured upward (the same convention layoutOverUnder uses).
+    const half = band / 2 + rt / 2;
+    const spine_shift: f32 = if (under) cb.depth + half else -(cb.height + half - rt);
+    const tip_shift: f32 = if (under) cb.depth + half else -cb.height;
+    const saved_len = list.scratch.items.len;
+    defer list.scratch.items.len = saved_len;
+    try list.scratch.append(list.gpa, .{ .idx = content, .x_shift = 0, .shift = 0 });
+    try list.scratch.append(list.gpa, .{
+        .idx = try list.createLeaf(.rule, cb.width, rt, 0, span),
+        .x_shift = 0,
+        .shift = spine_shift,
+    });
+    if (cb.width >= rt) {
+        for ([_]f32{ 0, cb.width - rt }) |x| {
+            try list.scratch.append(list.gpa, .{
+                .idx = try list.createLeaf(.rule, rt, half, 0, span),
+                .x_shift = x,
+                .shift = tip_shift,
+            });
+        }
+    }
+    const height = if (under) cb.height else cb.height + band;
+    const depth = if (under) cb.depth + band else cb.depth;
+    const band_box = try list.create(
+        .hbox,
+        cb.width,
+        height,
+        depth,
+        list.scratch.items[saved_len..],
+        0,
+        cstyle,
+        0,
+        span,
+    );
+    if (n.num_children < 2) return band_box;
+    return limitBox(
+        list,
+        ast,
+        ast.child(idx, 1),
+        band_box,
+        fm,
+        style,
+        size_pt,
+        cstyle,
+        cramped,
+        under,
+        span,
+    );
+}
+
+/// \phantom{x} / \hphantom{x} / \vphantom{x} / \smash{x} (a row carrying
+/// `phantom_row_data | keep`; children [content]): the argument laid out at
+/// the CURRENT math style, then re-boxed with the dimensions the keep mask
+/// selects and NO children — latex.ltx's \finph@nt returns an empty box whose
+/// ht/dp/wd were copied off the argument box, so nothing is drawn and the
+/// content's style never changes (measured: `x^{a\phantom{b^2}}` keeps
+/// b^2's script-size height). A `.strut` box is metrics-only by construction
+/// (draw.flatten draws nothing for it), which is exactly \phantom's contract.
+fn layoutPhantom(
+    list: *box.BoxList,
+    ast: *const atom.Ast,
+    idx: u32,
+    fm: *const metrics.FontMetrics,
+    style: Style,
+    size_pt: f32,
+    cstyle: atom.CharStyle,
+    cramped: bool,
+) !u32 {
+    const n = ast.node(idx);
+    const content = try layoutInner(
+        list,
+        ast,
+        ast.child(idx, 0),
+        fm,
+        style,
+        size_pt,
+        cstyle,
+        cramped,
+    );
+    const cb = list.get(content);
+    const keep_w = n.data & keep_width != 0;
+    const keep_h = n.data & keep_height != 0;
+    const keep_d = n.data & keep_depth != 0;
+    return list.createLeaf(
+        .strut,
+        if (keep_w) cb.width else 0,
+        if (keep_h) cb.height else 0,
+        if (keep_d) cb.depth else 0,
+        ast.span(idx),
+    );
+}
+
+/// \hspace{<dim>} / \kern<dim> / \mkern<dim> / `\: / \mkern's constant
+/// siblings (a row carrying `kern_row_data | unit` whose single `.space` child
+/// holds the magnitude): an invisible skip whose unit decides the scaling.
+///
+///   pt  absolute — TeX dimensions never scale with the font size, and
+///       \genfrac's rule thickness follows the same rule here
+///   em  the current em, so it follows the style ladder (a \hspace{1em} in a
+///       script is 0.7 of its width in text style)
+///   ex  the current x-height, same scaling
+///   mu  1/18 em of the ladder-NEUTRAL em — `size_pt / styleScale(style)` is
+///       the size the construct would have in text style, so a mu kern is
+///       style-INVARIANT: identical in display and text style, and unchanged
+///       by a \scriptstyle/\displaystyle switch inside it. This is ztex's mu
+///       convention, the one \pmod's leading 8mu, \mod's 12mu and \bmod's
+///       5mu kerns already follow.
+fn layoutKern(
+    list: *box.BoxList,
+    ast: *const atom.Ast,
+    idx: u32,
+    fm: *const metrics.FontMetrics,
+    style: Style,
+    size_pt: f32,
+) !u32 {
+    const n = ast.node(idx);
+    const value = atom.fixedToEm(ast.node(ast.child(idx, 0)).data);
+    const gl = metrics.glue(fm);
+    const width: f32 = switch (n.data & dim_unit_mask) {
+        dim_em => value * size_pt,
+        dim_ex => value * s(gl.x_height, size_pt),
+        dim_mu => (value / 18.0) * (size_pt / styleScale(gl, style)),
+        else => value,
+    };
+    return list.createLeaf(.glue, width, 0, 0, ast.span(idx));
 }
 
 /// The italic correction (in em of the glyph's font-size) that
@@ -3378,6 +3821,22 @@ fn bigOpCodepoint(op: atom.BigOp) u21 {
         .oiint => 0x222F, // ∯
         .oiiint => 0x2230, // ∰
         .ointctrclockwise => 0x222E, // ∮ (contourintegral)
+        // the \bigXXX n-ary family + \bigstar (amsmath's \slimits@ group;
+        // KaTeX classes the same glyphs as `op`)
+        .bigodot => 0x2A00, // ⨀
+        .bigoplus => 0x2A01, // ⨁
+        .bigotimes => 0x2A02, // ⨂
+        .biguplus => 0x2A04, // ⨄
+        .bigsqcap => 0x2A05, // ⨅
+        .bigwedge => 0x22C0, // ⋀
+        .bigvee => 0x22C1, // ⋁
+        .bigstar => 0x22C6, // ⋆
+        // The BIG integrals: no single big-integral codepoint exists in
+        // Unicode, so they draw the ordinary integral signs scaled up (see
+        // bigOpScale).
+        .bigint => 0x222B, // ∫
+        .bigiint => 0x222F, // ∯
+        .bigiiint => 0x2230, // ⰰ
     };
 }
 
@@ -3396,6 +3855,18 @@ fn bigOpByCp(cp: u21) ?atom.BigOp {
         0x222F => .oiint,
         0x2230 => .oiiint,
         0x2A11 => .ointctrclockwise,
+        0x2A00 => .bigodot,
+        0x2A01 => .bigoplus,
+        0x2A02 => .bigotimes,
+        0x2A04 => .biguplus,
+        0x2A05 => .bigsqcap,
+        0x22C0 => .bigwedge,
+        0x22C1 => .bigvee,
+        0x22C6 => .bigstar,
+        // The big integrals are NOT listed: they share \int / \oiint /
+        // \oiiint's codepoints (only the drawn size differs), so the map
+        // from codepoint to operator is not injective and the plain integral
+        // is the canonical answer.
         else => null,
     };
 }
@@ -3404,11 +3875,34 @@ fn bigOpByCp(cp: u21) ?atom.BigOp {
 /// fontmath.ltx defines the integral family as \intop\nolimits, so \int and
 /// \oint keep their scripts beside as script-size sub/superscripts even in
 /// display style; only \sum \prod \coprod \bigcup \bigcap \bigsqcup stack
-/// limits over/under.
+/// limits over/under. The \bigXXX family stacks too: amsmath redeclares
+/// \bigwedge \bigvee \biguplus \bigcap \bigcup \bigotimes \bigoplus \bigodot
+/// \bigsqcup with `\DOTSB…\slimits@`, i.e. display limits. The big integrals
+/// are the integral family (beside), and \bigstar is a star OPERATOR, so its
+/// scripts stay beside as well.
 fn bigOpLimits(op: atom.BigOp) bool {
     return switch (op) {
         .sum, .prod, .coprod, .bigcup, .bigcap, .bigsqcup => true,
+        .bigodot, .bigoplus, .bigotimes, .biguplus, .bigsqcap, .bigwedge, .bigvee => true,
         .int, .oint, .oiint, .oiiint, .ointctrclockwise => false,
+        .bigstar, .bigint, .bigiint, .bigiiint => false,
+    };
+}
+
+/// The factor between the current math size and the size a big operator is
+/// DRAWN at. Every operator draws at 1× — its box is the base or the display
+/// variant ink of the glyph itself (see layoutOp) — EXCEPT the big
+/// integrals, which Unicode has no codepoint for: \bigint \bigiint \bigiiint
+/// draw the ordinary integral signs, linearly scaled (the CTAN `bigints`
+/// package, v1.0 2010/02/15, defines `\bigint` as
+/// `\mathop{\text{\Huge$\int$}}\nolimits`: a \mathop over an inline
+/// integral set at \Huge, and \Huge is 24.88pt against the 10pt base —
+/// 2.488× — in every LaTeX size table). The box follows the same factor via
+/// the scaled metrics.bigOpInk rows, so the drawn glyph and its box agree.
+fn bigOpScale(op: atom.BigOp) f32 {
+    return switch (op) {
+        .bigint, .bigiint, .bigiiint => 2.488,
+        else => 1.0,
     };
 }
 
@@ -3475,7 +3969,13 @@ fn layoutOp(
     // every size — that workaround is obsolete: the box now carries the
     // big-op form (`.variant` for display), svg.zig emits it as data-op,
     // and the rasterizer resolves .v1 only for marked display ops.
-    const glyph_size = size_pt;
+    // The BIG integrals are the one exception: Unicode has no big-integral
+    // codepoint, so they draw the ordinary integral sign scaled by
+    // bigOpScale (2.488 — the `bigints` package's \Huge), and their
+    // metrics.bigOpInk rows carry the same factor, so the box still bounds
+    // exactly what is drawn. Every other operator keeps a scale of 1, so
+    // their geometry is byte-identical to before.
+    const glyph_size = size_pt * bigOpScale(op);
     const box_idx = try list.create(
         .char,
         box_w,
@@ -4973,4 +5473,574 @@ test "layout: pod omits the mod word and keeps the 8mu kern in text style" {
     const rb = list.get(b);
     const expect_w = 10.0 * 8.0 / 18.0 + 0.389 * 10 + 0.6 * 10 + 0.389 * 10;
     try testing.expectApproxEqAbs(expect_w, rb.width, 0.01);
+}
+
+/// Lay out a hand-built char leaf for `cp` (an explicit codepoint, as the
+/// parser emits for a synthesized glyph) at `style` / `size_pt`, and return
+/// the box index so a test can compare a construct against its own parts.
+fn charBox(
+    list: *box.BoxList,
+    a: *atom.Ast,
+    cp: u21,
+    style: Style,
+    size_pt: f32,
+) !u32 {
+    const leaf = try a.createLeaf(.char, 0, 1, cp);
+    return layout(list, a, leaf, &fm_default, style, size_pt, .italic);
+}
+
+/// A `\script`-style size at the 10pt base (gl.scriptfactor).
+const script_size: f32 = 7.0;
+
+test "layout: \\overset / \\underset stack a forced limit on the base" {
+    // \mathop{base}\limits^{script}: the script is set one ladder step down
+    // and centred on max(base, script), and it stays over/under the base in
+    // EVERY style (the \limits is forced) — measured on XeTeX.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    var a = atom.Ast.init(testing.allocator, "overset");
+    defer a.deinit();
+    try a.pushToken(.{ .tag = .char, .start = 0, .end = 6 });
+
+    const base_only = try charBox(&list, &a, 0x1D465, .text, 10); // x
+    const bb = list.get(base_only);
+    const script_only = try charBox(&list, &a, 0x1D466, .script, script_size); // y
+    const sb = list.get(script_only);
+
+    for ([_]struct { data: u32, under: bool }{
+        .{ .data = overset_row_data, .under = false },
+        .{ .data = underset_row_data, .under = true },
+    }) |c| {
+        const script = try a.createLeaf(.char, 0, 1, 0x1D466);
+        const base = try a.createLeaf(.char, 0, 1, 0x1D465);
+        const row = try a.createNode(.row, 0, 1, &.{ a.node(script), a.node(base) }, c.data);
+        // Display and text style must agree: the limits are forced.
+        for ([_]Style{ .display, .text }) |st| {
+            const b = try layout(&list, &a, row, &fm_default, st, 10, .italic);
+            const rb = list.get(b);
+            try testing.expectEqual(.vbox, rb.kind);
+            try testing.expectApproxEqAbs(@max(bb.width, sb.width), rb.width, 0.001);
+            const rise = if (c.under)
+                @max(limit_under_min, sb.height + limit_under_gap)
+            else
+                bb.height + limit_over_gap;
+            const want_h = if (c.under) bb.height else rise + sb.height + sb.depth;
+            const want_d = if (c.under) bb.depth + rise + sb.depth else bb.depth;
+            try testing.expectApproxEqAbs(want_h, rb.height, 0.001);
+            try testing.expectApproxEqAbs(want_d, rb.depth, 0.001);
+            // The base keeps the construct's baseline; the limit is shifted
+            // by exactly `rise` (negative = up).
+            const ch = list.children(b);
+            try testing.expectEqual(@as(u16, 2), rb.num_children);
+            try testing.expectApproxEqAbs(@as(f32, 0), ch[0].shift, 0.001);
+            try testing.expectApproxEqAbs(if (c.under) rise else -rise, ch[1].shift, 0.001);
+        }
+    }
+}
+
+test "layout: \\stackrel is a relation, \\overset takes no inter-atom class" {
+    // The kernel's \stackrel IS a \mathrel (thick 5mu on both sides); amsmath's
+    // \overset expands to an EMPTY \mathrel before the construct, which takes
+    // no class, so its neighbours add no glue. Measured on XeTeX:
+    // `x\stackrel{a}{b}` = x + 5mu + construct + 5mu + y, `x\overset{a}{b}y` =
+    // x + construct + y.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    var a = atom.Ast.init(testing.allocator, "stackrel");
+    defer a.deinit();
+    try a.pushToken(.{ .tag = .char, .start = 0, .end = 8 });
+    const thick = 5.0 * 10.0 / 18.0; // glue_em[3] at 10pt
+    for ([_]struct { data: u32, want_glue: f32 }{
+        .{ .data = stackrel_row_data, .want_glue = 2 * thick },
+        .{ .data = overset_row_data, .want_glue = 0 },
+        .{ .data = underset_row_data, .want_glue = 0 },
+    }) |c| {
+        const script = try a.createLeaf(.char, 0, 1, 0x1D466);
+        const base = try a.createLeaf(.char, 0, 1, 0x1D465);
+        const limits = try a.createNode(.row, 0, 1, &.{ a.node(script), a.node(base) }, c.data);
+        const x1 = try a.createLeaf(.char, 0, 1, 0x1D465);
+        const x2 = try a.createLeaf(.char, 0, 1, 0x1D465);
+        const kids = [_]atom.Node{ a.node(x1), a.node(limits), a.node(x2) };
+        const row = try a.createNode(.row, 0, 1, &kids, 0);
+        const b = try layout(&list, &a, row, &fm_default, .text, 10, .italic);
+        // The construct's own box (laid out standalone; the row boxes it
+        // identically) plus the two neighbours and the class's glue.
+        const construct = list.get(try layout(&list, &a, limits, &fm_default, .text, 10, .italic));
+        const xb = list.get(try charBox(&list, &a, 0x1D465, .text, 10));
+        const want = 2 * xb.width + construct.width + c.want_glue;
+        try testing.expectApproxEqAbs(want, list.get(b).width, 0.01);
+    }
+}
+
+test "layout: the four phantoms keep exactly the dimensions amsmath defines" {
+    // \phantom reserves the whole box, \hphantom (and \smash, which zeroes ht
+    // and dp and keeps the advance) only the width, \vphantom only the height
+    // and depth. Each is an invisible box — a .strut draws nothing.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    var a = atom.Ast.init(testing.allocator, "phantom");
+    defer a.deinit();
+    try a.pushToken(.{ .tag = .char, .start = 0, .end = 7 });
+
+    const content_box = try charBox(&list, &a, 0x1D45E, .text, 10); // q
+    const cb = list.get(content_box);
+    // The phantom must be able to CLEAR both axes: q has a real descender and
+    // a height above the x-height.
+    try testing.expect(cb.height > 0 and cb.depth > 0 and cb.width > 0);
+
+    // \\phantom keeps all three, \\hphantom / \\smash the width only,
+    // \\vphantom the height and depth; \\smash[t] drops the height and
+    // \\smash[b] the depth.
+    const full = phantom_row_data | keep_width | keep_height | keep_depth;
+    const cases = [_]struct { data: u32, w: f32, h: f32, d: f32 }{
+        .{ .data = full, .w = cb.width, .h = cb.height, .d = cb.depth },
+        .{ .data = phantom_row_data | keep_width, .w = cb.width, .h = 0, .d = 0 },
+        .{ .data = phantom_row_data | keep_height | keep_depth, .w = 0, .h = cb.height, .d = cb.depth },
+        .{ .data = phantom_row_data | keep_width | keep_depth, .w = cb.width, .h = 0, .d = cb.depth },
+        .{ .data = phantom_row_data | keep_width | keep_height, .w = cb.width, .h = cb.height, .d = 0 },
+    };
+    for (cases) |c| {
+        const content = try a.createLeaf(.char, 0, 1, 0x1D45E);
+        const row = try a.createNode(.row, 0, 1, &.{a.node(content)}, c.data);
+        const b = try layout(&list, &a, row, &fm_default, .text, 10, .italic);
+        const rb = list.get(b);
+        try testing.expectEqual(.strut, rb.kind);
+        try testing.expectEqual(@as(u16, 0), rb.num_children);
+        try testing.expectApproxEqAbs(c.w, rb.width, 0.0001);
+        try testing.expectApproxEqAbs(c.h, rb.height, 0.0001);
+        try testing.expectApproxEqAbs(c.d, rb.depth, 0.0001);
+    }
+}
+
+test "layout: \\underbrace / \\overbrace hang a brace band and take an annotation" {
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    var a = atom.Ast.init(testing.allocator, "underbrace");
+    defer a.deinit();
+    try a.pushToken(.{ .tag = .char, .start = 0, .end = 10 });
+
+    const content_box = try charBox(&list, &a, 0x1D465, .text, 10); // x
+    const cb = list.get(content_box);
+    const rt = metrics.glue(&fm_default).rule_thickness;
+
+    for ([_]struct { data: u32, under: bool }{
+        .{ .data = underbrace_row_data, .under = true },
+        .{ .data = overbrace_row_data, .under = false },
+    }) |c| {
+        const content = try a.createLeaf(.char, 0, 1, 0x1D465);
+        const row = try a.createNode(.row, 0, 1, &.{a.node(content)}, c.data);
+        const b = try layout(&list, &a, row, &fm_default, .text, 10, .italic);
+        const rb = list.get(b);
+        const band = if (c.under) underbrace_band else overbrace_band;
+        // The content keeps the construct's width and baseline; the band is
+        // added below (underbrace) or above (overbrace).
+        try testing.expectApproxEqAbs(cb.width, rb.width, 0.0001);
+        const want_h = if (c.under) cb.height else cb.height + band;
+        const want_d = if (c.under) cb.depth + band else cb.depth;
+        try testing.expectApproxEqAbs(want_h, rb.height, 0.0001);
+        try testing.expectApproxEqAbs(want_d, rb.depth, 0.0001);
+        // The band is drawn: the content plus a full-width spine and the two
+        // end tips (skipped for content narrower than the rule).
+        const n_rules = countRules(&list, b);
+        try testing.expectEqual(if (cb.width >= rt) @as(usize, 3) else 1, n_rules);
+    }
+}
+
+/// The number of `.rule` boxes directly under `root`.
+fn countRules(list: *box.BoxList, root: u32) usize {
+    var n: usize = 0;
+    for (list.children(root)) |cr| {
+        if (list.get(cr.idx).kind == .rule) n += 1;
+    }
+    return n;
+}
+
+test "layout: \\underbrace_{n} drops the annotation below the brace" {
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    var a = atom.Ast.init(testing.allocator, "underbrace");
+    defer a.deinit();
+    try a.pushToken(.{ .tag = .char, .start = 0, .end = 10 });
+
+    const content = try a.createLeaf(.char, 0, 1, 0x1D465);
+    const ann = try a.createLeaf(.char, 0, 1, 0x1D45B); // n
+    const row = try a.createNode(
+        .row,
+        0,
+        1,
+        &.{ a.node(content), a.node(ann) },
+        underbrace_row_data,
+    );
+    const b = try layout(&list, &a, row, &fm_default, .text, 10, .italic);
+    const rb = list.get(b);
+
+    const cb = list.get(try charBox(&list, &a, 0x1D465, .text, 10));
+    const ab = list.get(try charBox(&list, &a, 0x1D45B, .script, script_size));
+    // The annotation is the band box's forced limit: it clears the brace
+    // band's bottom by the under-limit rule.
+    const band_depth = cb.depth + underbrace_band;
+    const rise = @max(limit_under_min, ab.height + limit_under_gap);
+    try testing.expectEqual(.vbox, rb.kind);
+    try testing.expectApproxEqAbs(cb.height, rb.height, 0.0001);
+    try testing.expectApproxEqAbs(band_depth + rise + ab.depth, rb.depth, 0.0001);
+    try testing.expectApproxEqAbs(@max(cb.width, ab.width), rb.width, 0.0001);
+    try testing.expectApproxEqAbs(rise, list.children(b)[1].shift, 0.0001);
+}
+
+test "layout: mu spacing is style-invariant while em spacing follows the style" {
+    // \mkern4mu reserves 4/18 em of the ladder-NEUTRAL em: the same width in
+    // display, text AND script style (a mu skip does not shrink with the
+    // script ladder). \hspace{1em} is the CURRENT em, so it follows the
+    // ladder; \hspace{2pt} is absolute and never scales.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    var a = atom.Ast.init(testing.allocator, "kern");
+    defer a.deinit();
+    try a.pushToken(.{ .tag = .char, .start = 0, .end = 4 });
+    const mu = 4.0 * 10.0 / 18.0;
+    for ([_]struct { unit: u32, value: f32 }{
+        .{ .unit = dim_mu, .value = 4 },
+        .{ .unit = dim_em, .value = 1 },
+        .{ .unit = dim_pt, .value = 2 },
+    }) |c| {
+        const leaf = try a.createLeaf(.space, 0, 1, atom.emToFixed(c.value));
+        const row = try a.createNode(.row, 0, 1, &.{a.node(leaf)}, kern_row_data | c.unit);
+        for ([_]struct { style: Style, size_pt: f32 }{
+            .{ .style = .display, .size_pt = 10 },
+            .{ .style = .text, .size_pt = 10 },
+            .{ .style = .script, .size_pt = script_size },
+        }) |st| {
+            const b = try layout(&list, &a, row, &fm_default, st.style, st.size_pt, .italic);
+            const k = list.get(b);
+            try testing.expectEqual(.glue, k.kind);
+            const want: f32 = switch (c.unit) {
+                dim_mu => mu,
+                dim_em => c.value * st.size_pt,
+                else => c.value,
+            };
+            try testing.expectApproxEqAbs(want, k.width, 0.0001);
+        }
+    }
+}
+
+test "layout: the constant spaces keep their em widths" {
+    // Regression guard: \, \; \! \quad \qquad and the interword space \  are
+    // plain em-fraction space leaves (style-dependent through size_pt), and
+    // `\:` is the mu skip above — none of them changed.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    var a = atom.Ast.init(testing.allocator, " ");
+    defer a.deinit();
+    try a.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
+    const em_widths = [_]f32{ 0.166, 0.277, -0.166, 1.0, 2.0, 1.0 / 3.0 };
+    for (em_widths) |em| {
+        const leaf = try a.createLeaf(.space, 0, 1, atom.emToFixed(em));
+        const text_b = try layout(&list, &a, leaf, &fm_default, .text, 10, .italic);
+        try testing.expectApproxEqAbs(em * 10, list.get(text_b).width, 0.0001);
+        // A space leaf scales with the style's size, unlike a mu skip.
+        const script_b = try layout(&list, &a, leaf, &fm_default, .script, script_size, .italic);
+        try testing.expectApproxEqAbs(em * script_size, list.get(script_b).width, 0.0001);
+    }
+}
+
+/// A one-child row carrying a forced class around the glyph `cp` — the shape
+/// the parser builds for `\mathord`…`\mathinner` and `\colon` — or the bare
+/// char leaf when `cls` is null (a typed glyph, whose class layout derives
+/// from the codepoint).
+fn classProbeMid(a: *atom.Ast, cp: u21, cls: ?atom.MathClass) !atom.Node {
+    const leaf = try a.createLeaf(.char, 0, 1, cp);
+    if (cls) |c| {
+        return a.node(try a.createNode(.row, 0, 1, &.{a.node(leaf)}, atom.classRowData(c)));
+    }
+    return a.node(leaf);
+}
+
+/// Lay out `x <mid> y` at 10pt text style, where the middle atom is either
+/// the bare glyph `cp` or that same glyph wrapped in a forced class — the two
+/// shapes `\mathrel{...}` and a bare relation produce. The neighbours are
+/// math-italic 𝑥/𝑦, whose italic corrections are 0 in the IC table, so the
+/// row's width differs by the GLUE alone.
+fn classProbeRow(
+    list: *box.BoxList,
+    a: *atom.Ast,
+    cp: u21,
+    cls: ?atom.MathClass,
+) !f32 {
+    const x = try a.createLeaf(.char, 0, 1, 0x1D465);
+    const y = try a.createLeaf(.char, 0, 1, 0x1D466);
+    const kids = [_]atom.Node{ a.node(x), try classProbeMid(a, cp, cls), a.node(y) };
+    const row = try a.createNode(.row, 0, 1, &kids, 0);
+    return list.get(try layout(list, a, row, &fm_default, .text, 10, .italic)).width;
+}
+
+/// The same probe as `classProbeRow`, but as the NUMERATOR of a ruled
+/// fraction over a 𝑘: the class must reach the glue wherever the wrapper sits.
+fn fracProbeWidth(
+    list: *box.BoxList,
+    a: *atom.Ast,
+    cp: u21,
+    cls: ?atom.MathClass,
+) !f32 {
+    const x = try a.createLeaf(.char, 0, 1, 0x1D465);
+    const y = try a.createLeaf(.char, 0, 1, 0x1D466);
+    const num = try a.createNode(
+        .row,
+        0,
+        1,
+        &.{ a.node(x), try classProbeMid(a, cp, cls), a.node(y) },
+        0,
+    );
+    const den = try a.createLeaf(.char, 0, 1, 0x1D4F7);
+    const frac = try a.createNode(
+        .fraction,
+        0,
+        1,
+        &.{ a.node(num), a.node(den) },
+        atom.fracData(true, null, false),
+    );
+    // DISPLAY style, so the numerator is set at TEXT style: the thick
+    // relation spaces are suppressed in the script styles (the glue table's
+    // script column is 0 for med/thick), and this probe is about the CLASS.
+    return list.get(try layout(list, a, frac, &fm_default, .display, 10, .italic)).width;
+}
+
+/// The 10pt text-style glue of one class pair, from the TeX table
+/// (tex.web §799): thin 3/18, med 4/18, thick 5/18 em of the current size.
+fn glueAt(units: u8) f32 {
+    return glue_em[units] * 10.0 / 18.0;
+}
+
+test "layout: a forced class replaces the atom's own class on both sides" {
+    // TeX's \mathXXX must reach the GLUE, not just the tree. A forced rel
+    // around a glyph that is itself a bin takes the relation's thick 5/18 em
+    // on BOTH sides; a forced ord around the same bin takes none; a forced
+    // bin around a glyph that is itself a rel drops the thick to med. Every
+    // wrapper is the parser's shape: a `.row` of one child whose `data` is
+    // atom.classRowData(cls).
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    var a = atom.Ast.init(testing.allocator, "x-y");
+    defer a.deinit();
+    try a.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
+    const eq = 0x3D; // `=` — a relation
+    const minus = 0x2212; // the glyph a `-` draws — a bin
+    const thick = glueAt(3);
+    const med = glueAt(2);
+    const thin = glueAt(1);
+
+    // `=` is already a relation: forcing rel reproduces the bare row exactly,
+    // and forcing another class moves both sides away from thick.
+    const bare_eq = try classProbeRow(&list, &a, eq, null);
+    try testing.expectApproxEqAbs(bare_eq, try classProbeRow(&list, &a, eq, .rel), 0.0001);
+    try testing.expectApproxEqAbs(bare_eq - 2 * thick, try classProbeRow(&list, &a, eq, .ord), 0.01);
+    try testing.expectApproxEqAbs(
+        bare_eq - 2 * (thick - med),
+        try classProbeRow(&list, &a, eq, .bin),
+        0.01,
+    );
+    // open/close take nothing against an ord neighbour; punct takes nothing
+    // BEFORE it and a thin space after (ord→punct is 0, punct→ord is thin).
+    try testing.expectApproxEqAbs(bare_eq - 2 * thick, try classProbeRow(&list, &a, eq, .open), 0.01);
+    try testing.expectApproxEqAbs(bare_eq - 2 * thick, try classProbeRow(&list, &a, eq, .close), 0.01);
+    try testing.expectApproxEqAbs(
+        bare_eq - 2 * thick + thin,
+        try classProbeRow(&list, &a, eq, .punct),
+        0.01,
+    );
+    // inner takes a thin space on both sides.
+    try testing.expectApproxEqAbs(
+        bare_eq - 2 * (thick - thin),
+        try classProbeRow(&list, &a, eq, .inner),
+        0.01,
+    );
+
+    // `-` is a bin: forcing bin reproduces the bare row, forcing ord removes
+    // the med spaces, and forcing rel promotes them to thick.
+    const bare_minus = try classProbeRow(&list, &a, minus, null);
+    try testing.expectApproxEqAbs(bare_minus, try classProbeRow(&list, &a, minus, .bin), 0.0001);
+    try testing.expectApproxEqAbs(bare_minus - 2 * med, try classProbeRow(&list, &a, minus, .ord), 0.01);
+    try testing.expectApproxEqAbs(
+        bare_minus + 2 * (thick - med),
+        try classProbeRow(&list, &a, minus, .rel),
+        0.01,
+    );
+}
+
+test "layout: a forced class still spaces inside a fraction" {
+    // The override is a property of the ATOM, not of the row it happens to
+    // sit in: the same two thick spaces appear when the wrapped relation is
+    // the numerator of a fraction, so the whole fraction is 2·(5/18)em wider
+    // than one built from the bare relation.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    var a = atom.Ast.init(testing.allocator, "x=y");
+    defer a.deinit();
+    try a.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
+    const rel_frac = try fracProbeWidth(&list, &a, 0x3D, null);
+    const ord_frac = try fracProbeWidth(&list, &a, 0x3D, .ord);
+    try testing.expectApproxEqAbs(2 * glueAt(3), rel_frac - ord_frac, 0.01);
+}
+
+test "layout: \\colon spaces as punctuation, a bare : as a relation" {
+    // Plain TeX's `\def\colon{\mathpunct{:}}`: the glyph is the same colon, so
+    // the two rows differ ONLY in glue — `x: y` takes thick on both sides of
+    // the relation, `x\colon y` takes none before and a thin space after.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    var a = atom.Ast.init(testing.allocator, "x:y");
+    defer a.deinit();
+    try a.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
+    const colon = 0x3A;
+    const glyphs = list.get(try charBox(&list, &a, 0x1D465, .text, 10)).width +
+        list.get(try charBox(&list, &a, 0x1D466, .text, 10)).width +
+        list.get(try charBox(&list, &a, colon, .text, 10)).width;
+    const rel_row = try classProbeRow(&list, &a, colon, null);
+    const punct_row = try classProbeRow(&list, &a, colon, .punct);
+    try testing.expectApproxEqAbs(glyphs + 2 * glueAt(3), rel_row, 0.01);
+    try testing.expectApproxEqAbs(glyphs + glueAt(1), punct_row, 0.01);
+    // and the difference is exactly the class change: two thick → one thin.
+    try testing.expectApproxEqAbs(2 * glueAt(3) - glueAt(1), rel_row - punct_row, 0.01);
+}
+
+test "layout: \\mathop is a roman op atom whose scripts stay beside" {
+    // The `.opname` model TeX's \mathop produces: the field is laid out in
+    // upright roman (its box carries the roman style) and the atom takes the
+    // OP class, so `x\mathop f y` gets the op↔ord thin space on both sides —
+    // exactly what `\sin x` gets. `data` 0 means no limits: even in display
+    // style a subscript stays beside instead of stacking.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    var a = atom.Ast.init(testing.allocator, "mathop");
+    defer a.deinit();
+    try a.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
+    const f = try a.createLeaf(.char, 0, 1, 0x66);
+    const opn = try a.createNode(.opname, 0, 1, &.{a.node(f)}, 0);
+    const op_box = try layout(&list, &a, opn, &fm_default, .text, 10, .italic);
+    try testing.expectEqual(.char, list.get(op_box).kind);
+    try testing.expectEqual(.roman, list.charData(op_box).style);
+
+    const x = try a.createLeaf(.char, 0, 1, 0x1D465);
+    const y = try a.createLeaf(.char, 0, 1, 0x1D466);
+    const row = try a.createNode(.row, 0, 1, &.{ a.node(x), a.node(opn), a.node(y) }, 0);
+    const row_b = try layout(&list, &a, row, &fm_default, .text, 10, .italic);
+    const glyphs = list.get(try charBox(&list, &a, 0x1D465, .text, 10)).width +
+        list.get(try charBox(&list, &a, 0x1D466, .text, 10)).width +
+        list.get(op_box).width;
+    try testing.expectApproxEqAbs(glyphs + 2 * glueAt(1), list.get(row_b).width, 0.01);
+
+    // \limits is not implied: a subscript in DISPLAY style stays beside.
+    const sub = try a.createLeaf(.char, 0, 1, 0x1D462);
+    const scripted = try a.createNode(
+        .script,
+        0,
+        1,
+        &.{ a.node(opn), a.node(sub) },
+        atom.ScriptBits.sub,
+    );
+    const sb = try layout(&list, &a, scripted, &fm_default, .display, 10, .italic);
+    try testing.expectEqual(.script, list.get(sb).kind);
+}
+
+test "layout: the big operators box by their measured font ink" {
+    // Every new big operator boxes itself by the ink of the glyph it draws:
+    // the base form in the smaller styles, the .v1 display variant in display.
+    // The drawn FONT SIZE is the current size for all of them EXCEPT the big
+    // integrals, which draw the plain integral sign scaled by 2.488 (the
+    // `bigints` package's \Huge) — the box above follows the same factor.
+    const cases = [_]struct { op: atom.BigOp, cp: u21, draw_scale: f32 }{
+        .{ .op = .bigodot, .cp = 0x2A00, .draw_scale = 1.0 },
+        .{ .op = .bigoplus, .cp = 0x2A01, .draw_scale = 1.0 },
+        .{ .op = .bigotimes, .cp = 0x2A02, .draw_scale = 1.0 },
+        .{ .op = .biguplus, .cp = 0x2A04, .draw_scale = 1.0 },
+        .{ .op = .bigsqcap, .cp = 0x2A05, .draw_scale = 1.0 },
+        .{ .op = .bigwedge, .cp = 0x22C0, .draw_scale = 1.0 },
+        .{ .op = .bigvee, .cp = 0x22C1, .draw_scale = 1.0 },
+        .{ .op = .bigstar, .cp = 0x22C6, .draw_scale = 1.0 },
+        .{ .op = .bigint, .cp = 0x222B, .draw_scale = 2.488 },
+        .{ .op = .bigiint, .cp = 0x222F, .draw_scale = 2.488 },
+        .{ .op = .bigiiint, .cp = 0x2230, .draw_scale = 2.488 },
+    };
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    var a = atom.Ast.init(testing.allocator, "bigop");
+    defer a.deinit();
+    try a.pushToken(.{ .tag = .char, .start = 0, .end = 5 });
+    for (cases) |c| {
+        const leaf = try a.createLeaf(.op, 0, 1, @intFromEnum(c.op));
+        for ([_]struct { style: Style, display: bool }{
+            .{ .style = .text, .display = false },
+            .{ .style = .display, .display = true },
+        }) |st| {
+            const b = try layout(&list, &a, leaf, &fm_default, st.style, 10, .italic);
+            const ink = metrics.bigOpInk(c.op, st.display);
+            const bx = list.get(b);
+            try testing.expectEqual(.char, bx.kind);
+            try testing.expectApproxEqAbs(ink.advance * 10, bx.width, 0.001);
+            try testing.expectApproxEqAbs(ink.asc * 10, bx.height, 0.001);
+            try testing.expectApproxEqAbs(ink.desc * 10, bx.depth, 0.001);
+            const cd = list.charData(b);
+            try testing.expectEqual(c.cp, cd.cp);
+            try testing.expectApproxEqAbs(10 * c.draw_scale, cd.size, 0.001);
+        }
+    }
+}
+
+test "layout: the plain operators still draw at the current size" {
+    // Regression guard: the drawn-size factor belongs to the big integrals
+    // alone — every operator that already worked keeps size_pt, so no
+    // existing formula's geometry moves.
+    const cases = [_]struct { op: atom.BigOp }{
+        .{ .op = .sum },      .{ .op = .int },              .{ .op = .prod },
+        .{ .op = .coprod },   .{ .op = .bigcup },           .{ .op = .bigcap },
+        .{ .op = .bigsqcup }, .{ .op = .oint },             .{ .op = .oiint },
+        .{ .op = .oiiint },   .{ .op = .ointctrclockwise },
+    };
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    var a = atom.Ast.init(testing.allocator, "op");
+    defer a.deinit();
+    try a.pushToken(.{ .tag = .char, .start = 0, .end = 2 });
+    for (cases) |c| {
+        const leaf = try a.createLeaf(.op, 0, 1, @intFromEnum(c.op));
+        const b = try layout(&list, &a, leaf, &fm_default, .display, 10, .italic);
+        try testing.expectApproxEqAbs(10, list.charData(b).size, 0.0001);
+    }
+}
+
+test "layout: \\dbinom takes the amsmath display fence, \\tbinom the small one" {
+    // Both are the same amsmath-delimited fraction; only the FORCED style
+    // differs, and it governs the fence: display covers the standard fraction
+    // box (parenleft.v6, 2.392em ink) while the smaller styles draw the base
+    // paren (1.094em). The paren BOX is the variant's ink, so its height +
+    // depth measures which rung was picked.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    var a = atom.Ast.init(testing.allocator, "dbinom");
+    defer a.deinit();
+    try a.pushToken(.{ .tag = .char, .start = 0, .end = 6 });
+    for ([_]struct { forced: atom.MathStyle, ink_em: f32 }{
+        .{ .forced = .display, .ink_em = 2.392 },
+        .{ .forced = .text, .ink_em = 1.094 },
+    }) |c| {
+        const open = try a.createLeaf(.char, 0, 1, 0x28);
+        const n = try a.createLeaf(.char, 0, 1, 0x1D45B);
+        const k = try a.createLeaf(.char, 0, 1, 0x1D4F7);
+        const data = atom.fracData(false, c.forced, false) | atom.FractionBits.fixed_delim;
+        const frac = try a.createNode(.fraction, 0, 1, &.{ a.node(n), a.node(k) }, data);
+        const close = try a.createLeaf(.char, 0, 1, 0x29);
+        const left = try a.createNode(
+            .left,
+            0,
+            1,
+            &.{ a.node(open), a.node(frac), a.node(close) },
+            0,
+        );
+        // Laid out in DISPLAY style either way: the forced style argument, not
+        // the ambient one, picks the fence.
+        const b = try layout(&list, &a, left, &fm_default, .display, 10, .italic);
+        const kids = list.children(b);
+        try testing.expectEqual(@as(usize, 3), kids.len);
+        const paren = list.get(kids[0].idx);
+        try testing.expectApproxEqAbs(c.ink_em * 10, paren.height + paren.depth, 0.01);
+    }
 }

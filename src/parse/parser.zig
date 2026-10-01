@@ -57,6 +57,14 @@ const Command = enum {
     /// fraction inside \left( \right) parens (auto-sized by the variant
     /// ladder)
     binom,
+    /// \dbinom{num}{den} = \genfrac{(}{)}{0pt}{0}{num}{den}: \binom with
+    /// the style argument FORCED to display (amsmath), so the parts and the
+    /// amsc fixed-delimiter parens both size as display even inside a
+    /// script or a text-style formula
+    dbinom,
+    /// \tbinom{num}{den} = \genfrac{(}{)}{0pt}{1}{num}{den}: \binom forced
+    /// to text style (amsmath)
+    tbinom,
     /// \genfrac{left}{right}{thick}{style}{num}{den}: the generalized
     /// fraction — explicit delimiters (possibly empty), rule thickness
     /// (0pt = \atop-style no rule), forced style (0=display 1=text
@@ -86,6 +94,34 @@ const Command = enum {
     op_oiint,
     op_oiiint,
     op_ointctrclockwise,
+    /// the \bigXXX n-ary family + \bigstar (amsmath's \slimits@ group) and
+    /// the big integrals \bigint \bigiint \bigiiint
+    op_bigodot,
+    op_bigoplus,
+    op_bigotimes,
+    op_biguplus,
+    op_bigsqcap,
+    op_bigwedge,
+    op_bigvee,
+    op_bigstar,
+    op_bigint,
+    op_bigiint,
+    op_bigiiint,
+    /// \mathop{<field>}: TeX's generic \mathop — the math field in upright
+    /// roman with the OP class and no limits (the `.opname` model, data 0)
+    mathop,
+    /// \mathord \mathrel \mathbin \mathopen \mathclose \mathpunct
+    /// \mathinner: the math field wrapped in a forced class (a `.row` of one
+    /// child whose data packs the class — atom.classRowData)
+    mathord,
+    mathrel,
+    mathopen,
+    mathclose,
+    mathpunct,
+    mathinner,
+    /// \colon: the colon as PUNCTUATION (plain TeX's `\def\colon
+    /// {\mathpunct{:}}`), unlike a bare `:` which is a relation
+    colon,
     /// an operator word (\sin \lim \log ...): roman styled run of the name
     opname,
     /// \left ... \right delimited construct
@@ -150,6 +186,32 @@ const Command = enum {
     /// amsmath \if@display 18mu branch never fires inside \array cells —
     /// measured on XeTeX; see mod()).
     mod,
+    /// \overset{top}{base} / \underset{bot}{base} / \stackrel{top}{base}:
+    /// amsmath's / the kernel's \mathop-with-forced-limits forms (a row of
+    /// children [script, base], laid out as centred over/under limits)
+    overset,
+    underset,
+    stackrel,
+    /// \phantom{x} / \hphantom{x} / \vphantom{x} / \smash{x}: an invisible
+    /// box keeping the argument's dimensions in the four combinations amsmath
+    /// defines (a row of children [content], data = the keep mask)
+    phantom,
+    hphantom,
+    vphantom,
+    smash,
+    /// \underbrace{x}_{c} / \overbrace{x}^{c}: a brace band under/over the
+    /// content (a row of children [content] or [content, annotation])
+    underbrace,
+    overbrace,
+    /// \hspace{<dim>} / \kern<dim> / \mkern<dim>: an explicit horizontal skip
+    /// whose dimension unit decides how layout scales it
+    hspace,
+    kern,
+    mkern,
+    /// \: — LaTeX's medium math space (\tmspace+\medmuskip = +4mu)
+    space_colon,
+    /// \  — the interword space (one third of the em)
+    space_control,
     /// \begin{env}...\end{env}: a math environment (matrix family, cases,
     /// aligned, array) — parsed by parseBegin into a `.env` atom.
     begin,
@@ -172,6 +234,8 @@ const cmd_map = std.StaticStringMap(Command).initComptime(&[_]struct { []const u
     .{ "cfrac", .cfrac },
     .{ "atop", .atop },
     .{ "binom", .binom },
+    .{ "dbinom", .dbinom },
+    .{ "tbinom", .tbinom },
     .{ "genfrac", .genfrac },
     .{ "text", .text },
     .{ "mathrm", .style_roman },
@@ -195,6 +259,30 @@ const cmd_map = std.StaticStringMap(Command).initComptime(&[_]struct { []const u
     .{ "oiiint", .op_oiiint },
     .{ "ointctrclockwise", .op_ointctrclockwise },
     .{ "ointctrclockwisectr", .op_ointctrclockwise },
+    // the remaining big operators: the \bigXXX n-ary family and \bigstar
+    // (amsmath redeclares exactly these with \slimits@), then the big
+    // integrals, which reuse the plain integral codepoints at a larger size
+    .{ "bigodot", .op_bigodot },
+    .{ "bigoplus", .op_bigoplus },
+    .{ "bigotimes", .op_bigotimes },
+    .{ "biguplus", .op_biguplus },
+    .{ "bigsqcap", .op_bigsqcap },
+    .{ "bigwedge", .op_bigwedge },
+    .{ "bigvee", .op_bigvee },
+    .{ "bigstar", .op_bigstar },
+    .{ "bigint", .op_bigint },
+    .{ "bigiint", .op_bigiint },
+    .{ "bigiiint", .op_bigiiint },
+    // TeX's class primitives: \mathop and the \mathXXX family, plus \colon
+    // (punctuation, unlike a bare `:`)
+    .{ "mathop", .mathop },
+    .{ "mathord", .mathord },
+    .{ "mathrel", .mathrel },
+    .{ "mathopen", .mathopen },
+    .{ "mathclose", .mathclose },
+    .{ "mathpunct", .mathpunct },
+    .{ "mathinner", .mathinner },
+    .{ "colon", .colon },
     .{ "left", .left },
     .{ "right", .right },
     .{ "big", .big },
@@ -268,6 +356,26 @@ const cmd_map = std.StaticStringMap(Command).initComptime(&[_]struct { []const u
     // (see bmod()/mod()).
     .{ "mod", .mod },
     .{ "bmod", .bmod },
+    // forced-limit scripts over/under a base: a row of [script, base]
+    .{ "overset", .overset },
+    .{ "underset", .underset },
+    .{ "stackrel", .stackrel },
+    // the four invisible boxes; the keep mask distinguishes the variants
+    .{ "phantom", .phantom },
+    .{ "hphantom", .hphantom },
+    .{ "vphantom", .vphantom },
+    .{ "smash", .smash },
+    // the brace decorations, each with an optional _ / ^ annotation
+    .{ "underbrace", .underbrace },
+    .{ "overbrace", .overbrace },
+    // explicit horizontal skips; \: is LaTeX's medium math space and \  its
+    // interword space (a control symbol's name IS its single byte, so the
+    // control space is the command " ")
+    .{ "hspace", .hspace },
+    .{ "kern", .kern },
+    .{ "mkern", .mkern },
+    .{ ":", .space_colon },
+    .{ " ", .space_control },
 });
 
 /// \displaystyle \textstyle \scriptstyle \scriptscriptstyle → forced math
@@ -493,7 +601,22 @@ const symbol_map = std.StaticStringMap(u21).initComptime(&[_]struct { []const u8
     .{ "rceil", 0x2309 },
     .{ "therefore", 0x2234 },
     .{ "because", 0x2235 },
-    .{ "colon", 0x3A },
+    // The colon family. \colon is NOT here: plain TeX typesets it as
+    // PUNCTUATION (`\def\colon{\mathpunct{:}}`) while a bare `:` is a
+    // relation, so it needs a forced class and lives in cmd_map.
+    // \coloneqq / \Coloneqq are mathtools' `:=` / `::=`; unicode-math spells
+    // the same two symbols \coloneq (U+2254) and \Coloneq (U+2A74) — but
+    // Latin Modern Math has NO U+2A74, so \Coloneqq falls back to the
+    // single-glyph COLON EQUALS U+2254 (it still draws a relation glyph with
+    // relation glue; only the doubled colon is lost). \Colon and \ratio are
+    // unicode-math's U+2237 PROPORTION and U+2236 RATIO.
+    .{ "coloneqq", 0x2254 },
+    .{ "coloneqqs", 0x2254 },
+    .{ "Coloneqq", 0x2254 },
+    .{ "Coloneqqs", 0x2254 },
+    .{ "coloneq", 0x2255 },
+    .{ "Colon", 0x2237 },
+    .{ "ratio", 0x2236 },
     .{ "hbar", 0x210F },
     .{ "imath", 0x0131 },
     .{ "jmath", 0x0237 },
@@ -627,6 +750,47 @@ const bmod_row_data: u32 = 6;
 /// inside \array cells — measured on XeTeX) plus the fixed \mkern6mu
 /// mod-arg gap — instead of the ordinary row path.
 const mod_row_data: u32 = 7;
+
+/// The `data` an \overset / \underset / \stackrel row node carries (children
+/// [script, base]) so layout routes it through the forced-limits path — the
+/// three share one geometry; only the class the row reports differs.
+const overset_row_data: u32 = 8;
+const underset_row_data: u32 = 9;
+const stackrel_row_data: u32 = 10;
+
+/// The `data` an \underbrace / \overbrace row node carries (children
+/// [content] or [content, annotation]) so layout routes it through the brace
+/// path — the brace band plus the optional forced-limit annotation.
+const underbrace_row_data: u32 = 11;
+const overbrace_row_data: u32 = 12;
+
+/// Bit 5 of an explicit-kern row's `data` marks the family (\hspace / \kern /
+/// \mkern, and `\:`'s constant mu skip); bits 0-1 carry the dimension's unit
+/// (see `dim_pt`) and the magnitude rides in the row's single `.space` child
+/// (a space leaf's f32 em payload). Values 32..35, disjoint from the fixed row
+/// markers 1..12 above and from the phantom family (bit 4).
+const kern_row_data: u32 = 1 << 5;
+
+/// Dimension units: TeX's absolute-point ones never scale with the font size;
+/// em/ex follow the current style's size; mu is style-invariant (1/18 em of
+/// the ladder-neutral em, the convention \pmod's 8mu and \mod's 12mu already
+/// follow).
+const dim_pt: u32 = 0;
+const dim_em: u32 = 1;
+const dim_ex: u32 = 2;
+const dim_mu: u32 = 3;
+
+/// Bit 4 of a \phantom-family row's `data` marks the family; the low bits are
+/// the keep mask — which of the argument box's dimensions survive. \phantom
+/// keeps all three, \vphantom the height and depth, \hphantom the width, and
+/// \smash the width alone (amsmath's `\smash[<axes>]` zeroes ht and/or dp of
+/// the argument box and always keeps the advance, so its default `[tb]` is
+/// exactly \hphantom).
+const phantom_row_data: u32 = 1 << 4;
+const keep_width: u32 = 1;
+const keep_height: u32 = 2;
+const keep_depth: u32 = 4;
+const keep_vertical: u32 = keep_height | keep_depth;
 
 /// Relation codepoint → its pre-composed negated form, for \not<relation>.
 /// unicode-math's \not command uses the pre-composed glyph when one exists
@@ -1224,6 +1388,16 @@ pub const Parser = struct {
                 const den = try self.parseRequiredArg(ast);
                 break :blk self.binom(ast, cmd_tok, num, den);
             },
+            .dbinom => blk: {
+                const num = try self.parseRequiredArg(ast);
+                const den = try self.parseRequiredArg(ast);
+                break :blk self.binomVariant(ast, cmd_tok, .display, num, den);
+            },
+            .tbinom => blk: {
+                const num = try self.parseRequiredArg(ast);
+                const den = try self.parseRequiredArg(ast);
+                break :blk self.binomVariant(ast, cmd_tok, .text, num, den);
+            },
             .genfrac => blk: {
                 const ld = try self.parseGenfracDelim();
                 const rd = try self.parseGenfracDelim();
@@ -1254,6 +1428,30 @@ pub const Parser = struct {
             .op_oiint => self.op(ast, cmd_tok, .oiint),
             .op_oiiint => self.op(ast, cmd_tok, .oiiint),
             .op_ointctrclockwise => self.op(ast, cmd_tok, .ointctrclockwise),
+            .op_bigodot => self.op(ast, cmd_tok, .bigodot),
+            .op_bigoplus => self.op(ast, cmd_tok, .bigoplus),
+            .op_bigotimes => self.op(ast, cmd_tok, .bigotimes),
+            .op_biguplus => self.op(ast, cmd_tok, .biguplus),
+            .op_bigsqcap => self.op(ast, cmd_tok, .bigsqcap),
+            .op_bigwedge => self.op(ast, cmd_tok, .bigwedge),
+            .op_bigvee => self.op(ast, cmd_tok, .bigvee),
+            .op_bigstar => self.op(ast, cmd_tok, .bigstar),
+            .op_bigint => self.op(ast, cmd_tok, .bigint),
+            .op_bigiint => self.op(ast, cmd_tok, .bigiint),
+            .op_bigiiint => self.op(ast, cmd_tok, .bigiiint),
+            .mathop => self.mathop(ast, cmd_tok),
+            .mathord => self.mathClass(ast, cmd_tok, .ord),
+            .mathrel => self.mathClass(ast, cmd_tok, .rel),
+            .mathopen => self.mathClass(ast, cmd_tok, .open),
+            .mathclose => self.mathClass(ast, cmd_tok, .close),
+            .mathpunct => self.mathClass(ast, cmd_tok, .punct),
+            .mathinner => self.mathClass(ast, cmd_tok, .inner),
+            .colon => blk: {
+                // The glyph is the plain colon; only the class differs from a
+                // bare `:`.
+                const leaf = try ast.createLeaf(.char, cmd_tok, 1, 0x3A);
+                break :blk self.classRow(ast, cmd_tok, .punct, leaf);
+            },
             .opname => self.opname(ast, cmd_tok, name),
             .left => self.parseLeftRight(ast, cmd_tok),
             .right => self.fail(.unexpected_r_group, self.spanAt(cmd_tok)),
@@ -1281,6 +1479,19 @@ pub const Parser = struct {
             .pod => self.pmod(ast, cmd_tok, false),
             .bmod => self.bmod(ast, cmd_tok),
             .mod => self.mod(ast, cmd_tok),
+            .overset => self.limitScript(ast, cmd_tok, .over, false),
+            .underset => self.limitScript(ast, cmd_tok, .under, false),
+            .stackrel => self.limitScript(ast, cmd_tok, .over, true),
+            .phantom => self.phantom(ast, cmd_tok, keep_width | keep_vertical),
+            .hphantom => self.phantom(ast, cmd_tok, keep_width),
+            .vphantom => self.phantom(ast, cmd_tok, keep_vertical),
+            .smash => self.smash(ast, cmd_tok),
+            .underbrace => self.brace(ast, cmd_tok, true),
+            .overbrace => self.brace(ast, cmd_tok, false),
+            .hspace => self.kern(ast, cmd_tok, true),
+            .kern, .mkern => self.kern(ast, cmd_tok, false),
+            .space_colon => self.kernRow(ast, cmd_tok, 4.0, .mu),
+            .space_control => self.space(ast, cmd_tok, 1.0 / 3.0),
             .begin => self.parseBegin(ast, cmd_tok),
         };
     }
@@ -1380,6 +1591,70 @@ pub const Parser = struct {
         const num_tokens = (inode.first_token + inode.num_tokens) - cmd_tok;
         const children = [_]atom.Node{ast.node(inner)};
         return self.createNode(ast, .opname, cmd_tok, num_tokens, &children, limits);
+    }
+
+    /// \mathop{<field>}: TeX's generic \mathop — the math field in upright
+    /// roman with the OP class and NO limits. The `.opname` atom is exactly
+    /// that shape (a child laid out roman, `leftRole`/`rightRole` = op), and
+    /// `data` 0 selects beside scripts; unlike `\operatorname` the content
+    /// may be a bare atom (`\mathop\lim`), since TeX's \mathXXX takes a math
+    /// FIELD, not a braced argument.
+    fn mathop(self: *Parser, ast: *atom.Ast, cmd_tok: u32) Error!u32 {
+        const field = try self.parseScriptArg(ast);
+        const fnode = ast.node(field);
+        const num_tokens = (fnode.first_token + fnode.num_tokens) - cmd_tok;
+        const children = [_]atom.Node{fnode};
+        return self.createNode(ast, .opname, cmd_tok, num_tokens, &children, 0);
+    }
+
+    /// \mathord \mathrel \mathbin \mathopen \mathclose \mathpunct
+    /// \mathinner: the math field wrapped in a forced class.
+    fn mathClass(self: *Parser, ast: *atom.Ast, cmd_tok: u32, cls: atom.MathClass) Error!u32 {
+        const field = try self.parseScriptArg(ast);
+        return self.classRow(ast, cmd_tok, cls, field);
+    }
+
+    /// Wrap an already-parsed atom in a class-override row: a `.row` of one
+    /// child whose `data` packs the marker + class (atom.classRowData). The
+    /// row lays out as the ordinary single-child row — the same box the
+    /// field produces alone — and layout classifies it from `data` on BOTH
+    /// sides, so the wrapper is invisible to the geometry and visible to
+    /// the glue.
+    fn classRow(
+        self: *Parser,
+        ast: *atom.Ast,
+        cmd_tok: u32,
+        cls: atom.MathClass,
+        field: u32,
+    ) Error!u32 {
+        const fnode = ast.node(field);
+        const num_tokens = (fnode.first_token + fnode.num_tokens) - cmd_tok;
+        const children = [_]atom.Node{fnode};
+        return self.createNode(ast, .row, cmd_tok, num_tokens, &children, atom.classRowData(cls));
+    }
+
+    /// \dbinom{num}{den} / \tbinom{num}{den} = \genfrac{(}{)}{0pt}{0|1}
+    /// {num}{den} (amsmath): \binom with the style argument FORCED, which
+    /// is the only difference: the parens take amsc's fixed fraction-
+    /// delimiter size for the FORCED style (display → the v6 paren, text →
+    /// the base paren) and the parts render at that style. The synthetic
+    /// delimiter leaves borrow the command token, like \binom's.
+    fn binomVariant(
+        self: *Parser,
+        ast: *atom.Ast,
+        cmd_tok: u32,
+        forced: atom.MathStyle,
+        num: u32,
+        den: u32,
+    ) Error!u32 {
+        const frac = try self.fraction(ast, cmd_tok, num, den, false, forced, false);
+        ast.nodes.items[frac].data |= atom.FractionBits.fixed_delim;
+        const fnode = ast.node(frac);
+        const open = try ast.createLeaf(.char, cmd_tok, 1, 0x28);
+        const close = try ast.createLeaf(.char, cmd_tok, 1, 0x29);
+        const children = [_]atom.Node{ ast.node(open), fnode, ast.node(close) };
+        const num_tokens = (ast.node(den).first_token + ast.node(den).num_tokens) - cmd_tok;
+        return self.createNode(ast, .left, cmd_tok, num_tokens, &children, 0);
     }
 
     fn space(_: *Parser, ast: *atom.Ast, cmd_tok: u32, em: f32) Error!u32 {
@@ -2054,6 +2329,202 @@ pub const Parser = struct {
         return self.createNode(ast, .row, cmd_tok, num_tokens, &children, mod_row_data);
     }
 
+    /// \overset{top}{base} / \underset{bot}{base} / \stackrel{top}{base}:
+    /// amsmath.sty:
+    ///   \overset#1#2{\binrel@{#2}\binrel@@{\mathop{\kern\z@#2}\limits^{#1}}}
+    ///   \underset#1#2{\binrel@{#2}\binrel@@{\mathop{\kern\z@#2}\limits_{#1}}}
+    /// and the kernel (latex.ltx):
+    ///   \stackrel#1#2{\mathrel{\mathop{#2}\limits^{#1}}}
+    /// — a \mathop with FORCED limits, so the script is centred over (or
+    /// under) the base in EVERY math style: measured on the XeTeX reference,
+    /// `\overset{a}{b}` is byte-identical in display and text style, where a
+    /// bare `\sum^{a}` would put its script beside. The \kern\z@ inside the
+    /// \mathop is an empty kern and contributes no geometry, so all three
+    /// share one parse shape and one layout; they differ only in the ATOM
+    /// CLASS the row reports — the amsmath pair expands to
+    /// `\mathrel{\nonscript\relax{}}` + base + the construct, and that empty
+    /// \mathrel takes no class (measured: `x\overset{a}{b}` carries NO
+    /// inter-atom glue on either side, while `x\stackrel{a}{b}` gets the thick
+    /// 5mu of a \mathrel). The children are [script, base], the argument
+    /// order of the macros.
+    fn limitScript(
+        self: *Parser,
+        ast: *atom.Ast,
+        cmd_tok: u32,
+        placement: enum { over, under },
+        rel: bool,
+    ) Error!u32 {
+        const script = try self.parseRequiredArg(ast);
+        const base = try self.parseRequiredArg(ast);
+        const sn = ast.node(script);
+        const bn = ast.node(base);
+        const children = [_]atom.Node{ sn, bn };
+        const num_tokens = (bn.first_token + bn.num_tokens) - cmd_tok;
+        const data: u32 = if (rel)
+            stackrel_row_data
+        else if (placement == .under)
+            underset_row_data
+        else
+            overset_row_data;
+        return self.createNode(ast, .row, cmd_tok, num_tokens, &children, data);
+    }
+
+    /// \phantom{x} / \hphantom{x} / \vphantom{x} / \smash{x} — latex.ltx:
+    ///   \vphantom → \v@true \h@false \ph@nt, \hphantom → \v@false \h@true
+    ///   \ph@nt, \phantom → \v@true \h@true \ph@nt, and \ph@nt typesets the
+    ///   argument in an \hbox then copies the selected dimensions off it
+    ///   (\finph@nt), leaving an EMPTY box — nothing is drawn.
+    /// The argument is typeset at the CURRENT math style (measured:
+    /// `x^{a\phantom{b^2}}` keeps b^2's script-size height), so only the
+    /// dimensions are zeroed, never the content. `keep` is the keep mask the
+    /// layout reads: \phantom keeps width AND height/depth, \vphantom only the
+    /// vertical extent, \hphantom and \smash only the width.
+    fn phantom(self: *Parser, ast: *atom.Ast, cmd_tok: u32, keep: u32) Error!u32 {
+        const content = try self.parseRequiredArg(ast);
+        const cn = ast.node(content);
+        const children = [_]atom.Node{cn};
+        const num_tokens = (cn.first_token + cn.num_tokens) - cmd_tok;
+        return self.createNode(ast, .row, cmd_tok, num_tokens, &children, phantom_row_data | keep);
+    }
+
+    /// \smash[<axes>]{x} — amsmath's smash, whose optional argument selects
+    /// which axes it zeroes:
+    ///   \edef\finsm@sh{\csname mb@#1\endcsname\z@\z@\box\z@}
+    /// with `\def\mb@t{\ht}` (ht → 0, depth and advance kept),
+    /// `\def\mb@b{\dp}` (dp → 0) and `\def\mb@tb{\ht\z@\z@\dp}` (both). The
+    /// default is `[tb]`, which zeroes both and leaves exactly \hphantom's
+    /// geometry. An option that is not a subset of `t`/`b` is amsmath's
+    /// `\csname mb@…\endcsname` on an undefined name — TeX errors, so ztex
+    /// reports `error.MissingArgument` at the option text.
+    fn smash(self: *Parser, ast: *atom.Ast, cmd_tok: u32) Error!u32 {
+        var keep: u32 = keep_width;
+        if (self.peek()) |t| {
+            if (t.tag == .char and self.src[t.start] == '[') {
+                const open_tok: u32 = @intCast(self.pos);
+                _ = self.advance(); // consume [
+                const start_tok: u32 = @intCast(self.pos);
+                while (self.peek()) |c| {
+                    if (c.tag == .char and self.src[c.start] == ']') break;
+                    _ = self.advance();
+                }
+                const end_tok: u32 = @intCast(self.pos);
+                const close = self.advance() orelse
+                    return self.fail(.unclosed_group, self.spanAt(open_tok));
+                if (close.tag != .char or self.src[close.start] != ']')
+                    return self.fail(.unclosed_group, self.spanAt(open_tok));
+                const first = self.tokens[start_tok];
+                const last = self.tokens[end_tok - 1];
+                const axes = self.src[first.start..last.end];
+                const bad: atom.Span = .{ .start = first.start, .end = last.end };
+                keep = if (std.mem.eql(u8, axes, "t"))
+                    keep_width | keep_depth
+                else if (std.mem.eql(u8, axes, "b"))
+                    keep_width | keep_height
+                else if (std.mem.eql(u8, axes, "tb"))
+                    keep_width
+                else
+                    return self.fail(.missing_argument, bad);
+            }
+        }
+        return self.phantom(ast, cmd_tok, keep);
+    }
+
+    /// \underbrace{x}_{c} / \overbrace{x}^{c}: plain TeX's brace macro
+    /// (amsmath does not redefine it) — a \mathop whose nucleus is a \vtop
+    /// (\underbrace) or \vbox (\overbrace) holding the content at
+    /// \displaystyle followed by the extensible brace pieces, with an
+    /// OPTIONAL `_{...}` / `^{...}` annotation attached as a limit (the
+    /// annotation under an \underbrace, over an \overbrace; both are accepted
+    /// in either position, exactly as a script after the macro). The children
+    /// are [content] or [content, annotation]; layout draws the brace band and
+    /// applies the annotation through the same forced-limits path as
+    /// \overset.
+    fn brace(self: *Parser, ast: *atom.Ast, cmd_tok: u32, under: bool) Error!u32 {
+        const content = try self.parseRequiredArg(ast);
+        const cn = ast.node(content);
+        var children: std.ArrayList(atom.Node) = .empty;
+        defer children.deinit(self.gpa);
+        try children.append(self.gpa, cn);
+        var last = cn;
+        // The optional annotation: exactly one script right after the content.
+        if (self.peek()) |t| {
+            if (t.tag == .sub or t.tag == .sup) {
+                _ = self.advance(); // consume _ or ^
+                const ann = try self.parseScriptArg(ast);
+                const an = ast.node(ann);
+                try children.append(self.gpa, an);
+                last = an;
+            }
+        }
+        const num_tokens = (last.first_token + last.num_tokens) - cmd_tok;
+        return self.createNode(
+            ast,
+            .row,
+            cmd_tok,
+            num_tokens,
+            children.items,
+            if (under) underbrace_row_data else overbrace_row_data,
+        );
+    }
+
+    /// \hspace{<dim>} / \kern<dim> / \mkern<dim>: an explicit horizontal skip.
+    /// `braced` selects the two argument shapes (`\hspace` takes a braced
+    /// group, `\kern`/`\mkern` a bare dimension, like TeX). \kern and \mkern
+    /// are the same primitive in math mode (both an ord-grade kern).
+    fn kern(self: *Parser, ast: *atom.Ast, cmd_tok: u32, braced: bool) Error!u32 {
+        const dim = try self.parseDimension(braced);
+        return self.kernRow(ast, cmd_tok, dim.value, dim.unit);
+    }
+
+    /// The kern row itself: the unit in `data`, the magnitude in the single
+    /// `.space` child (a space leaf's f32 em payload — no layout change is
+    /// needed to carry it, only to interpret it under the right unit).
+    fn kernRow(
+        self: *Parser,
+        ast: *atom.Ast,
+        cmd_tok: u32,
+        value: f32,
+        unit: DimUnit,
+    ) Error!u32 {
+        const leaf = try ast.createLeaf(.space, cmd_tok, 1, atom.emToFixed(value));
+        const ln = ast.node(leaf);
+        const children = [_]atom.Node{ln};
+        const data = kern_row_data | @intFromEnum(unit);
+        return self.createNode(ast, .row, cmd_tok, 1, &children, data);
+    }
+
+    /// A TeX dimension, braced (`\hspace{...}`) or bare (`\kern1em`):
+    /// `<sign><digits>[.<digits>]<unit>`, the unit optional (a bare number is
+    /// pt, as in TeX's scan_dimen). The bytes are re-read from the token
+    /// spans. A missing brace, an unclosed group, or text that is not a
+    /// dimension is `error.MissingArgument` at the offending span (an
+    /// unclosed `{` reports `error.UnclosedGroup` at the brace, like every
+    /// other braced argument here).
+    fn parseDimension(self: *Parser, braced: bool) Error!Dim {
+        const open_tok: u32 = @intCast(self.pos);
+        if (braced) {
+            const t = self.peek() orelse return self.fail(.missing_argument, self.spanAt(self.pos));
+            if (t.tag != .l_group) return self.fail(.missing_argument, spanOf(t));
+            _ = self.advance(); // consume {
+        }
+        const start_tok: u32 = @intCast(self.pos);
+        // The dimension is a run of char tokens (`1em`, `-2.5pt`, `4mu`).
+        while (self.peek()) |t| {
+            if (t.tag != .char) break;
+            _ = self.advance();
+        }
+        const end_tok: u32 = @intCast(self.pos);
+        if (braced) {
+            const c = self.advance() orelse return self.fail(.unclosed_group, self.spanAt(open_tok));
+            if (c.tag != .r_group) return self.fail(.unclosed_group, self.spanAt(open_tok));
+        }
+        if (end_tok == start_tok) return self.fail(.missing_argument, self.spanAt(start_tok));
+        const st = self.tokens[start_tok];
+        const et = self.tokens[end_tok - 1];
+        const bad: atom.Span = .{ .start = st.start, .end = et.end };
+        return parseDim(self.src[st.start..et.end]) orelse self.fail(.missing_argument, bad);
+    }
+
     /// Parse the \sqrt[n] degree: atoms until a `]` char at this row level.
     fn parseUntilRBracket(self: *Parser, ast: *atom.Ast) Error!u32 {
         const start_tok: u32 = @intCast(self.pos);
@@ -2173,6 +2644,78 @@ const Delimiter = struct {
     cp: u21,
     tok: u32,
 };
+
+/// The unit of an explicit horizontal skip, which decides how layout scales
+/// it: the absolute-point units never scale with the font size, em/ex follow
+/// the current style's size, and mu is style-invariant (1/18 em of the
+/// ladder-neutral em — the convention \pmod's 8mu and \mod's 12mu already
+/// follow).
+const DimUnit = enum(u8) {
+    pt = dim_pt,
+    em = dim_em,
+    ex = dim_ex,
+    mu = dim_mu,
+};
+
+/// One TeX dimension: the magnitude plus the unit that scales it. `value` is
+/// in points for `.pt` and in ems for `.em`/`.ex`/`.mu`.
+const Dim = struct {
+    value: f32,
+    unit: DimUnit,
+};
+
+/// Parse `<sign><digits>[.<digits>]<unit>` (TeX's scan_dimen grammar, minus
+/// the internal units) from `text`, or null when it is not a dimension. The
+/// unit is optional — a bare number is pt. The absolute conversions are
+/// TeX's (TeXbook p.331: 1in = 72.27pt, 1pc = 12pt, 1bp = 72/72.27 pt); `mu`
+/// is accepted here even though TeX rejects it for \kern/\hspace with "Illegal
+/// unit of measure" — a mu dimension is the one thing \kern exists for.
+fn parseDim(text: []const u8) ?Dim {
+    var i: usize = 0;
+    var sign: f32 = 1;
+    if (i < text.len and (text[i] == '-' or text[i] == '+')) {
+        if (text[i] == '-') sign = -1;
+        i += 1;
+    }
+    var mantissa: f32 = 0;
+    var digits: usize = 0;
+    while (i < text.len and std.ascii.isDigit(text[i])) : (i += 1) {
+        mantissa = mantissa * 10 + @as(f32, @floatFromInt(text[i] - '0'));
+        digits += 1;
+    }
+    if (i < text.len and text[i] == '.') {
+        i += 1;
+        var place: f32 = 0.1;
+        while (i < text.len and std.ascii.isDigit(text[i])) : (i += 1) {
+            mantissa += @as(f32, @floatFromInt(text[i] - '0')) * place;
+            place *= 0.1;
+            digits += 1;
+        }
+    }
+    if (digits == 0) return null;
+    // The unit decides the scaling (see DimUnit); the absolute units are
+    // converted to points here, the em-relative ones are kept in ems.
+    const unit_text = text[i..];
+    const absolute: ?f32 = if (unit_text.len == 0 or std.mem.eql(u8, unit_text, "pt"))
+        1.0
+    else if (std.mem.eql(u8, unit_text, "bp"))
+        72.0 / 72.27
+    else if (std.mem.eql(u8, unit_text, "pc"))
+        12.0
+    else if (std.mem.eql(u8, unit_text, "in"))
+        72.27
+    else if (std.mem.eql(u8, unit_text, "cm"))
+        72.27 / 2.54
+    else if (std.mem.eql(u8, unit_text, "mm"))
+        72.27 / 25.4
+    else
+        null;
+    if (absolute) |k| return .{ .value = sign * mantissa * k, .unit = .pt };
+    if (std.mem.eql(u8, unit_text, "em")) return .{ .value = sign * mantissa, .unit = .em };
+    if (std.mem.eql(u8, unit_text, "ex")) return .{ .value = sign * mantissa, .unit = .ex };
+    if (std.mem.eql(u8, unit_text, "mu")) return .{ .value = sign * mantissa, .unit = .mu };
+    return null;
+}
 
 /// Environment name → kind, for \begin{env}. matrix/pmatrix/bmatrix/
 /// Bmatrix/vmatrix/Vmatrix/cases/aligned are amsmath environments; array is
@@ -2945,6 +3488,176 @@ test "parser: & outside an environment is an ordinary char" {
     try testing.expectEqual(.char, ast.node(ast.child(ast.root, 1)).tag);
 }
 
+/// The first atom of `src`, unwrapped through the root row.
+fn firstAtom(ast: *const atom.Ast) u32 {
+    return ast.child(ast.root, 0);
+}
+
+test "parser: \\overset / \\underset / \\stackrel build a [script, base] row" {
+    const cases = [_]struct { src: []const u8, data: u32 }{
+        .{ .src = "\\overset{a}{b}", .data = overset_row_data },
+        .{ .src = "\\underset{a}{b}", .data = underset_row_data },
+        .{ .src = "\\stackrel{a}{b}", .data = stackrel_row_data },
+    };
+    for (cases) |c| {
+        var ast = try parseSrc(testing.allocator, c.src);
+        defer ast.deinit();
+        const row = ast.node(firstAtom(&ast));
+        try testing.expectEqual(.row, row.tag);
+        try testing.expectEqual(c.data, row.data);
+        // The macro's argument order: #1 is the script, #2 the base.
+        try testing.expectEqual(@as(u16, 2), row.num_children);
+        const script = ast.child(firstAtom(&ast), 0);
+        const base = ast.child(firstAtom(&ast), 1);
+        try testing.expectEqual(.row, ast.node(script).tag);
+        try testing.expectEqual(.row, ast.node(base).tag);
+        // The macro's argument order: #1 is the script, #2 the base.
+        const ss = ast.span(script);
+        const bs = ast.span(base);
+        try testing.expectEqualStrings("a", ast.src[ss.start..ss.end]);
+        try testing.expectEqualStrings("b", ast.src[bs.start..bs.end]);
+    }
+}
+
+test "parser: the phantom family carries its keep mask" {
+    const cases = [_]struct { src: []const u8, keep: u32 }{
+        // \phantom keeps the width AND the vertical extent
+        .{ .src = "\\phantom{ab}", .keep = keep_width | keep_vertical },
+        .{ .src = "\\vphantom{ab}", .keep = keep_vertical },
+        // \hphantom and \smash keep only the width — amsmath's \smash[tb]
+        // zeroes ht and dp and leaves the advance alone
+        .{ .src = "\\hphantom{ab}", .keep = keep_width },
+        .{ .src = "\\smash{ab}", .keep = keep_width },
+        .{ .src = "\\smash[tb]{ab}", .keep = keep_width },
+        .{ .src = "\\smash[t]{ab}", .keep = keep_width | keep_depth },
+        .{ .src = "\\smash[b]{ab}", .keep = keep_width | keep_height },
+    };
+    for (cases) |c| {
+        var ast = try parseSrc(testing.allocator, c.src);
+        defer ast.deinit();
+        const row = ast.node(firstAtom(&ast));
+        try testing.expectEqual(.row, row.tag);
+        try testing.expectEqual(phantom_row_data | c.keep, row.data);
+        try testing.expectEqual(@as(u16, 1), row.num_children);
+    }
+}
+
+test "parser: \\underbrace takes an optional subscript annotation" {
+    var bare = try parseSrc(testing.allocator, "\\underbrace{x+y}");
+    defer bare.deinit();
+    const row = bare.node(firstAtom(&bare));
+    try testing.expectEqual(underbrace_row_data, row.data);
+    try testing.expectEqual(@as(u16, 1), row.num_children);
+
+    var annotated = try parseSrc(testing.allocator, "\\underbrace{x+y}_{n}");
+    defer annotated.deinit();
+    const arow = annotated.node(firstAtom(&annotated));
+    try testing.expectEqual(underbrace_row_data, arow.data);
+    try testing.expectEqual(@as(u16, 2), arow.num_children);
+    const content = annotated.node(annotated.child(firstAtom(&annotated), 0));
+    try testing.expectEqual(@as(u16, 3), content.num_children); // x + y
+    const ann = annotated.node(annotated.child(firstAtom(&annotated), 1));
+    // A braced annotation is a script field: a `.group` over its content.
+    try testing.expectEqual(.group, ann.tag);
+    try testing.expectEqual(@as(u16, 1), ann.num_children);
+    // Inside the group the annotation is the `n` field itself.
+    const inner = annotated.child(annotated.child(firstAtom(&annotated), 1), 0);
+    const ann_span = annotated.span(inner);
+    try testing.expectEqualStrings("n", annotated.src[ann_span.start..ann_span.end]);
+
+    var over = try parseSrc(testing.allocator, "\\overbrace{x}^{n}");
+    defer over.deinit();
+    try testing.expectEqual(overbrace_row_data, over.node(firstAtom(&over)).data);
+    try testing.expectEqual(@as(u16, 2), over.node(firstAtom(&over)).num_children);
+}
+
+test "parser: \\kern / \\mkern / \\hspace carry the dimension's unit" {
+    const cases = [_]struct { src: []const u8, unit: u32, value: f32 }{
+        .{ .src = "\\kern2mu", .unit = dim_mu, .value = 2 },
+        .{ .src = "\\mkern-1.5mu", .unit = dim_mu, .value = -1.5 },
+        .{ .src = "\\hspace{4mu}", .unit = dim_mu, .value = 4 },
+        .{ .src = "\\kern1em", .unit = dim_em, .value = 1 },
+        .{ .src = "\\hspace{0.5ex}", .unit = dim_ex, .value = 0.5 },
+        // A bare number is pt, as in TeX's scan_dimen.
+        .{ .src = "\\kern2.5pt", .unit = dim_pt, .value = 2.5 },
+        .{ .src = "\\hspace{3}", .unit = dim_pt, .value = 3 },
+        // TeX's absolute conversions: 1in = 72.27pt, 1pc = 12pt.
+        .{ .src = "\\kern1in", .unit = dim_pt, .value = 72.27 },
+        .{ .src = "\\kern0.5pc", .unit = dim_pt, .value = 6 },
+    };
+    for (cases) |c| {
+        var ast = try parseSrc(testing.allocator, c.src);
+        defer ast.deinit();
+        const row = ast.node(firstAtom(&ast));
+        try testing.expectEqual(.row, row.tag);
+        try testing.expectEqual(kern_row_data | c.unit, row.data);
+        // The magnitude rides in the single space child.
+        const leaf = ast.node(ast.child(firstAtom(&ast), 0));
+        try testing.expectEqual(.space, leaf.tag);
+        try testing.expectApproxEqAbs(c.value, atom.fixedToEm(leaf.data), 1e-4);
+    }
+}
+
+test "parser: \\: is the medium math space and \\  the interword space" {
+    var colon = try parseSrc(testing.allocator, "x\\:y");
+    defer colon.deinit();
+    const kern = colon.node(colon.child(colon.root, 1));
+    try testing.expectEqual(.row, kern.tag);
+    try testing.expectEqual(kern_row_data | dim_mu, kern.data);
+    const leaf = colon.node(colon.child(colon.child(colon.root, 1), 0));
+    try testing.expectApproxEqAbs(@as(f32, 4), atom.fixedToEm(leaf.data), 1e-5);
+
+    // The control space lexes as the one-byte command " " and reserves a third
+    // of an em — the text font's interword space (measured 3.33pt at 10pt).
+    var ctrl = try parseSrc(testing.allocator, "x\\ y");
+    defer ctrl.deinit();
+    const space = ctrl.node(ctrl.child(ctrl.root, 1));
+    try testing.expectEqual(.space, space.tag);
+    try testing.expectApproxEqAbs(@as(f32, 1) / 3.0, atom.fixedToEm(space.data), 1e-5);
+}
+
+test "parser: a malformed or missing dimension argument is a spanned error" {
+    var info: parse_err.Info = undefined;
+    // A non-brace argument: the span points at the offending token.
+    try expectSpanError(&info, error.MissingArgument, "\\hspace x", .missing_argument);
+    // Not a dimension at all — the span covers the text.
+    try expectSpanError(&info, error.MissingArgument, "\\kern em", .missing_argument);
+    try expectSpanError(&info, error.MissingArgument, "\\hspace{1zz}", .missing_argument);
+    // An unclosed \hspace group reports at the opening brace.
+    try expectSpanError(&info, error.UnclosedGroup, "\\hspace{1mu", .unclosed_group);
+    // Missing arguments for the new constructs.
+    try testing.expectError(error.MissingArgument, parseSrc(testing.allocator, "\\hspace"));
+    try testing.expectError(error.MissingArgument, parseSrc(testing.allocator, "\\kern"));
+    try testing.expectError(error.MissingArgument, parseSrc(testing.allocator, "\\overset{a}"));
+    try testing.expectError(error.MissingArgument, parseSrc(testing.allocator, "\\underset{a}"));
+    try testing.expectError(error.MissingArgument, parseSrc(testing.allocator, "\\stackrel{a}"));
+    try testing.expectError(error.MissingArgument, parseSrc(testing.allocator, "\\underbrace"));
+    try testing.expectError(error.MissingArgument, parseSrc(testing.allocator, "\\overbrace"));
+    try testing.expectError(error.MissingArgument, parseSrc(testing.allocator, "\\phantom"));
+    try testing.expectError(error.MissingArgument, parseSrc(testing.allocator, "\\smash"));
+    // \smash's option must be a subset of t/b (amsmath's \csname mb@…\endcsname
+    // on an undefined name).
+    try expectSpanError(&info, error.MissingArgument, "\\smash[zz]{x}", .missing_argument);
+}
+
+/// Parse `src` expecting `err`, and check the reported kind and span: a
+/// zero-width span is rejected, so every error must point at real bytes.
+fn expectSpanError(
+    info: *parse_err.Info,
+    err: Error,
+    src: []const u8,
+    kind: parse_err.Kind,
+) !void {
+    var ast = atom.Ast.init(testing.allocator, src);
+    defer ast.deinit();
+    try lexer.lex(&ast, info);
+    var p = Parser.init(testing.allocator, src, ast.tokens.items, info);
+    try testing.expectError(err, p.parse(&ast));
+    try testing.expectEqual(kind, info.kind);
+    try testing.expect(info.span.end > info.span.start);
+    try testing.expect(info.span.end <= src.len);
+}
+
 // ── supported_commands ──────────────────────────
 
 /// Independent comptime recomputation of the DISTINCT command count across
@@ -2983,6 +3696,166 @@ const supported_distinct_count: usize = blk: {
     }
     break :blk total - dups;
 };
+
+test "parser: \\dbinom and \\tbinom are \\binom with a FORCED style" {
+    // Both are \genfrac{(}{)}{0pt}{0|1}{n}{d}: a ruleless fraction inside a
+    // synthetic paren fence marked as amsmath-delimited, and the ONLY
+    // difference is the forced style — which layout turns into both the
+    // parts' size and the fixed fence the parens are boxed by.
+    const cases = [_]struct { src: []const u8, forced: atom.MathStyle }{
+        .{ .src = "\\dbinom{n}{k}", .forced = .display },
+        .{ .src = "\\tbinom{n}{k}", .forced = .text },
+    };
+    for (cases) |c| {
+        var ast = try parseSrc(testing.allocator, c.src);
+        defer ast.deinit();
+        const left_idx = ast.child(ast.root, 0);
+        const left = ast.node(left_idx);
+        try testing.expectEqual(.left, left.tag);
+        try testing.expectEqual(@as(u16, 3), left.num_children);
+        // the fence leaves carry the paren codepoints, like \binom's
+        try testing.expectEqual(@as(u32, 0x28), ast.node(ast.child(left_idx, 0)).data);
+        try testing.expectEqual(@as(u32, 0x29), ast.node(ast.child(left_idx, 2)).data);
+        const frac = ast.node(ast.child(left_idx, 1));
+        try testing.expectEqual(.fraction, frac.tag);
+        try testing.expect(!atom.fracLine(frac.data)); // 0pt: no rule
+        try testing.expect(atom.fracFixedDelim(frac.data));
+        const forced = atom.fracForcedStyle(frac.data) orelse
+            return error.TestExpectedEqual;
+        try testing.expectEqual(c.forced, forced);
+    }
+    // \binom itself keeps the CURRENT style (both references leave \genfrac's
+    // style arg empty) — the forced variants must not have changed it.
+    var plain = try parseSrc(testing.allocator, "\\binom{n}{k}");
+    defer plain.deinit();
+    const pf = plain.node(plain.child(plain.child(plain.root, 0), 1));
+    try testing.expect(atom.fracFixedDelim(pf.data));
+    try testing.expect(atom.fracForcedStyle(pf.data) == null);
+    try testing.expectError(error.MissingArgument, parseSrc(testing.allocator, "\\dbinom{n}"));
+}
+
+test "parser: the big operators parse to .op leaves with their BigOp" {
+    const cases = [_]struct { src: []const u8, which: atom.BigOp }{
+        .{ .src = "\\bigodot", .which = .bigodot },
+        .{ .src = "\\bigoplus", .which = .bigoplus },
+        .{ .src = "\\bigotimes", .which = .bigotimes },
+        .{ .src = "\\biguplus", .which = .biguplus },
+        .{ .src = "\\bigsqcap", .which = .bigsqcap },
+        .{ .src = "\\bigwedge", .which = .bigwedge },
+        .{ .src = "\\bigvee", .which = .bigvee },
+        .{ .src = "\\bigstar", .which = .bigstar },
+        .{ .src = "\\bigint", .which = .bigint },
+        .{ .src = "\\bigiint", .which = .bigiint },
+        .{ .src = "\\bigiiint", .which = .bigiiint },
+    };
+    for (cases) |c| {
+        var ast = try parseSrc(testing.allocator, c.src);
+        defer ast.deinit();
+        const op = ast.node(ast.child(ast.root, 0));
+        try testing.expectEqual(.op, op.tag);
+        try testing.expectEqual(@as(u32, @intFromEnum(c.which)), op.data);
+        // A big operator takes scripts like any atom (\bigwedge_{i}).
+        var buf: [32]u8 = undefined;
+        const scripted_src = try std.fmt.bufPrint(&buf, "{s}_{{i}}", .{c.src});
+        var scripted = try parseSrc(testing.allocator, scripted_src);
+        defer scripted.deinit();
+        const script_idx = scripted.child(scripted.root, 0);
+        try testing.expectEqual(.script, scripted.node(script_idx).tag);
+        try testing.expectEqual(.op, scripted.node(scripted.child(script_idx, 0)).tag);
+    }
+}
+
+test "parser: \\mathop is a roman operator word with no limits" {
+    // TeX's \mathop takes a math FIELD: \mathop{ab} wraps the group, while
+    // \mathop a takes the single bare atom. Either way the result is the
+    // `.opname` model — one child, laid out roman, class op — with `data` 0,
+    // i.e. NO display limits (unlike \lim, whose name is in limitOpName).
+    for ([_][]const u8{ "\\mathop{ab}", "\\mathop a" }) |src| {
+        var ast = try parseSrc(testing.allocator, src);
+        defer ast.deinit();
+        const opn = ast.node(ast.child(ast.root, 0));
+        try testing.expectEqual(.opname, opn.tag);
+        try testing.expectEqual(@as(u16, 1), opn.num_children);
+        try testing.expectEqual(@as(u32, 0), opn.data);
+    }
+    // \mathop\lim is the op word `lim` as a field, NOT the limit-taking
+    // `\lim` command (which is a different atom with its own limits).
+    var wrapped = try parseSrc(testing.allocator, "\\mathop\\lim");
+    defer wrapped.deinit();
+    const w = wrapped.node(wrapped.child(wrapped.root, 0));
+    try testing.expectEqual(.opname, w.tag);
+    try testing.expectEqual(@as(u32, 0), w.data);
+}
+
+test "parser: the \\mathXXX family wraps a math field in a class row" {
+    // A math FIELD, not a braced argument: `\mathord a` and `\mathbin{a}`
+    // both parse, and the wrapper carries the class in its `data` with the
+    // field as its ONLY child.
+    const cases = [_]struct { src: []const u8, cls: atom.MathClass }{
+        .{ .src = "\\mathord{a}", .cls = .ord },
+        .{ .src = "\\mathrel{a}", .cls = .rel },
+        .{ .src = "\\mathopen{a}", .cls = .open },
+        .{ .src = "\\mathclose{a}", .cls = .close },
+        .{ .src = "\\mathpunct{a}", .cls = .punct },
+        .{ .src = "\\mathinner{a}", .cls = .inner },
+        .{ .src = "\\mathord a", .cls = .ord },
+    };
+    for (cases) |c| {
+        var ast = try parseSrc(testing.allocator, c.src);
+        defer ast.deinit();
+        const row = ast.node(ast.child(ast.root, 0));
+        try testing.expectEqual(.row, row.tag);
+        try testing.expect(atom.isClassRow(row.data));
+        try testing.expectEqual(c.cls, atom.classRowClass(row.data));
+        try testing.expectEqual(@as(u16, 1), row.num_children);
+        try testing.expectEqual(atom.classRowData(c.cls), row.data);
+    }
+    try testing.expectError(error.MissingScript, parseSrc(testing.allocator, "\\mathrel"));
+}
+
+test "parser: \\colon is punctuation while a bare : is a plain char" {
+    // plain TeX: `\def\colon{\mathpunct{:}}`. The GLYPH is the same colon, so
+    // \colon is a class row around a `:` char leaf, while a typed `:` stays a
+    // bare char atom (whose class layout derives from the codepoint).
+    var ast = try parseSrc(testing.allocator, "a\\colon b");
+    defer ast.deinit();
+    const row_idx = ast.child(ast.root, 1);
+    const row = ast.node(row_idx);
+    try testing.expectEqual(.row, row.tag);
+    try testing.expectEqual(atom.classRowData(.punct), row.data);
+    const inner = ast.node(ast.child(row_idx, 0));
+    try testing.expectEqual(.char, inner.tag);
+    try testing.expectEqual(@as(u32, 0x3A), inner.data);
+
+    var plain = try parseSrc(testing.allocator, "a:b");
+    defer plain.deinit();
+    const colon = plain.node(plain.child(plain.root, 1));
+    try testing.expectEqual(.char, colon.tag);
+    try testing.expect(!atom.isClassRow(colon.data));
+}
+
+test "parser: the colon relation family maps to the unicode-math glyphs" {
+    // \coloneqq / \Coloneqq are mathtools' `:=` / `::=`, which unicode-math
+    // spells \coloneq (U+2254) and \Coloneq (U+2A74); Latin Modern Math has no
+    // U+2A74, so \Coloneqq falls back to the single-glyph COLON EQUALS. Every
+    // one of them is a plain char leaf — a relation, classified in layout.
+    const cases = [_]struct { src: []const u8, cp: u21 }{
+        .{ .src = "\\coloneqq", .cp = 0x2254 },
+        .{ .src = "\\coloneqqs", .cp = 0x2254 },
+        .{ .src = "\\Coloneqq", .cp = 0x2254 },
+        .{ .src = "\\Coloneqqs", .cp = 0x2254 },
+        .{ .src = "\\coloneq", .cp = 0x2255 },
+        .{ .src = "\\Colon", .cp = 0x2237 },
+        .{ .src = "\\ratio", .cp = 0x2236 },
+    };
+    for (cases) |c| {
+        var ast = try parseSrc(testing.allocator, c.src);
+        defer ast.deinit();
+        const leaf = ast.node(ast.child(ast.root, 0));
+        try testing.expectEqual(.char, leaf.tag);
+        try testing.expectEqual(c.cp, leaf.data);
+    }
+}
 
 test "parser: supported_commands is exactly the union of the four tables" {
     // 1. Every table key appears in the list — the tables are the source of

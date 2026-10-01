@@ -398,6 +398,12 @@ const table = [_]Entry{
     .{ .cp = 0x222E, .w = 6.65, .h = 0, .d = 11.11122, .ic = 3.32 }, // ∮ \oint
     .{ .cp = 0x2234, .w = 5.16, .h = 6.92241, .d = 0, .ic = 0 }, // ∴ \therefore (msam10 41)
     .{ .cp = 0x2235, .w = 5.16, .h = 6.92241, .d = 0, .ic = 0 }, // ∵ \because (msam10 42)
+    // The colon family: unicode-math-only glyphs (no CM slot), so the widths
+    // and the ink-derived h/d are Latin Modern Math's (fontTools hmtx + CFF
+    // bounds); all four sit with their ink between 0.078 and 0.422em above
+    // the baseline, so d = 0.
+    .{ .cp = 0x2236, .w = 2.78, .h = 4.22, .d = 0, .ic = 0 }, // ∶ \ratio (LM 0.278em)
+    .{ .cp = 0x2237, .w = 5.16, .h = 4.22, .d = 0, .ic = 0 }, // ∷ \Colon (LM 0.516em)
     .{ .cp = 0x223C, .w = 7.73, .h = 3.66875, .d = -1.33125, .ic = 0 }, // ∼ \sim (cmsy10 187)
     .{ .cp = 0x2240, .w = 2.8, .h = 6.94445, .d = 1.94443, .ic = 0 }, // ≀ \wr (cmsy10 111)
     .{ .cp = 0x2241, .w = 7.73, .h = 3.66875, .d = -1.33125, .ic = 0 }, // ≁ \nsim (msbm10 28)
@@ -410,6 +416,8 @@ const table = [_]Entry{
     .{ .cp = 0x2249, .w = 7.73, .h = 6.94444, .d = 1.94443, .ic = 0 }, // ≉ \napprox (composite: \not over ≈)
     .{ .cp = 0x224D, .w = 7.78, .h = 4.63748, .d = -0.36252, .ic = 0 }, // ≍ \asymp (cmsy10 179)
     .{ .cp = 0x2250, .w = 7.78, .h = 3.66875, .d = -1.33125, .ic = 0 }, // ≐ \doteq (dot-over-= composite)
+    .{ .cp = 0x2254, .w = 9.06, .h = 4.22, .d = 0, .ic = 0 }, // ⋔ \coloneqq (LM 0.906em)
+    .{ .cp = 0x2255, .w = 9.06, .h = 4.22, .d = 0, .ic = 0 }, // ⋕ \coloneq (LM 0.906em)
     .{ .cp = 0x2260, .w = 7.78, .h = 6.94445, .d = 1.94443, .ic = 0 }, // ≠ \ne (composite: \not over =)
     .{ .cp = 0x2261, .w = 7.78, .h = 4.63748, .d = -0.36252, .ic = 0 }, // ≡ \equiv (cmsy10 180)
     .{ .cp = 0x2262, .w = 7.78, .h = 6.94445, .d = 1.94443, .ic = 0 }, // ≢ \not\equiv (composite: \not over ≡)
@@ -1703,6 +1711,8 @@ const ink_table = [_]InkEntry{
     .{ .cp = 0x222E, .a = 0.805, .d = 0.306 }, // ∮
     .{ .cp = 0x2234, .a = 0.416, .d = 0.000 }, // ∴
     .{ .cp = 0x2235, .a = 0.416, .d = 0.000 }, // ∵
+    .{ .cp = 0x2236, .a = 0.422, .d = 0.000 }, // ∶
+    .{ .cp = 0x2237, .a = 0.422, .d = 0.000 }, // ∷
     .{ .cp = 0x223C, .a = 0.366, .d = 0.000 }, // ∼
     .{ .cp = 0x2240, .a = 0.583, .d = 0.083 }, // ≀
     .{ .cp = 0x2241, .a = 0.482, .d = 0.000 }, // ≁
@@ -1715,6 +1725,8 @@ const ink_table = [_]InkEntry{
     .{ .cp = 0x2249, .a = 0.603, .d = 0.103 }, // ≉
     .{ .cp = 0x224D, .a = 0.498, .d = 0.000 }, // ≍
     .{ .cp = 0x2250, .a = 0.601, .d = 0.000 }, // ≐
+    .{ .cp = 0x2254, .a = 0.422, .d = 0.000 }, // ⋔
+    .{ .cp = 0x2255, .a = 0.422, .d = 0.000 }, // ⋕
     .{ .cp = 0x2260, .a = 0.730, .d = 0.230 }, // ≠
     .{ .cp = 0x2261, .a = 0.464, .d = 0.000 }, // ≡
     .{ .cp = 0x2262, .a = 0.730, .d = 0.230 }, // ≢
@@ -2009,6 +2021,80 @@ pub fn bigOpInk(op: atom.BigOp, display: bool) BigOpInk {
             .desc = 0.306,
             .ic = 3.32,
         },
+        // The \bigXXX family and \bigstar: the BASE glyphs (fontTools
+        // hmtx + CFF bounds on latinmodern-math.otf 2.005 — ⨀/⨁/⨂ share
+        // one design, so do their numbers).
+        .bigodot, .bigoplus, .bigotimes => BigOpInk{
+            .advance = 1.111,
+            .disp_advance = 1.111,
+            .asc = 0.743,
+            .desc = 0.243,
+            .ic = 0,
+        }, // U+2A00/2A01/2A02 ⨀ ⨁ ⨂
+        .biguplus => BigOpInk{
+            .advance = 0.833,
+            .disp_advance = 0.833,
+            .asc = 0.750,
+            .desc = 0.272,
+            .ic = 0,
+        }, // U+2A04 ⨄
+        .bigsqcap => BigOpInk{
+            .advance = 0.833,
+            .disp_advance = 0.833,
+            .asc = 0.764,
+            .desc = 0.264,
+            .ic = 0,
+        }, // U+2A05 ⨅
+        .bigwedge => BigOpInk{
+            .advance = 0.833,
+            .disp_advance = 0.833,
+            .asc = 0.780,
+            .desc = 0.264,
+            .ic = 0,
+        }, // U+22C0 ⋀
+        .bigvee => BigOpInk{
+            .advance = 0.833,
+            .disp_advance = 0.833,
+            .asc = 0.764,
+            .desc = 0.280,
+            .ic = 0,
+        }, // U+22C1 ⋁
+        // U+22C6 ⋆ has no vertical size variant in Latin Modern Math, so
+        // the base glyph IS the display form (ic 0.025em = 0.25pt at 10pt).
+        .bigstar => BigOpInk{
+            .advance = 0.500,
+            .disp_advance = 0.500,
+            .asc = 0.486,
+            .desc = 0.000,
+            .ic = 0.25,
+        },
+        // The BIG integrals: the plain integral glyphs scaled by
+        // layout.bigOpScale (2.488 — the `bigints` package's \Huge), since
+        // Unicode has no big-integral codepoint. Every field is the plain
+        // integral's × 2.488: ∫ 0.665/0.805/0.306 and ic 0.332em (3.32pt at
+        // 10pt) → 1.655/2.003/0.761 and 8.26; ⯯ 1.035 and ⰰ 1.405 em
+        // advance (fontTools hmtx) keep their own ratios.
+        .bigint => BigOpInk{
+            .advance = 1.655,
+            .disp_advance = 1.655,
+            .asc = 2.003,
+            .desc = 0.761,
+            .ic = 8.26,
+        }, // U+222B ∫ × 2.488
+        .bigiint => BigOpInk{
+            .advance = 2.575,
+            .disp_advance = 2.575,
+            .asc = 2.003,
+            .desc = 0.761,
+            .ic = 8.26,
+        }, // U+222F ∯ × 2.488
+        .bigiiint => BigOpInk{
+            .advance = 3.496,
+            .disp_advance = 3.496,
+            .asc = 2.003,
+            .desc = 0.761,
+            .ic = 8.26,
+        }, // U+2230 ⰰ × 2.488
     };
     if (!display) return base;
     // Display variants (summation.v1, integral.v1, ... — hmtx advances and
@@ -2065,6 +2151,76 @@ pub fn bigOpInk(op: atom.BigOp, display: bool) BigOpInk {
             .desc = 0.861,
             .ic = 5.91,
         },
+        // The \bigXXX family in display: the .v1 of each ladder
+        // (uni2A00.v1 / uni2A01.v1 / uni2A02.v1 / uni2A04.v1 / uni2A05.v1 /
+        // uni22C0.v1 / uni22C1.v1 — hmtx advance and CFF ink, fontTools).
+        .bigodot, .bigoplus, .bigotimes => BigOpInk{
+            .advance = 1.511,
+            .disp_advance = 1.511,
+            .asc = 0.902,
+            .desc = 0.402,
+            .ic = 0,
+        }, // U+2A00/2A01/2A02 .v1
+        .biguplus => BigOpInk{
+            .advance = 1.111,
+            .disp_advance = 1.111,
+            .asc = 0.917,
+            .desc = 0.439,
+            .ic = 0,
+        }, // U+2A04 .v1
+        .bigsqcap => BigOpInk{
+            .advance = 1.111,
+            .disp_advance = 1.111,
+            .asc = 0.936,
+            .desc = 0.436,
+            .ic = 0,
+        }, // U+2A05 .v1
+        .bigwedge => BigOpInk{
+            .advance = 1.111,
+            .disp_advance = 1.111,
+            .asc = 0.958,
+            .desc = 0.436,
+            .ic = 0,
+        }, // U+22C0 .v1
+        .bigvee => BigOpInk{
+            .advance = 1.111,
+            .disp_advance = 1.111,
+            .asc = 0.936,
+            .desc = 0.458,
+            .ic = 0,
+        }, // U+22C1 .v1
+        // U+22C6 ⋆: no .v1, so the base glyph stands in for the display form
+        // (the rasterizer degrades a missing rung to the base glyph).
+        .bigstar => BigOpInk{
+            .advance = 0.500,
+            .disp_advance = 0.500,
+            .asc = 0.486,
+            .desc = 0.000,
+            .ic = 0.25,
+        },
+        // The BIG integrals have no .v1 either — the integral ladder is base
+        // + integral.v1 — so display keeps the scaled base row.
+        .bigint => BigOpInk{
+            .advance = 1.655,
+            .disp_advance = 1.655,
+            .asc = 2.003,
+            .desc = 0.761,
+            .ic = 8.26,
+        }, // U+222B ∫ × 2.488
+        .bigiint => BigOpInk{
+            .advance = 2.575,
+            .disp_advance = 2.575,
+            .asc = 2.003,
+            .desc = 0.761,
+            .ic = 8.26,
+        }, // U+222F ∯ × 2.488
+        .bigiiint => BigOpInk{
+            .advance = 3.496,
+            .disp_advance = 3.496,
+            .asc = 2.003,
+            .desc = 0.761,
+            .ic = 8.26,
+        }, // U+2230 ⰰ × 2.488
     };
 }
 
@@ -3044,6 +3200,7 @@ test "metrics: every roleOfCp math symbol resolves with real CM metrics" {
         0x2225, 0x2226, 0x2234, 0x2235, 0x224D, 0x2250, 0x226A, 0x226B, 0x2291,
         0x2292, 0x22A2, 0x22A3, 0x22A5, 0x22A8, 0x22C8, 0x2322, 0x2323, 0x27F5,
         0x27F6, 0x27F7, 0x27F8, 0x27F9, 0x27FA, 0x2AAF, 0x2AB0,
+        0x2236, 0x2237, 0x2254, 0x2255, // ∶ ∷ ⋔ ⋕ (the colon family)
     };
     const open = [_]u21{ 0x28, 0x5B, 0x7B, 0x27E8, 0x2308, 0x230A };
     const close = [_]u21{ 0x29, 0x5D, 0x7D, 0x27E9, 0x2309, 0x230B };

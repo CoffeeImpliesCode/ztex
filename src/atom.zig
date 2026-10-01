@@ -81,6 +81,22 @@ pub const BigOp = enum(u8) {
     oiint,
     oiiint,
     ointctrclockwise,
+    /// the \bigXXX n-ary family (\bigodot \bigoplus \bigotimes \biguplus
+    /// \bigsqcap \bigwedge \bigvee) plus \bigstar
+    bigodot,
+    bigoplus,
+    bigotimes,
+    biguplus,
+    bigsqcap,
+    bigwedge,
+    bigvee,
+    bigstar,
+    /// the BIG integrals: no single Unicode "big integral" exists, so these
+    /// draw the ordinary integral codepoints at a larger size (see
+    /// metrics.bigOpScale)
+    bigint,
+    bigiint,
+    bigiiint,
 };
 
 /// TeX math style. Layout's `Style` is an alias of this, so the parser can
@@ -92,6 +108,49 @@ pub const MathStyle = enum(u8) {
     script = 2,
     script_script = 3,
 };
+
+/// TeX math CLASS of an atom — the value the inter-atom glue table is
+/// indexed by (tex.web §799). Layout derives it per atom for a private
+/// mirror of the same eight classes; the parser records an EXPLICIT class
+/// (`\mathord` and friends, `\colon`) in a `.row` node's `data` (see
+/// `ClassBits`), so this enum is the parser's spelling of that table.
+pub const MathClass = enum(u8) {
+    ord,
+    op,
+    bin,
+    rel,
+    open,
+    close,
+    punct,
+    inner,
+};
+
+/// Encoding of a class override in a `.row` node's `data`: the low four
+/// bits carry the row marker, bits 8-10 the class. The marker is 13 — the
+/// fixed markers 0..12, the phantom family's bit 4 and the kern family's
+/// bit 5 are taken, so 13 is the first free value, and `data & 0xF == 13`
+/// is reachable only through this encoding (a phantom row is 16|keep, a
+/// kern row 32|unit).
+pub const ClassBits = struct {
+    pub const marker: u32 = 13;
+    pub const class_shift: u5 = 8;
+    pub const class_mask: u32 = 0x7;
+};
+
+/// The `data` of a class-override row (one child: the wrapped field).
+pub inline fn classRowData(cls: MathClass) u32 {
+    return ClassBits.marker | (@as(u32, @intFromEnum(cls)) << ClassBits.class_shift);
+}
+
+/// Whether a `.row` node's `data` carries a class override.
+pub inline fn isClassRow(data: u32) bool {
+    return data & 0xF == ClassBits.marker;
+}
+
+/// The class a class-override row reports on BOTH sides of its content.
+pub inline fn classRowClass(data: u32) MathClass {
+    return @enumFromInt((data >> ClassBits.class_shift) & ClassBits.class_mask);
+}
 
 /// Math environment kinds, packed into an `.env` node's `data` low bits.
 pub const EnvKind = enum(u8) {
