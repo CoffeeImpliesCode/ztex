@@ -472,7 +472,13 @@ pub const Ast = struct {
         });
     }
 
+    /// The node at `idx`. `layout.render` validates the whole tree at its
+    /// boundary, so this index is in range for anything that reached layout;
+    /// the assert catches a bad index on a hand-built tree in a debug or
+    /// safe build, and compiles out of ReleaseFast where the branch would
+    /// sit on the hottest accessor in layout.
     pub inline fn node(self: *const Ast, idx: u32) Node {
+        std.debug.assert(idx < self.nodes.items.len);
         return self.nodes.items[idx];
     }
 
@@ -613,4 +619,17 @@ test "ast: createNode accepts the maximum u16 child count" {
     defer testing.allocator.free(children);
     const row = try a.createNode(.row, 0, 0, children, 0);
     try testing.expectEqual(std.math.maxInt(u16), a.node(row).num_children);
+}
+
+test "ast: node accepts the last pool index (the guard must not be off by one)" {
+    var a = Ast.init(testing.allocator, "x");
+    defer a.deinit();
+
+    try a.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
+    const root = try a.createLeaf(.char, 0, 1, 0);
+    // The deepest legal index is the last slot of the pool; an off-by-one in
+    // the bound-check in `node` would reject it and break every real tree.
+    const last = @as(u32, @intCast(a.nodes.items.len - 1));
+    try testing.expectEqual(.char, a.node(last).tag);
+    try testing.expectEqual(@as(u16, 1), a.node(root).num_tokens);
 }

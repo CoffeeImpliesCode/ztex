@@ -3,7 +3,13 @@
 //! Facade over two independently usable modules:
 //! - `ztex.parse` — LaTeX source → superflat atom tree
 //! - `ztex.layout` — atom tree + font metrics → box tree → draw list
-
+//!
+//! Module weight: importing `ztex` pulls ~0.9 MiB of embedded Latin Modern
+//! faces (`font.zig` → `fonts/`), because the `Context` facade measures from
+//! them. `ztex.parse` and `ztex.layout` do NOT depend on `font.zig` — they
+//! reach real fonts through an opaque `metrics.FontHook`, so a host that only
+//! wants the static tables can import those two modules and never link the
+//! font bytes.
 const std = @import("std");
 
 pub const atom = @import("ztex.atom");

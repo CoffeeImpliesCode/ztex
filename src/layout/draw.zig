@@ -110,15 +110,36 @@ pub const Line = struct {
 /// (baseline at y = 0, left edge at x = 0):
 ///   - `width`/`height`/`depth` — the BOX bounds: the laid-out root box's
 ///     advance and design extents (set by the caller, e.g. layout/root.zig
-///     render from the root box; svg.zig draws the viewBox from these).
-///     Boxes deliberately under-bind the drawn ink (italic overhang, tall
-///     display variants), which is why svg.zig pads them heuristically.
+///     render from the root box). Boxes can under-bind the drawn ink
+///     (italic overhang past the advance, a display variant taller than its
+///     box) and can over-bind it (an alignment strut), so a frame drawn from
+///     them can either clip the ink or carry empty border; the consumers
+///     (svg.zig's viewBox, raster.zig's pixel buffer) frame from `bounds()`.
 ///   - `bounds()` — the INK bounds accumulated by `flatten`: the exact
 ///     vertical ink extents of every drawn glyph (char boxes carry the
 ///     drawn glyph's ink as their h/d) and the exact rect areas, with the
 ///     horizontal glyph extent taken from the advance box (the ink table
 ///     carries only asc/desc, so the true ink left/right edges are not
 ///     available).
+/// Exact INK bounds of everything `flatten` drew, relative to the root
+/// reference point. `min_x`/`min_y` are where that ink actually starts: the
+/// reference point is (0, 0) for a draw list whose first drawn primitive
+/// sits on it, but NOT in general — a fraction's first ink is its numerator,
+/// inset by TeX's 1.2pt nulldelimiterspace, so `min_x` is positive there. A
+/// consumer must offset by the origin, never assume it is zero.
+pub const InkBounds = struct {
+    /// x of the leftmost ink (not necessarily 0)
+    min_x: f32,
+    /// y of the topmost ink (not necessarily 0; negative = above baseline)
+    min_y: f32,
+    /// horizontal ink span
+    width: f32,
+    /// ink ascent above the baseline
+    height: f32,
+    /// ink descent below the baseline
+    depth: f32,
+};
+
 pub const DrawList = struct {
     gpa: std.mem.Allocator,
     items: std.ArrayList(Draw) = .empty,
@@ -158,21 +179,30 @@ pub const DrawList = struct {
         return self.items.items.len;
     }
 
-    /// Exact INK bounds of everything `flatten` drew, relative to the root
-    /// reference point: `width` = horizontal ink span, `height` = ink ascent
-    /// above the baseline, `depth` = ink descent below it; all zero for an
-    /// empty draw list. The `width`/`height`/`depth` FIELDS are the BOX
-    /// bounds — see the struct doc.
-    pub fn bounds(self: *const DrawList) struct { width: f32, height: f32, depth: f32 } {
-        if (!self.ink_valid) return .{ .width = 0, .height = 0, .depth = 0 };
+    /// Exact INK bounds of everything `flatten` drew (see `InkBounds`); all
+    /// zero for an empty draw list. The `width`/`height`/`depth` FIELDS are
+    /// the BOX bounds — see the struct doc.
+    pub fn bounds(self: *const DrawList) InkBounds {
+        if (!self.ink_valid) {
+            return .{ .min_x = 0, .min_y = 0, .width = 0, .height = 0, .depth = 0 };
+        }
         return .{
+            .min_x = self.ink_min_x,
+            .min_y = self.ink_min_y,
             .width = self.ink_max_x - self.ink_min_x,
             .height = -self.ink_min_y,
             .depth = self.ink_max_y,
         };
     }
 
-    fn accInk(self: *DrawList, x0: f32, y0: f32, x1: f32, y1: f32) void {
+    /// Union one drawn primitive's ink extent into the running bbox, in the
+    /// same coordinates as `add` (baseline-anchored: ascent is negative y).
+    /// `flatten` calls it for every primitive it adds, and every other
+    /// producer MUST do the same: a primitive recorded without its ink
+    /// leaves `bounds()` under-reporting, and the consumers that frame
+    /// from it (svg.zig's viewBox, raster.zig's pixel buffer) frame too
+    /// little.
+    pub fn accInk(self: *DrawList, x0: f32, y0: f32, x1: f32, y1: f32) void {
         if (!self.ink_valid) {
             self.ink_valid = true;
             self.ink_min_x = x0;
@@ -408,6 +438,10 @@ test "bounds: flatten accumulates the drawn ink extents" {
     try testing.expectApproxEqAbs(@as(f32, 4), b0.width, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 3), b0.height, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 0.5), b0.depth, 0.001);
+    // the origin is the ink's own corner, not the reference point: the
+    // glyph was drawn at x = 10
+    try testing.expectApproxEqAbs(@as(f32, 10), b0.min_x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, -3), b0.min_y, 0.001);
     const r = try list.createLeaf(.rule, 2.0, 1.0, 1.0, .{ .start = 0, .end = 1 });
     try flatten(&list, r, "x", 5, 30, &out);
     const b1 = out.bounds();
@@ -415,12 +449,15 @@ test "bounds: flatten accumulates the drawn ink extents" {
     try testing.expectApproxEqAbs(@as(f32, 9), b1.width, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 3), b1.height, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 31), b1.depth, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 5), b1.min_x, 0.001);
 }
 
 test "bounds: empty draw list reports zero" {
     var out = DrawList.init(testing.allocator);
     defer out.deinit();
     const b = out.bounds();
+    try testing.expectEqual(@as(f32, 0), b.min_x);
+    try testing.expectEqual(@as(f32, 0), b.min_y);
     try testing.expectEqual(@as(f32, 0), b.width);
     try testing.expectEqual(@as(f32, 0), b.height);
     try testing.expectEqual(@as(f32, 0), b.depth);

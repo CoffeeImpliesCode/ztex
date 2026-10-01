@@ -139,6 +139,15 @@ test "PixelBuffer.writePnm writes wide RGBA rows" {
     }
 }
 
+/// Where the draw list's ink origin (x = 0, y = the ink top) lands in the
+/// buffer, in points: the negative of the ink minimum, i.e. the same shift
+/// svg.zig applies to its viewBox origin. Applied before the pt→px scale and
+/// the pixel padding, so the two back ends frame the same content.
+const Origin = struct {
+    x: f32,
+    y: f32,
+};
+
 /// Rasterize a draw list using the font context's embedded/cached fonts.
 pub fn rasterize(
     gpa: std.mem.Allocator,
@@ -149,8 +158,13 @@ pub fn rasterize(
     const pt_to_px = (opts.dpi / 72.0) * opts.scale;
     const pad = opts.padding;
 
-    const content_w = @max(1.0, dl.width * pt_to_px);
-    const content_h = @max(1.0, (dl.height + dl.depth) * pt_to_px);
+    // Same basis as svg.zig's viewBox: the INK bounds, so a PNG and an SVG of
+    // one draw list cover the same content. `padding` and the 1px bearing
+    // below stay in pixels, as before.
+    const ink = dl.bounds();
+    const origin = Origin{ .x = -ink.min_x, .y = -ink.min_y };
+    const content_w = @max(1.0, ink.width * pt_to_px);
+    const content_h = @max(1.0, (ink.height + ink.depth) * pt_to_px);
     // Add 1px minimum bearing headroom to prevent subpixel antialiasing clamp at row 0
     const width = @as(u32, @intFromFloat(@ceil(content_w))) + 2 * pad + 1;
     const height = @as(u32, @intFromFloat(@ceil(content_h))) + 2 * pad + 1;
@@ -186,21 +200,33 @@ pub fn rasterize(
     for (dl.items.items) |d| {
         switch (d) {
             .text => |t| {
-                try drawGlyph(gpa, ctx, dl, pixels, width, height, stride, opts, t, pt_to_px, pad_f);
+                try drawGlyph(
+                    gpa,
+                    ctx,
+                    pixels,
+                    width,
+                    height,
+                    stride,
+                    opts,
+                    t,
+                    pt_to_px,
+                    pad_f,
+                    origin,
+                );
             },
             .rect => |r| {
-                const x0 = pad_f + r.x * pt_to_px;
-                const x1 = pad_f + (r.x + r.w) * pt_to_px;
-                const y0 = pad_f + (r.y + dl.height) * pt_to_px;
-                const y1 = pad_f + (r.y + r.h + dl.height) * pt_to_px;
+                const x0 = pad_f + (r.x + origin.x) * pt_to_px;
+                const x1 = pad_f + (r.x + r.w + origin.x) * pt_to_px;
+                const y0 = pad_f + (r.y + origin.y) * pt_to_px;
+                const y1 = pad_f + (r.y + r.h + origin.y) * pt_to_px;
                 fillRect(pixels, width, height, stride, opts, x0, x1, y0, y1);
             },
             .line => |l| {
                 const half = 0.5 * l.width;
-                const x0 = pad_f + (@min(l.x0, l.x1) - half) * pt_to_px;
-                const x1 = pad_f + (@max(l.x0, l.x1) + half) * pt_to_px;
-                const y0 = pad_f + (@min(l.y0, l.y1) - half + dl.height) * pt_to_px;
-                const y1 = pad_f + (@max(l.y0, l.y1) + half + dl.height) * pt_to_px;
+                const x0 = pad_f + (@min(l.x0, l.x1) - half + origin.x) * pt_to_px;
+                const x1 = pad_f + (@max(l.x0, l.x1) + half + origin.x) * pt_to_px;
+                const y0 = pad_f + (@min(l.y0, l.y1) - half + origin.y) * pt_to_px;
+                const y1 = pad_f + (@max(l.y0, l.y1) + half + origin.y) * pt_to_px;
                 fillRect(pixels, width, height, stride, opts, x0, x1, y0, y1);
             },
         }
@@ -216,10 +242,47 @@ pub fn rasterize(
     };
 }
 
+test "rasterize: the buffer is sized from the ink bounds, not the box bounds" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    var dl = draw.DrawList.init(testing.allocator);
+    defer dl.deinit();
+    // A 10 x 43 rule whose ink spans x ∈ [1.2, 11.2], y ∈ [−26, 17]: the
+    // reference point (0, 0) is NOT the ink origin, and the box bounds
+    // (zeros) under-bind the drawn ink.
+    try dl.add(.{ .rect = .{
+        .x = 1.2,
+        .y = -26,
+        .w = 10,
+        .h = 43,
+        .color = .{ .r = 0, .g = 0, .b = 0 },
+        .src_start = 0,
+        .src_end = 1,
+    } });
+    dl.accInk(1.2, -26, 11.2, 17);
+    var buf = try rasterize(testing.allocator, &ctx, &dl, .{ .dpi = 72, .format = .alpha8 });
+    defer buf.deinit();
+    // 1 px per pt at 72 dpi, plus the 1px bearing headroom past the ink
+    try testing.expectEqual(@as(u32, 11), buf.width);
+    try testing.expectEqual(@as(u32, 44), buf.height);
+    // The rule covers the ink box exactly: the ink origin shifted it into
+    // the top-left corner, and only the 1px headroom past the ink stays
+    // empty. A buffer sized from the box bounds would be 1x1, and one that
+    // ignored the ink origin would shift the rule off the left edge.
+    var inked: usize = 0;
+    for (0..buf.height) |y| {
+        for (0..buf.width) |x| {
+            const on = buf.pixels[y * buf.stride + x] != 0;
+            try testing.expectEqual(y != buf.height - 1 and x != buf.width - 1, on);
+            if (on) inked += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 43 * 10), inked);
+}
+
 fn drawGlyph(
     gpa: std.mem.Allocator,
     ctx: *context.Context,
-    dl: *const draw.DrawList,
     pixels: []u8,
     width: u32,
     height: u32,
@@ -228,6 +291,7 @@ fn drawGlyph(
     t: draw.Text,
     pt_to_px: f32,
     pad_f: f32,
+    origin: Origin,
 ) !void {
     const cp: u21 = blk: {
         if (t.bytes.len == 0) return;
@@ -388,9 +452,9 @@ fn drawGlyph(
     }
 
     const gscale = t.size * pt_to_px / @as(f32, @floatCast(@as(f64, @floatFromInt(face.unitsPerEm()))));
-    const ox = pad_f + t.x * pt_to_px;
+    const ox = pad_f + (t.x + origin.x) * pt_to_px;
     const h_f: f32 = @floatFromInt(height);
-    const ybase = h_f - (pad_f + (t.y + dl.height) * pt_to_px);
+    const ybase = h_f - (pad_f + (t.y + origin.y) * pt_to_px);
 
     var min_x: f32 = std.math.inf(f32);
     var max_x: f32 = -std.math.inf(f32);

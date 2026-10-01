@@ -57,6 +57,19 @@ const corpus = [_][]const u8{
     "x \\bmod y",
 };
 
+/// The focused SVG corpus of src/tests/regression.zig, with the padding each
+/// case renders at. Mirrors `regression.golden_svg`; that table cannot be
+/// regenerated from the breadth corpus above, so this section exists to keep
+/// it reproducible.
+const regression_corpus = [_]struct { src: []const u8, padding: f32 }{
+    .{ .src = "x", .padding = 0 },
+    .{ .src = "x^2", .padding = 0 },
+    .{ .src = "\\frac{1}{2}", .padding = 0 },
+    .{ .src = "\\sum_{i=1}^{n}", .padding = 0 },
+    .{ .src = "\\text{hi}", .padding = 0 },
+    .{ .src = "x^2", .padding = 5 },
+};
+
 fn dumpDraw(gpa: std.mem.Allocator, src: []const u8, size: f32) ![]u8 {
     var dl = try ztex.render(gpa, src, size, null);
     defer dl.deinit();
@@ -78,10 +91,10 @@ fn dumpDraw(gpa: std.mem.Allocator, src: []const u8, size: f32) ![]u8 {
     return buf.toOwnedSlice(gpa);
 }
 
-fn dumpSvgOnly(gpa: std.mem.Allocator, src: []const u8, size: f32) ![]u8 {
+fn dumpSvgOnly(gpa: std.mem.Allocator, src: []const u8, size: f32, padding: f32) ![]u8 {
     var dl = try ztex.render(gpa, src, size, null);
     defer dl.deinit();
-    const svg = try ztex.svg.render(gpa, &dl, .{ .padding = 0 });
+    const svg = try ztex.svg.render(gpa, &dl, .{ .padding = padding });
     defer gpa.free(svg);
     return ztex.svg.stripForGoldenSnapshot(gpa, svg);
 }
@@ -146,11 +159,28 @@ pub fn main() !void {
 
     std.debug.print("\n== svg goldens ==\n", .{});
     for (corpus) |src| {
-        const svg = try dumpSvgOnly(gpa, src, 20);
+        const svg = try dumpSvgOnly(gpa, src, 20, 0);
         defer gpa.free(svg);
         const esc = try zigEscape(gpa, src);
         defer gpa.free(esc);
         std.debug.print(".{{ .src = \"{s}\", .padding = 0, .svg =\n", .{esc});
+        var it = std.mem.splitScalar(u8, svg, '\n');
+        while (it.next()) |line| {
+            std.debug.print("    \\\\{s}\n", .{line});
+        }
+        std.debug.print("    }},\n", .{});
+    }
+
+    std.debug.print("\n== regression svg goldens ==\n", .{});
+    for (regression_corpus) |c| {
+        const svg = try dumpSvgOnly(gpa, c.src, 20, c.padding);
+        defer gpa.free(svg);
+        const esc = try zigEscape(gpa, c.src);
+        defer gpa.free(esc);
+        std.debug.print(
+            ".{{ .src = \"{s}\", .padding = {d}, .svg =\n",
+            .{ esc, @as(i32, @intFromFloat(c.padding)) },
+        );
         var it = std.mem.splitScalar(u8, svg, '\n');
         while (it.next()) |line| {
             std.debug.print("    \\\\{s}\n", .{line});

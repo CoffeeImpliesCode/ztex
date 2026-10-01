@@ -109,13 +109,14 @@ root-reachable subtree before use (`src/layout/root.zig:85`).
 
 ## M2. `Ast.child`, `Ast.node`, `BoxList.get` are unchecked; `child` reads across runs
 
-**Status: OPEN.** Two of the three are checked: `Ast.child` panics on an
-out-of-range index (`src/atom.zig:483`) and `BoxList.get` asserts
-(`src/layout/box.zig:166`). `Ast.node` is still a bare
-`self.nodes.items[idx]` with no bounds check (`src/atom.zig:475`), so a
-hand-built `Ast` with a bad index still reaches an unchecked read on the
-`node` path. In practice the layout-boundary validator rejects such a tree
-first (`src/layout/root.zig:85`), but the accessor itself is unguarded.
+**Status: LANDED.** All three are guarded. `Ast.node` carries a bounds assert
+(`src/atom.zig:480`) — compiled out of ReleaseFast, where the check would sit
+on the hottest accessor in layout, and measured to leave the benchmark
+unchanged. `Ast.child` panics on an out-of-range index (`src/atom.zig:489`)
+and `BoxList.get` asserts (`src/layout/box.zig:166`). The layout-boundary
+validator still rejects a malformed tree before layout runs
+(`src/layout/root.zig:86`), so the assert is a backstop for hand-built ASTs
+rather than the primary guard.
 
 ---
 
@@ -221,7 +222,7 @@ Three tests keep it honest: exact-union coverage
 | H2 | High | facade/main | parse error erased then hardcoded | LANDED |
 | H3 | High | svg/main | bad color → transparent | LANDED |
 | M1 | Medium | atom/box | `0` sentinel collides | LANDED (documented + checked) |
-| M2 | Medium | atom | unchecked `child`/`node`/`get` | OPEN (`Ast.node`) |
+| M2 | Medium | atom | unchecked `child`/`node`/`get` | LANDED |
 | M3 | Medium | box | `children()` slice invalidation | LANDED (documented) |
 | M4 | Medium | draw/context | by-value owning structs | LANDED (documented) |
 | M5 | Medium | draw | `Text.bytes` ownership | LANDED |
@@ -272,18 +273,17 @@ gone; it is now a documented one-line wrapper over the shared pipeline
 
 ## AI Slop
 
-### S1. Over-commenting: narration and repeated architecture boilerplate — **OPEN**
+### S1. Over-commenting: narration and repeated architecture boilerplate — **LANDED**
 
-Most of the named material is gone: the `atom.zig` header now states only
-the invariant that module owns (`src/atom.zig:1-7`), the `box.zig` and
-`draw.zig` headers are down to one and two lines
-(`src/layout/box.zig:1`, `src/layout/draw.zig:1-2`), and the restating
-accessor doc on `pushNode` is deleted (`src/atom.zig:424`).
-
-One instance of the exact boilerplate this finding named survives: the
-"house pattern, cf. `~/projects/{vain,skript}`" aside
-(`src/parse/lexer.zig:4`). See also `audit2.md` M8, which tracks the same
-narration.
+All of the named material is gone. The `atom.zig` header states only the
+invariant that module owns (`src/atom.zig:1-7`), the `box.zig` and `draw.zig`
+headers are down to one and two lines (`src/layout/box.zig:1`,
+`src/layout/draw.zig:1-2`), and the restating accessor doc on `pushNode` is
+deleted (`src/atom.zig:424`). The last survivor of the exact boilerplate — the
+"house pattern, cf. `~/projects/{vain,skript}`" aside — is gone from the lexer
+header (`src/parse/lexer.zig:1-6`), which now states only the token-table
+contract. The TeX-measured values, bit layouts, and ownership rules this
+finding said to keep are all still present. See also `audit2.md` M8.
 
 ### S2. Q16.16 fixed-point for space widths buys nothing, adds a UB surface — **LANDED**
 

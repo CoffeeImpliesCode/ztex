@@ -285,360 +285,321 @@ test "goldens: draw-list snapshots" {
 
 /// SVG snapshots at size_pt = 20, padding 0 (see regression.dumpSvg).
 pub const golden_svg = [_]struct { src: []const u8, padding: f32, svg: []const u8 }{
-    .{
-        .src = "\\frac{x^2+1}{x-1}",
-        .padding = 0,
-        .svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"59.308887pt\" " ++
-            "height=\"51.253178pt\" viewBox=\"0 0 59.308887 51.253178\">\n" ++
-            \\<text x="2.8pt" y="18.183998pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
-            \\<text x="14.559999pt" y="10.923998pt" font-size="14pt" font-style="italic" fill="#000000ff">2</text>
-            \\<text x="26.504444pt" y="18.183998pt" font-size="20pt" font-style="italic" fill="#000000ff">+</text>
-            \\<text x="46.508884pt" y="18.183998pt" font-size="20pt" font-style="italic" fill="#000000ff">1</text>
-            \\<rect x="2.8pt" y="26.31416pt" width="53.708885pt" height="0.8pt" fill="#000000ff"/>
-            \\<text x="6.7099977pt" y="45.433178pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
-            \\<text x="22.594442pt" y="45.433178pt" font-size="20pt" font-style="italic" fill="#000000ff">−</text>
-            \\<text x="42.598885pt" y="45.433178pt" font-size="20pt" font-style="italic" fill="#000000ff">1</text>
-            \\</svg>
-            \\
-        ,
+    .{ .src = "\\frac{x^2+1}{x-1}", .padding = 0, .svg =
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="56.908886pt" height="48.053185pt" viewBox="0 0 56.908886 48.053185">
+    \\<text x="1.5999999pt" y="16.584003pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<text x="13.359999pt" y="9.324001pt" font-size="14pt" font-style="italic" fill="#000000ff">2</text>
+    \\<text x="25.304443pt" y="16.584003pt" font-size="20pt" font-style="italic" fill="#000000ff">+</text>
+    \\<text x="45.308887pt" y="16.584003pt" font-size="20pt" font-style="italic" fill="#000000ff">1</text>
+    \\<rect x="1.5999999pt" y="24.714163pt" width="53.708885pt" height="0.8pt" fill="#000000ff"/>
+    \\<text x="5.5099974pt" y="43.833183pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<text x="21.394442pt" y="43.833183pt" font-size="20pt" font-style="italic" fill="#000000ff">−</text>
+    \\<text x="41.398888pt" y="43.833183pt" font-size="20pt" font-style="italic" fill="#000000ff">1</text>
+    \\</svg>
+    \\
     },
     .{ .src = "\\dfrac{a}{b}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="16.18pt" height="43.509182pt" viewBox="0 0 16.18 43.509182">
-    \\<text x="2.8pt" y="10.44pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑎</text>
-    \\<rect x="2.8pt" y="18.57016pt" width="10.58pt" height="0.8pt" fill="#000000ff"/>
-    \\<text x="3.8pt" y="37.68918pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑏</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="13.78pt" height="40.30918pt" viewBox="0 0 13.78 40.30918">
+    \\<text x="1.5999999pt" y="8.839999pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑎</text>
+    \\<rect x="1.5999999pt" y="16.97016pt" width="10.58pt" height="0.8pt" fill="#000000ff"/>
+    \\<text x="2.6pt" y="36.08918pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑏</text>
     \\</svg>
     \\
     },
     .{ .src = "\\cfrac{1}{a_1+\\cfrac{1}{a_2}}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="68.60889pt" height="87.25902pt" viewBox="0 0 68.60889 87.25902">
-    \\<text x="29.304447pt" y="18.399998pt" font-size="20pt" font-style="italic" fill="#000000ff">1</text>
-    \\<rect x="2.8pt" y="27.999998pt" width="63.008892pt" height="0.8pt" fill="#000000ff"/>
-    \\<text x="2.8pt" y="62.999996pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑎</text>
-    \\<text x="13.379999pt" y="67.939995pt" font-size="14pt" font-style="italic" fill="#000000ff">1</text>
-    \\<text x="25.324446pt" y="62.999996pt" font-size="20pt" font-style="italic" fill="#000000ff">+</text>
-    \\<text x="50.568893pt" y="47.999996pt" font-size="20pt" font-style="italic" fill="#000000ff">1</text>
-    \\<rect x="46.528893pt" y="57.6pt" width="18.08pt" height="0.8pt" fill="#000000ff"/>
-    \\<text x="46.528893pt" y="76.71902pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑎</text>
-    \\<text x="57.108894pt" y="81.65901pt" font-size="14pt" font-style="italic" fill="#000000ff">2</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="66.20889pt" height="80.57902pt" viewBox="0 0 66.20889 80.57902">
+    \\<text x="28.104446pt" y="13.32pt" font-size="20pt" font-style="italic" fill="#000000ff">1</text>
+    \\<rect x="1.5999999pt" y="22.92pt" width="63.008892pt" height="0.8pt" fill="#000000ff"/>
+    \\<text x="1.5999999pt" y="57.92pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑎</text>
+    \\<text x="12.179999pt" y="62.859997pt" font-size="14pt" font-style="italic" fill="#000000ff">1</text>
+    \\<text x="24.124445pt" y="57.92pt" font-size="20pt" font-style="italic" fill="#000000ff">+</text>
+    \\<text x="49.368896pt" y="42.92pt" font-size="20pt" font-style="italic" fill="#000000ff">1</text>
+    \\<rect x="45.328896pt" y="52.519997pt" width="18.08pt" height="0.8pt" fill="#000000ff"/>
+    \\<text x="45.328896pt" y="71.63902pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑎</text>
+    \\<text x="55.908897pt" y="76.57902pt" font-size="14pt" font-style="italic" fill="#000000ff">2</text>
     \\</svg>
     \\
     },
     .{ .src = "\\binom{n}{k}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="47.04pt" height="55.04pt" viewBox="0 0 47.04 55.04">
-    ++
-        "\n<text x=\"1.5999999pt\" y=\"30.52pt\" font-size=\"20pt\" " ++
-        "font-style=\"italic\" data-fixed-req=\"2.392\" data-delim-form=\"v6\" " ++
-        "fill=\"#000000ff\">(</text>\n" ++
-        \\<text x="17.52pt" y="16.989841pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑛</text>
-        \\<text x="18.310001pt" y="44.23902pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑘</text>
-    ++
-        "\n<text x=\"30.72pt\" y=\"30.52pt\" font-size=\"20pt\" " ++
-        "font-style=\"italic\" data-fixed-req=\"2.392\" data-delim-form=\"v6\" " ++
-        "fill=\"#000000ff\">)</text>\n" ++
-        \\</svg>
-        \\
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="47.04pt" height="51.84pt" viewBox="0 0 47.04 51.84">
+    \\<text x="1.5999999pt" y="28.92pt" font-size="20pt" font-style="italic" data-fixed-req="2.392" data-delim-form="v6" fill="#000000ff">(</text>
+    \\<text x="17.52pt" y="15.38984pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑛</text>
+    \\<text x="18.310001pt" y="42.63902pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑘</text>
+    \\<text x="30.72pt" y="28.92pt" font-size="20pt" font-style="italic" data-fixed-req="2.392" data-delim-form="v6" fill="#000000ff">)</text>
+    \\</svg>
+    \\
     },
     .{ .src = "\\sqrt{a^2+b^2}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="82.028885pt" height="32pt" viewBox="0 0 82.028885 32">
-    ++
-        "\n<text x=\"1.5999999pt\" y=\"19.4pt\" font-size=\"20pt\" " ++
-        "font-style=\"italic\" data-radical=\"v1\" fill=\"#000000ff\">√</text>\n" ++
-        \\<text x="21.6pt" y="23.002pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑎</text>
-        \\<text x="32.399998pt" y="17.222pt" font-size="14pt" font-style="italic" fill="#000000ff">2</text>
-        \\<text x="44.344444pt" y="23.002pt" font-size="20pt" font-style="italic" fill="#000000ff">+</text>
-        \\<text x="64.348885pt" y="23.002pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑏</text>
-        \\<text x="72.92889pt" y="17.222pt" font-size="14pt" font-style="italic" fill="#000000ff">2</text>
-        \\<rect x="21.6pt" y="2.3999996pt" width="58.828888pt" height="0.8pt" fill="#000000ff"/>
-        \\</svg>
-        \\
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="82.028885pt" height="28pt" viewBox="0 0 82.028885 28">
+    \\<text x="1.5999999pt" y="17pt" font-size="20pt" font-style="italic" data-radical="v1" fill="#000000ff">√</text>
+    \\<text x="21.6pt" y="20.602001pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑎</text>
+    \\<text x="32.399998pt" y="14.8220005pt" font-size="14pt" font-style="italic" fill="#000000ff">2</text>
+    \\<text x="44.344444pt" y="20.602001pt" font-size="20pt" font-style="italic" fill="#000000ff">+</text>
+    \\<text x="64.348885pt" y="20.602001pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑏</text>
+    \\<text x="72.92889pt" y="14.8220005pt" font-size="14pt" font-style="italic" fill="#000000ff">2</text>
+    \\<rect x="21.6pt" y="0pt" width="58.828888pt" height="0.8pt" fill="#000000ff"/>
+    \\</svg>
+    \\
     },
     .{ .src = "\\sqrt[3]{\\frac{a}{b}}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="36.18pt" height="56pt" viewBox="0 0 36.18 56">
-    ++
-        "\n<text x=\"1.5999999pt\" y=\"31.399998pt\" font-size=\"20pt\" " ++
-        "font-style=\"italic\" data-radical=\"v3\" fill=\"#000000ff\">√</text>\n" ++
-        \\<text x="22.800001pt" y="18.965408pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑎</text>
-        \\<rect x="22.800001pt" y="27.095568pt" width="10.58pt" height="0.8pt" fill="#000000ff"/>
-        \\<text x="23.800001pt" y="46.21459pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑏</text>
-        \\<rect x="21.6pt" y="2.3999977pt" width="12.98pt" height="0.8pt" fill="#000000ff"/>
-        \\<text x="3.6pt" y="24.700884pt" font-size="10pt" font-style="italic" fill="#000000ff">3</text>
-        \\</svg>
-        \\
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="36.18pt" height="52pt" viewBox="0 0 36.18 52">
+    \\<text x="1.5999999pt" y="29pt" font-size="20pt" font-style="italic" data-radical="v3" fill="#000000ff">√</text>
+    \\<text x="22.800001pt" y="16.56541pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑎</text>
+    \\<rect x="22.800001pt" y="24.69557pt" width="10.58pt" height="0.8pt" fill="#000000ff"/>
+    \\<text x="23.800001pt" y="43.81459pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑏</text>
+    \\<rect x="21.6pt" y="0pt" width="12.98pt" height="0.8pt" fill="#000000ff"/>
+    \\<text x="3.6pt" y="22.300886pt" font-size="10pt" font-style="italic" fill="#000000ff">3</text>
+    \\</svg>
+    \\
     },
     .{ .src = "\\left( \\frac{x+1}{x-1} \\right)", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="78.00889pt" height="49.970158pt" viewBox="0 0 78.00889 49.970158">
-    ++
-        "\n<text x=\"1.5999999pt\" y=\"28.45016pt\" font-size=\"20pt\" " ++
-        "font-style=\"italic\" data-delim-form=\"v5\" fill=\"#000000ff\">(</text>\n" ++
-        \\<text x="16.06pt" y="14.919999pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
-        \\<text x="31.944445pt" y="14.919999pt" font-size="20pt" font-style="italic" fill="#000000ff">+</text>
-        \\<text x="51.948887pt" y="14.919999pt" font-size="20pt" font-style="italic" fill="#000000ff">1</text>
-        \\<rect x="16.06pt" y="23.05016pt" width="45.88889pt" height="0.8pt" fill="#000000ff"/>
-        \\<text x="16.06pt" y="42.169178pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
-        \\<text x="31.944445pt" y="42.169178pt" font-size="20pt" font-style="italic" fill="#000000ff">−</text>
-        \\<text x="51.948887pt" y="42.169178pt" font-size="20pt" font-style="italic" fill="#000000ff">1</text>
-    ++
-        "\n<text x=\"63.148888pt\" y=\"28.45016pt\" font-size=\"20pt\" " ++
-        "font-style=\"italic\" data-delim-form=\"v5\" fill=\"#000000ff\">)</text>\n" ++
-        \\</svg>
-        \\
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="78.00889pt" height="46.770157pt" viewBox="0 0 78.00889 46.770157">
+    \\<text x="1.5999999pt" y="26.850159pt" font-size="20pt" font-style="italic" data-delim-form="v5" fill="#000000ff">(</text>
+    \\<text x="16.06pt" y="13.319999pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<text x="31.944445pt" y="13.319999pt" font-size="20pt" font-style="italic" fill="#000000ff">+</text>
+    \\<text x="51.948887pt" y="13.319999pt" font-size="20pt" font-style="italic" fill="#000000ff">1</text>
+    \\<rect x="16.06pt" y="21.45016pt" width="45.88889pt" height="0.8pt" fill="#000000ff"/>
+    \\<text x="16.06pt" y="40.56918pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<text x="31.944445pt" y="40.56918pt" font-size="20pt" font-style="italic" fill="#000000ff">−</text>
+    \\<text x="51.948887pt" y="40.56918pt" font-size="20pt" font-style="italic" fill="#000000ff">1</text>
+    \\<text x="63.148888pt" y="26.850159pt" font-size="20pt" font-style="italic" data-delim-form="v5" fill="#000000ff">)</text>
+    \\</svg>
+    \\
     },
-    .{
-        .src = "\\left| x^2 \\right|",
-        .padding = 0,
-        .svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"33.579998pt\" " ++
-            "height=\"31.240002pt\" viewBox=\"0 0 33.579998 31.240002\">\n" ++
-            "<text x=\"1.5999999pt\" y=\"18.62pt\" font-size=\"20pt\" " ++
-            "font-style=\"italic\" data-delim-form=\"v1\" fill=\"#000000ff\">|</text>\n" ++
-            \\<text x="7.16pt" y="18.62pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
-            \\<text x="18.92pt" y="11.360001pt" font-size="14pt" font-style="italic" fill="#000000ff">2</text>
-        ++
-            "\n<text x=\"26.419998pt\" y=\"18.62pt\" font-size=\"20pt\" " ++
-            "font-style=\"italic\" data-delim-form=\"v1\" fill=\"#000000ff\">|</text>\n" ++
-            \\</svg>
-            \\
-        ,
+    .{ .src = "\\left| x^2 \\right|", .padding = 0, .svg =
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="33.579998pt" height="28.04pt" viewBox="0 0 33.579998 28.04">
+    \\<text x="1.5999999pt" y="17.02pt" font-size="20pt" font-style="italic" data-delim-form="v1" fill="#000000ff">|</text>
+    \\<text x="7.16pt" y="17.02pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<text x="18.92pt" y="9.76pt" font-size="14pt" font-style="italic" fill="#000000ff">2</text>
+    \\<text x="26.419998pt" y="17.02pt" font-size="20pt" font-style="italic" data-delim-form="v1" fill="#000000ff">|</text>
+    \\</svg>
+    \\
     },
     .{ .src = "\\big( a+b \\big)", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="63.68889pt" height="29.079998pt" viewBox="0 0 63.68889 29.079998">
-    \\<text x="1.5999999pt" y="17.539999pt" font-size="20pt" font-style="italic" fill="#000000ff">(</text>
-    \\<text x="10.039999pt" y="17.539999pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑎</text>
-    \\<text x="25.064445pt" y="17.539999pt" font-size="20pt" font-style="italic" fill="#000000ff">+</text>
-    \\<text x="45.068886pt" y="17.539999pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑏</text>
-    \\<text x="53.648888pt" y="17.539999pt" font-size="20pt" font-style="italic" fill="#000000ff">)</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="63.68889pt" height="25.88pt" viewBox="0 0 63.68889 25.88">
+    \\<text x="1.5999999pt" y="15.94pt" font-size="20pt" font-style="italic" fill="#000000ff">(</text>
+    \\<text x="10.039999pt" y="15.94pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑎</text>
+    \\<text x="25.064445pt" y="15.94pt" font-size="20pt" font-style="italic" fill="#000000ff">+</text>
+    \\<text x="45.068886pt" y="15.94pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑏</text>
+    \\<text x="53.648888pt" y="15.94pt" font-size="20pt" font-style="italic" fill="#000000ff">)</text>
     \\</svg>
     \\
     },
     .{ .src = "\\left\\{ \\frac{a}{b} \\right\\}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="42.86pt" height="44.13902pt" viewBox="0 0 42.86 44.13902">
-    ++
-        "\n<text x=\"1.5999999pt\" y=\"24.6pt\" font-size=\"20pt\" " ++
-        "font-style=\"italic\" data-delim-form=\"v4\" fill=\"#000000ff\">{</text>\n" ++
-        \\<text x="16.14pt" y="11.06984pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑎</text>
-        \\<rect x="16.14pt" y="19.2pt" width="10.58pt" height="0.8pt" fill="#000000ff"/>
-        \\<text x="17.14pt" y="38.31902pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑏</text>
-    ++
-        "\n<text x=\"27.92pt\" y=\"24.6pt\" font-size=\"20pt\" " ++
-        "font-style=\"italic\" data-delim-form=\"v4\" " ++
-        "fill=\"#000000ff\">}</text>\n" ++
-        \\</svg>
-        \\
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="42.86pt" height="40.93902pt" viewBox="0 0 42.86 40.93902">
+    \\<text x="1.5999999pt" y="23pt" font-size="20pt" font-style="italic" data-delim-form="v4" fill="#000000ff">{</text>
+    \\<text x="16.14pt" y="9.46984pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑎</text>
+    \\<rect x="16.14pt" y="17.6pt" width="10.58pt" height="0.8pt" fill="#000000ff"/>
+    \\<text x="17.14pt" y="36.71902pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑏</text>
+    \\<text x="27.92pt" y="23pt" font-size="20pt" font-style="italic" data-delim-form="v4" fill="#000000ff">}</text>
+    \\</svg>
+    \\
     },
     .{ .src = "\\int_0^1 x^2\\,dx", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="78.91334pt" height="60.572pt" viewBox="0 0 78.91334 60.572">
-    \\<text x="1.5999999pt" y="34.643997pt" font-size="20pt" font-style="italic" fill="#000000ff">∫</text>
-    \\<text x="21.58pt" y="10.923998pt" font-size="14pt" font-style="italic" fill="#000000ff">1</text>
-    \\<text x="9.76pt" y="54.663994pt" font-size="14pt" font-style="italic" fill="#000000ff">0</text>
-    \\<text x="32.413334pt" y="34.643997pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
-    \\<text x="44.173332pt" y="27.383997pt" font-size="14pt" font-style="italic" fill="#000000ff">2</text>
-    \\<text x="54.993332pt" y="34.643997pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑑</text>
-    \\<text x="65.87334pt" y="34.643997pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="78.91334pt" height="57.371998pt" viewBox="0 0 78.91334 57.371998">
+    \\<text x="1.5999999pt" y="33.044pt" font-size="20pt" font-style="italic" fill="#000000ff">∫</text>
+    \\<text x="21.58pt" y="9.323999pt" font-size="14pt" font-style="italic" fill="#000000ff">1</text>
+    \\<text x="9.76pt" y="53.063995pt" font-size="14pt" font-style="italic" fill="#000000ff">0</text>
+    \\<text x="32.413334pt" y="33.044pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<text x="44.173332pt" y="25.783998pt" font-size="14pt" font-style="italic" fill="#000000ff">2</text>
+    \\<text x="54.993332pt" y="33.044pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑑</text>
+    \\<text x="65.87334pt" y="33.044pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
     \\</svg>
     \\
     },
     .{ .src = "\\prod_{i=1}^{n} i", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="38.993336pt" height="58.36pt" viewBox="0 0 38.993336 58.36">
-    \\<text x="10.18pt" y="7.788pt" font-size="14pt" font-style="italic" fill="#000000ff">𝑛</text>
-    \\<text x="1.5999999pt" y="30.942pt" font-size="20pt" font-style="italic" fill="#000000ff">∏</text>
-    \\<text x="3.0189996pt" y="52.606003pt" font-size="14pt" font-style="italic" fill="#000000ff">𝑖</text>
-    \\<text x="7.8489995pt" y="52.606003pt" font-size="14pt" font-style="italic" fill="#000000ff">=</text>
-    \\<text x="18.741pt" y="52.606003pt" font-size="14pt" font-style="italic" fill="#000000ff">1</text>
-    \\<text x="30.493334pt" y="30.942pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑖</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="38.993336pt" height="55.16pt" viewBox="0 0 38.993336 55.16">
+    \\<text x="10.18pt" y="6.1879997pt" font-size="14pt" font-style="italic" fill="#000000ff">𝑛</text>
+    \\<text x="1.5999999pt" y="29.342pt" font-size="20pt" font-style="italic" fill="#000000ff">∏</text>
+    \\<text x="3.0189996pt" y="51.006pt" font-size="14pt" font-style="italic" fill="#000000ff">𝑖</text>
+    \\<text x="7.8489995pt" y="51.006pt" font-size="14pt" font-style="italic" fill="#000000ff">=</text>
+    \\<text x="18.741pt" y="51.006pt" font-size="14pt" font-style="italic" fill="#000000ff">1</text>
+    \\<text x="30.493334pt" y="29.342pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑖</text>
     \\</svg>
     \\
     },
     .{ .src = "\\lim_{x \\to 0} \\frac{\\sin x}{x}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="75.11467pt" height="47.80918pt" viewBox="0 0 75.11467 47.80918">
-    \\<text x="3.3840003pt" y="28.27016pt" font-size="20pt" font-style="normal" fill="#000000ff">l</text>
-    \\<text x="8.384001pt" y="28.27016pt" font-size="20pt" font-style="normal" fill="#000000ff">i</text>
-    \\<text x="13.384001pt" y="28.27016pt" font-size="20pt" font-style="normal" fill="#000000ff">m</text>
-    \\<text x="1.5999999pt" y="40.934162pt" font-size="14pt" font-style="italic" fill="#000000ff">𝑥</text>
-    \\<text x="9.608pt" y="40.934162pt" font-size="14pt" font-style="italic" fill="#000000ff">→</text>
-    \\<text x="23.608pt" y="40.934162pt" font-size="14pt" font-style="italic" fill="#000000ff">0</text>
-    \\<text x="35.14133pt" y="14.740001pt" font-size="20pt" font-style="normal" fill="#000000ff">s</text>
-    \\<text x="42.32133pt" y="14.740001pt" font-size="20pt" font-style="normal" fill="#000000ff">i</text>
-    \\<text x="47.32133pt" y="14.740001pt" font-size="20pt" font-style="normal" fill="#000000ff">n</text>
-    \\<text x="60.874664pt" y="14.740001pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
-    \\<rect x="35.14133pt" y="22.870161pt" width="37.173336pt" height="0.8pt" fill="#000000ff"/>
-    \\<text x="48.008pt" y="41.98918pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="73.914665pt" height="44.60918pt" viewBox="0 0 73.914665 44.60918">
+    \\<text x="3.3840003pt" y="26.67016pt" font-size="20pt" font-style="normal" fill="#000000ff">l</text>
+    \\<text x="8.384001pt" y="26.67016pt" font-size="20pt" font-style="normal" fill="#000000ff">i</text>
+    \\<text x="13.384001pt" y="26.67016pt" font-size="20pt" font-style="normal" fill="#000000ff">m</text>
+    \\<text x="1.5999999pt" y="39.33416pt" font-size="14pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<text x="9.608pt" y="39.33416pt" font-size="14pt" font-style="italic" fill="#000000ff">→</text>
+    \\<text x="23.608pt" y="39.33416pt" font-size="14pt" font-style="italic" fill="#000000ff">0</text>
+    \\<text x="35.14133pt" y="13.14pt" font-size="20pt" font-style="normal" fill="#000000ff">s</text>
+    \\<text x="42.32133pt" y="13.14pt" font-size="20pt" font-style="normal" fill="#000000ff">i</text>
+    \\<text x="47.32133pt" y="13.14pt" font-size="20pt" font-style="normal" fill="#000000ff">n</text>
+    \\<text x="60.874664pt" y="13.14pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<rect x="35.14133pt" y="21.27016pt" width="37.173336pt" height="0.8pt" fill="#000000ff"/>
+    \\<text x="48.008pt" y="40.38918pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
     \\</svg>
     \\
     },
     .{ .src = "\\sum_{i=1}^{n} i^2", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="49.813335pt" height="58.36pt" viewBox="0 0 49.813335 58.36">
-    \\<text x="11.84pt" y="7.788pt" font-size="14pt" font-style="italic" fill="#000000ff">𝑛</text>
-    \\<text x="1.5999999pt" y="30.942pt" font-size="20pt" font-style="italic" fill="#000000ff">∑</text>
-    \\<text x="4.6790004pt" y="52.606003pt" font-size="14pt" font-style="italic" fill="#000000ff">𝑖</text>
-    \\<text x="9.509001pt" y="52.606003pt" font-size="14pt" font-style="italic" fill="#000000ff">=</text>
-    \\<text x="20.401001pt" y="52.606003pt" font-size="14pt" font-style="italic" fill="#000000ff">1</text>
-    \\<text x="33.81333pt" y="30.942pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑖</text>
-    \\<text x="40.713333pt" y="23.682pt" font-size="14pt" font-style="italic" fill="#000000ff">2</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="49.313335pt" height="55.16pt" viewBox="0 0 49.313335 55.16">
+    \\<text x="11.84pt" y="6.1879997pt" font-size="14pt" font-style="italic" fill="#000000ff">𝑛</text>
+    \\<text x="1.5999999pt" y="29.342pt" font-size="20pt" font-style="italic" fill="#000000ff">∑</text>
+    \\<text x="4.6790004pt" y="51.006pt" font-size="14pt" font-style="italic" fill="#000000ff">𝑖</text>
+    \\<text x="9.509001pt" y="51.006pt" font-size="14pt" font-style="italic" fill="#000000ff">=</text>
+    \\<text x="20.401001pt" y="51.006pt" font-size="14pt" font-style="italic" fill="#000000ff">1</text>
+    \\<text x="33.81333pt" y="29.342pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑖</text>
+    \\<text x="40.713333pt" y="22.081999pt" font-size="14pt" font-style="italic" fill="#000000ff">2</text>
     \\</svg>
     \\
     },
     .{ .src = "\\mathbb{R}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="16pt" height="27.2pt" viewBox="0 0 16 27.2">
-    \\<text x="1.5999999pt" y="16.6pt" font-size="20pt" font-style="normal" fill="#000000ff">ℝ</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="16pt" height="24pt" viewBox="0 0 16 24">
+    \\<text x="1.5999999pt" y="15pt" font-size="20pt" font-style="normal" fill="#000000ff">ℝ</text>
     \\</svg>
     \\
     },
     .{ .src = "\\mathbb{1}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="14.4pt" height="27.2pt" viewBox="0 0 14.4 27.2">
-    \\<text x="1.5999999pt" y="16.6pt" font-size="20pt" font-style="normal" fill="#000000ff">𝟙</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="14.4pt" height="24pt" viewBox="0 0 14.4 24">
+    \\<text x="1.5999999pt" y="15pt" font-size="20pt" font-style="normal" fill="#000000ff">𝟙</text>
     \\</svg>
     \\
     },
     .{ .src = "\\mathcal{L}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="15.7pt" height="20.86pt" viewBox="0 0 15.7 20.86">
-    \\<text x="1.5999999pt" y="15.26pt" font-size="20pt" font-style="normal" fill="#000000ff">L</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="15.7pt" height="17.66pt" viewBox="0 0 15.7 17.66">
+    \\<text x="1.5999999pt" y="13.660001pt" font-size="20pt" font-style="normal" fill="#000000ff">L</text>
     \\</svg>
     \\
     },
     .{ .src = "\\mathbf{x}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="13.76pt" height="15.82pt" viewBox="0 0 13.76 15.82">
-    ++
-        "\n<text x=\"1.5999999pt\" y=\"10.219999pt\" font-size=\"20pt\" " ++
-        "font-style=\"normal\" font-weight=\"bold\" fill=\"#000000ff\">x</text>\n" ++
-        \\</svg>
-        \\
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="13.76pt" height="12.62pt" viewBox="0 0 13.76 12.62">
+    \\<text x="1.5999999pt" y="8.62pt" font-size="20pt" font-style="normal" font-weight="bold" fill="#000000ff">x</text>
+    \\</svg>
+    \\
     },
     .{ .src = "\\hat{A}^{\\dagger}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="24.916pt" height="27.2pt" viewBox="0 0 24.916 27.2">
-    \\<text x="1.5999999pt" y="21.6pt" font-size="20pt" font-style="italic" fill="#000000ff">𝐴</text>
-    \\<text x="17.880001pt" y="16.279999pt" font-size="20pt" font-style="italic" fill="#000000ff">̂</text>
-    \\<text x="16.6pt" y="14.34pt" font-size="14pt" font-style="italic" fill="#000000ff">†</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="24.416pt" height="24pt" viewBox="0 0 24.416 24">
+    \\<text x="1.5999999pt" y="20pt" font-size="20pt" font-style="italic" fill="#000000ff">𝐴</text>
+    \\<text x="17.880001pt" y="14.679999pt" font-size="20pt" font-style="italic" fill="#000000ff">̂</text>
+    \\<text x="16.6pt" y="12.74pt" font-size="14pt" font-style="italic" fill="#000000ff">†</text>
     \\</svg>
     \\
     },
     .{ .src = "\\bar{x}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="14.639999pt" height="20.22pt" viewBox="0 0 14.639999 20.22">
-    \\<text x="1.5999999pt" y="14.4pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
-    \\<text x="13.459999pt" y="14.4pt" font-size="20pt" font-style="italic" fill="#000000ff">̄</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="15.059999pt" height="17.02pt" viewBox="0 0 15.059999 17.02">
+    \\<text x="1.5999999pt" y="12.799999pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<text x="13.459999pt" y="12.799999pt" font-size="20pt" font-style="italic" fill="#000000ff">̄</text>
     \\</svg>
     \\
     },
     .{ .src = "\\vec{v}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="12.9pt" height="21.64pt" viewBox="0 0 12.9 21.64">
-    \\<text x="1.5999999pt" y="15.82pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑣</text>
-    \\<text x="12.76pt" y="15.82pt" font-size="20pt" font-style="italic" fill="#000000ff">⃗</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="14.36pt" height="18.44pt" viewBox="0 0 14.36 18.44">
+    \\<text x="1.5999999pt" y="14.22pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑣</text>
+    \\<text x="12.76pt" y="14.22pt" font-size="20pt" font-style="italic" fill="#000000ff">⃗</text>
     \\</svg>
     \\
     },
     .{ .src = "\\dot{q}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="12.12pt" height="24.619999pt" viewBox="0 0 12.12 24.619999">
-    \\<text x="1.5999999pt" y="15.139999pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑞</text>
-    \\<text x="13.860001pt" y="15.139999pt" font-size="20pt" font-style="italic" fill="#000000ff">̇</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="15.46pt" height="21.42pt" viewBox="0 0 15.46 21.42">
+    \\<text x="1.5999999pt" y="13.54pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑞</text>
+    \\<text x="13.860001pt" y="13.54pt" font-size="20pt" font-style="italic" fill="#000000ff">̇</text>
     \\</svg>
     \\
     },
     .{ .src = "\\tilde{n}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="15.2pt" height="22.34pt" viewBox="0 0 15.2 22.34">
-    \\<text x="1.5999999pt" y="16.52pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑛</text>
-    \\<text x="12.18pt" y="16.52pt" font-size="20pt" font-style="italic" fill="#000000ff">̃</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="15.2pt" height="19.14pt" viewBox="0 0 15.2 19.14">
+    \\<text x="1.5999999pt" y="14.92pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑛</text>
+    \\<text x="12.18pt" y="14.92pt" font-size="20pt" font-style="italic" fill="#000000ff">̃</text>
     \\</svg>
     \\
     },
     .{ .src = "\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="64.1pt" height="55.2pt" viewBox="0 0 64.1 55.2">
-    ++
-        "\n<text x=\"1.5999999pt\" y=\"30.6pt\" font-size=\"20pt\" " ++
-        "font-style=\"italic\" data-delim-form=\"v6\" fill=\"#000000ff\">(</text>\n" ++
-        \\<text x="16.32pt" y="18.4pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑎</text>
-        \\<text x="37.91pt" y="18.4pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑏</text>
-        \\<text x="17.03pt" y="42.4pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑐</text>
-        \\<text x="36.899998pt" y="42.4pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑑</text>
-    ++
-        "\n<text x=\"47.78pt\" y=\"30.6pt\" font-size=\"20pt\" " ++
-        "font-style=\"italic\" data-delim-form=\"v6\" " ++
-        "fill=\"#000000ff\">)</text>\n" ++
-        \\</svg>
-        \\
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="64.1pt" height="51.84pt" viewBox="0 0 64.1 51.84">
+    \\<text x="1.5999999pt" y="28.92pt" font-size="20pt" font-style="italic" data-delim-form="v6" fill="#000000ff">(</text>
+    \\<text x="16.32pt" y="16.72pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑎</text>
+    \\<text x="37.91pt" y="16.72pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑏</text>
+    \\<text x="17.03pt" y="40.72pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑐</text>
+    \\<text x="36.899998pt" y="40.72pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑑</text>
+    \\<text x="47.78pt" y="28.92pt" font-size="20pt" font-style="italic" data-delim-form="v6" fill="#000000ff">)</text>
+    \\</svg>
+    \\
     },
     .{ .src = "\\begin{cases} x & x>0 \\\\ -x & x\\le 0 \\end{cases}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="116.35111pt" height="67.2pt" viewBox="0 0 116.35111 67.2">
-    ++
-        "\n<text x=\"1.5999999pt\" y=\"36.6pt\" font-size=\"20pt\" " ++
-        "font-style=\"italic\" data-delim-form=\"v7\" fill=\"#000000ff\">{</text>\n" ++
-        \\<text x="19.640001pt" y="22.96pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
-        \\<text x="66.64pt" y="22.96pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
-        \\<text x="83.63555pt" y="22.96pt" font-size="20pt" font-style="italic" fill="#000000ff">&gt;</text>
-        \\<text x="104.751114pt" y="22.96pt" font-size="20pt" font-style="italic" fill="#000000ff">0</text>
-        \\<text x="19.640001pt" y="51.76pt" font-size="20pt" font-style="italic" fill="#000000ff">−</text>
-        \\<text x="35.2pt" y="51.76pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
-        \\<text x="66.64pt" y="51.76pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
-        \\<text x="83.63555pt" y="51.76pt" font-size="20pt" font-style="italic" fill="#000000ff">≤</text>
-        \\<text x="104.751114pt" y="51.76pt" font-size="20pt" font-style="italic" fill="#000000ff">0</text>
-        \\</svg>
-        \\
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="116.35111pt" height="64pt" viewBox="0 0 116.35111 64">
+    \\<text x="1.5999999pt" y="35pt" font-size="20pt" font-style="italic" data-delim-form="v7" fill="#000000ff">{</text>
+    \\<text x="19.640001pt" y="21.36pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<text x="66.64pt" y="21.36pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<text x="83.63555pt" y="21.36pt" font-size="20pt" font-style="italic" fill="#000000ff">&gt;</text>
+    \\<text x="104.751114pt" y="21.36pt" font-size="20pt" font-style="italic" fill="#000000ff">0</text>
+    \\<text x="19.640001pt" y="50.16pt" font-size="20pt" font-style="italic" fill="#000000ff">−</text>
+    \\<text x="35.2pt" y="50.16pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<text x="66.64pt" y="50.16pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<text x="83.63555pt" y="50.16pt" font-size="20pt" font-style="italic" fill="#000000ff">≤</text>
+    \\<text x="104.751114pt" y="50.16pt" font-size="20pt" font-style="italic" fill="#000000ff">0</text>
+    \\</svg>
+    \\
     },
     .{ .src = "\\alpha + \\beta \\le \\gamma", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="90.02pt" height="25.619999pt" viewBox="0 0 90.02 25.619999">
-    \\<text x="1.5999999pt" y="15.719999pt" font-size="20pt" font-style="italic" fill="#000000ff">α</text>
-    \\<text x="18.864445pt" y="15.719999pt" font-size="20pt" font-style="italic" fill="#000000ff">+</text>
-    \\<text x="38.86889pt" y="15.719999pt" font-size="20pt" font-style="italic" fill="#000000ff">β</text>
-    \\<text x="55.584442pt" y="15.719999pt" font-size="20pt" font-style="italic" fill="#000000ff">≤</text>
-    \\<text x="76.7pt" y="15.719999pt" font-size="20pt" font-style="italic" fill="#000000ff">γ</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="90.02pt" height="22.419998pt" viewBox="0 0 90.02 22.419998">
+    \\<text x="1.5999999pt" y="14.119999pt" font-size="20pt" font-style="italic" fill="#000000ff">α</text>
+    \\<text x="18.864445pt" y="14.119999pt" font-size="20pt" font-style="italic" fill="#000000ff">+</text>
+    \\<text x="38.86889pt" y="14.119999pt" font-size="20pt" font-style="italic" fill="#000000ff">β</text>
+    \\<text x="55.584442pt" y="14.119999pt" font-size="20pt" font-style="italic" fill="#000000ff">≤</text>
+    \\<text x="76.7pt" y="14.119999pt" font-size="20pt" font-style="italic" fill="#000000ff">γ</text>
     \\</svg>
     \\
     },
     .{ .src = "x \\in \\mathbb{R}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="51.891113pt" height="27.2pt" viewBox="0 0 51.891113 27.2">
-    \\<text x="1.5999999pt" y="16.6pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
-    \\<text x="18.595556pt" y="16.6pt" font-size="20pt" font-style="italic" fill="#000000ff">∈</text>
-    \\<text x="37.49111pt" y="16.6pt" font-size="20pt" font-style="normal" fill="#000000ff">ℝ</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="51.891113pt" height="24pt" viewBox="0 0 51.891113 24">
+    \\<text x="1.5999999pt" y="15pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<text x="18.595556pt" y="15pt" font-size="20pt" font-style="italic" fill="#000000ff">∈</text>
+    \\<text x="37.49111pt" y="15pt" font-size="20pt" font-style="normal" fill="#000000ff">ℝ</text>
     \\</svg>
     \\
     },
-    .{ .src = "x \\neq y", .padding = 0, .svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"51.111115pt\" " ++
-        "height=\"26.400002pt\" viewBox=\"0 0 51.111115 26.400002\">\n" ++
-        \\<text x="1.5999999pt" y="16.2pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
-        \\<text x="18.595556pt" y="16.2pt" font-size="20pt" font-style="italic" fill="#000000ff">≠</text>
-        \\<text x="39.711113pt" y="16.2pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑦</text>
-        \\</svg>
-        \\
+    .{ .src = "x \\neq y", .padding = 0, .svg =
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="51.111115pt" height="23.2pt" viewBox="0 0 51.111115 23.2">
+    \\<text x="1.5999999pt" y="14.6pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<text x="18.595556pt" y="14.6pt" font-size="20pt" font-style="italic" fill="#000000ff">≠</text>
+    \\<text x="39.711113pt" y="14.6pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑦</text>
+    \\</svg>
+    \\
     },
     .{ .src = "e^{i\\theta}", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="24.682pt" height="24.55pt" viewBox="0 0 24.682 24.55">
-    \\<text x="1.5999999pt" y="18.730001pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑒</text>
-    \\<text x="10.92pt" y="11.470001pt" font-size="14pt" font-style="italic" fill="#000000ff">𝑖</text>
-    \\<text x="15.75pt" y="11.470001pt" font-size="14pt" font-style="italic" fill="#000000ff">θ</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="24.182pt" height="21.35pt" viewBox="0 0 24.182 21.35">
+    \\<text x="1.5999999pt" y="17.130001pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑒</text>
+    \\<text x="10.92pt" y="9.870001pt" font-size="14pt" font-style="italic" fill="#000000ff">𝑖</text>
+    \\<text x="15.75pt" y="9.870001pt" font-size="14pt" font-style="italic" fill="#000000ff">θ</text>
     \\</svg>
     \\
     },
     .{ .src = "a\\,b", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="25.68pt" height="21.3pt" viewBox="0 0 25.68 21.3">
-    \\<text x="1.5999999pt" y="15.48pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑎</text>
-    \\<text x="15.5pt" y="15.48pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑏</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="25.68pt" height="18.1pt" viewBox="0 0 25.68 18.1">
+    \\<text x="1.5999999pt" y="13.88pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑎</text>
+    \\<text x="15.5pt" y="13.88pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑏</text>
     \\</svg>
     \\
     },
     .{ .src = "x \\quad y", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="44.44pt" height="20.14pt" viewBox="0 0 44.44 20.14">
-    \\<text x="1.5999999pt" y="10.440001pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
-    \\<text x="33.039997pt" y="10.440001pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑦</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="44.44pt" height="16.94pt" viewBox="0 0 44.44 16.94">
+    \\<text x="1.5999999pt" y="8.84pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<text x="33.039997pt" y="8.84pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑦</text>
     \\</svg>
     \\
     },
     .{ .src = "x \\pmod n", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="92.59555pt" height="27.120003pt" viewBox="0 0 92.59555 27.120003">
-    \\<text x="1.5999999pt" y="16.560001pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
-    \\<text x="21.928888pt" y="16.560001pt" font-size="20pt" font-style="italic" fill="#000000ff">(</text>
-    \\<text x="29.70889pt" y="16.560001pt" font-size="20pt" font-style="normal" fill="#000000ff">m</text>
-    \\<text x="45.148888pt" y="16.560001pt" font-size="20pt" font-style="normal" fill="#000000ff">o</text>
-    \\<text x="54.328888pt" y="16.560001pt" font-size="20pt" font-style="normal" fill="#000000ff">d</text>
-    \\<text x="71.21555pt" y="16.560001pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑛</text>
-    \\<text x="83.21555pt" y="16.560001pt" font-size="20pt" font-style="italic" fill="#000000ff">)</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="92.59555pt" height="23.920002pt" viewBox="0 0 92.59555 23.920002">
+    \\<text x="1.5999999pt" y="14.960001pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<text x="21.928888pt" y="14.960001pt" font-size="20pt" font-style="italic" fill="#000000ff">(</text>
+    \\<text x="29.70889pt" y="14.960001pt" font-size="20pt" font-style="normal" fill="#000000ff">m</text>
+    \\<text x="45.148888pt" y="14.960001pt" font-size="20pt" font-style="normal" fill="#000000ff">o</text>
+    \\<text x="54.328888pt" y="14.960001pt" font-size="20pt" font-style="normal" fill="#000000ff">d</text>
+    \\<text x="71.21555pt" y="14.960001pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑛</text>
+    \\<text x="83.21555pt" y="14.960001pt" font-size="20pt" font-style="italic" fill="#000000ff">)</text>
     \\</svg>
     \\
     },
     .{ .src = "x \\bmod y", .padding = 0, .svg =
-    \\<svg xmlns="http://www.w3.org/2000/svg" width="70.39111pt" height="25.18pt" viewBox="0 0 70.39111 25.18">
-    \\<text x="1.5999999pt" y="15.48pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
-    \\<text x="18.595556pt" y="15.48pt" font-size="20pt" font-style="normal" fill="#000000ff">m</text>
-    \\<text x="34.035553pt" y="15.48pt" font-size="20pt" font-style="normal" fill="#000000ff">o</text>
-    \\<text x="43.215553pt" y="15.48pt" font-size="20pt" font-style="normal" fill="#000000ff">d</text>
-    \\<text x="58.99111pt" y="15.48pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑦</text>
+    \\<svg xmlns="http://www.w3.org/2000/svg" width="70.39111pt" height="21.98pt" viewBox="0 0 70.39111 21.98">
+    \\<text x="1.5999999pt" y="13.88pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑥</text>
+    \\<text x="18.595556pt" y="13.88pt" font-size="20pt" font-style="normal" fill="#000000ff">m</text>
+    \\<text x="34.035553pt" y="13.88pt" font-size="20pt" font-style="normal" fill="#000000ff">o</text>
+    \\<text x="43.215553pt" y="13.88pt" font-size="20pt" font-style="normal" fill="#000000ff">d</text>
+    \\<text x="58.99111pt" y="13.88pt" font-size="20pt" font-style="italic" fill="#000000ff">𝑦</text>
     \\</svg>
     \\
     },

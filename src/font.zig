@@ -17,8 +17,8 @@
 //!
 //! All values returned in "em" units are font-relative (value ÷ unitsPerEm),
 //! so callers multiply by the desired size in points. Every number asserted
-//! in the tests below was measured from the real fonts (see
-//! notes/font-context.md for the measurement method).
+//! in the tests below was measured from the real fonts with fontTools, then
+//! cross-checked against this parser's own tables.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -1934,8 +1934,8 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 
 // ── tests ────────────────────────────────
 // Expected values below were measured from the real OTF files (fontTools +
-// the byte-level parser in this module cross-checked byte-for-byte; see
-// notes/font-context.md). Nothing is guessed.
+// the byte-level parser in this module cross-checked byte-for-byte).
+// Nothing is guessed.
 
 const testing = std.testing;
 

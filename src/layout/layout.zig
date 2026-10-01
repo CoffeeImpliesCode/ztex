@@ -1770,8 +1770,8 @@ fn charIc(
 /// close?], each row a `.row` of cell atoms): the matrix family (matrix /
 /// pmatrix / bmatrix / Bmatrix / vmatrix / Vmatrix), cases, aligned and
 /// array. Every geometry constant below was verified against the
-/// XeTeX+unicode-math reference (\showbox at 10pt + per-glyph extraction
-/// at 36pt; see notes/feat-envs.md):
+/// XeTeX+unicode-math reference (\showbox at 10pt plus per-glyph extraction
+/// at 36pt):
 ///   · CELLS lay out at the current style/size. cases forces its SECOND
 ///     column to text style (per the feature spec; TeX's \array sets ALL
 ///     cells in $...$ text style — a nuance that only shows in

@@ -113,21 +113,30 @@ treats everything else as a parse error (`src/main.zig:122-135`).
 
 ### M4. `svg.writeFile` hardcodes cwd; fs in the library module — **LANDED**
 
-`writeFile` takes an explicit `std.Io.Dir` (`src/svg.zig:194`); `render`
+`writeFile` takes an explicit `std.Io.Dir` (`src/svg.zig:222`); `render`
 stays pure (`src/svg.zig:54`). The CLI passes `std.Io.Dir.cwd()` explicitly
 (`src/main.zig:162`).
 
-### M5. No exact ink-bounds API; heuristic svg margins — **OPEN** (half landed)
+### M5. No exact ink-bounds API; heuristic svg margins — **LANDED**
 
-The API landed: `flatten` accumulates an ink bbox
-(`src/layout/draw.zig:134`) exposed through `DrawList.bounds()`
-(`src/layout/draw.zig:160`, `src/layout/draw.zig:166`), and the struct doc
-distinguishes the box bounds from the ink bounds
-(`src/layout/draw.zig:109`).
+`DrawList.bounds()` now returns a named `InkBounds`
+(`src/layout/draw.zig:130`) carrying `min_x`/`min_y` alongside the span, and
+both consumers frame from it. `svg.render` builds the viewBox, the baseline
+offset, and every primitive shift from the ink bbox
+(`src/svg.zig:66`), offsetting by the ink ORIGIN rather than assuming it is
+zero — a fraction's first ink is its numerator inset by TeX's nulldelimiterspace,
+so `min_x` is positive there. `raster.rasterize` uses the same basis with a
+private `Origin` (`src/raster.zig:146`), so SVG and raster agree on the content
+extent.
 
-The payoff did not: `svg.render` still builds its viewBox from the box
-bounds plus a heuristic `0.08 × max_size` margin and a `0.2em` lineGap
-(`src/svg.zig:62`) and never calls `bounds()`.
+The heuristic vertical margin is gone: vertical ink extents are exact (a char
+box's h/d IS the drawn glyph's ink), so the ink top now lands on the frame
+edge. Two terms survive with stated reasons — horizontal advance-box slack,
+because the accumulated ink's horizontal extent is the glyph ADVANCE rather
+than the true ink edge, and the browser lineGap below the baseline, because
+bounding only the glyph ink clips the bottom in a browser. Measured effect at
+20pt: frames are 3.2pt (= 2 × 0.08em) shorter, and 2 of the 5 regression
+formulas also tightened horizontally where the box over-bound.
 
 ### M6. Magic-number drift: same constant in two+ places — **LANDED**
 
@@ -167,14 +176,16 @@ the rasterizer scales glyph outlines by it in production
 (`src/raster.zig:390`). `ascenderEm`/`descenderEm` are likewise used in
 production (`src/font.zig:1904`). No accessor in this group is dead.
 
-### M8 (slop). Duplicated fraction comment + S1 narration remainder — **OPEN**
+### M8 (slop). Duplicated fraction comment + S1 narration remainder — **LANDED**
 
 The repeated module headers were trimmed to their load-bearing minimum
 (`src/layout/box.zig:1`, `src/layout/draw.zig:1-2`, `src/atom.zig:1-7`) and
 the restating accessor doc on `pushNode` is gone
-(`src/atom.zig:424`). The house-pattern boilerplate this finding named
-survives in exactly one place: the "house pattern, cf." aside
-(`src/parse/lexer.zig:4`). Same open item as `audit.md` S1.
+(`src/atom.zig:424`). The last "house pattern, cf." aside is gone from the
+lexer header (`src/parse/lexer.zig:1-6`), which now states only the token-table
+contract. The stale "previous `Utf8View.init(...)` fallback" narration on
+`firstCodepoint` was rewritten to describe the current decode rule
+(`src/layout/layout.zig:528`). Same items as `audit.md` S1.
 
 ---
 
@@ -182,8 +193,9 @@ survives in exactly one place: the "house pattern, cf." aside
 
 - **DrawList ink bounds undocumented** — **LANDED**. Both bound sources and
   their difference are documented on the struct (`src/layout/draw.zig:109`)
-  and on the accessor (`src/layout/draw.zig:160`). The remaining
-  heuristic-margin problem is tracked by M5.
+  and on the accessor (`src/layout/draw.zig:185`); `InkBounds` itself
+  documents the non-zero-origin case (`src/layout/draw.zig:124`). The margin
+  problem this deferred to M5 is closed there.
 - **err_info out-param ceremony tripled** — **LANDED**. One `?*parse.Info`
   parameter, threaded through `renderPipeline` (`src/root.zig:36`).
 - **Context non-copyable by doc only** — **LANDED**. Stated at
@@ -192,20 +204,28 @@ survives in exactly one place: the "house pattern, cf." aside
   `src/layout/draw.zig:104`, `src/layout/box.zig:138`).
 - **svg.render anyerror → closed set** — **LANDED**
   (`src/svg.zig:58`, `error{ OutOfMemory, NonFiniteCoordinate }`).
-- **Zig 0.16.0 exact pin + zg from codeberg, no C ABI** — **OPEN**. The pin
-  landed (`minimum_zig_version = "0.16.0"`, `build.zig.zon:5`; zg v0.16.2
-  from codeberg, `build.zig.zon:8`). The version-contract documentation, the
-  optional `addStaticLibrary` + C header for non-Zig hosts, and vendoring zg
-  for offline use did not.
-- **~2.1 MB embedded fonts pulled by any ztex-facade consumer** — **OPEN**.
-  Still undocumented which module pulls them; a layout-only host cannot avoid
-  the facade import.
-- **No README/host-facing docs** — **OPEN**. No README in the tree; the
-  allocator, thread-safety, lifetime, and error contracts exist only as
-  per-module doc comments.
-- **Stale "prior attempt" narration in `firstCodepoint` doc** — **OPEN**. The
-  doc still explains what the *previous* `Utf8View.init(...) catch null`
-  fallback did (`src/layout/layout.zig:527`).
+- **Zig 0.16.0 exact pin + zg from codeberg, no C ABI** — **LANDED** (the
+  contract half). The pin was already there (`build.zig.zon:5`, `minimum_zig_version
+  = "0.16.0"`; zg v0.16.2 from codeberg, `build.zig.zon:8`); the version contract
+  is now documented for hosts in `README.md`, including the no-C-ABI fact. The
+  optional `addStaticLibrary` + C header for non-Zig hosts remains out of scope:
+  it is an API addition, not a defect.
+- **Embedded fonts pulled by any ztex-facade consumer** — **LANDED**, and the
+  original finding was wrong on both counts. The payload is ~0.9 MiB of font
+  bytes (964,100 B measured by counting the `0xNN` entries across
+  `src/fonts/`), not 2.1 MB — that figure counted Zig source, which is ~6 bytes
+  per font byte. And a layout-only host CAN avoid them: only `src/root.zig` and
+  `src/context.zig` import `font.zig`; `ztex.layout` reaches fonts through the
+  opaque `metrics.FontHook` and links none of those bytes. Both facts are now
+  documented on the facade (`src/root.zig:7-12`) and in `README.md`.
+- **No README/host-facing docs** — **LANDED**. `README.md` now carries the
+  host-facing contract: the version pin, the module table and its font weight,
+  the ownership/lifetime rules for every owning type, the allocator contract,
+  thread safety for both facades, the closed error sets, and the input limits.
+- **Stale "prior attempt" narration in `firstCodepoint` doc** — **LANDED**. The
+  doc no longer explains what the *previous* `Utf8View.init(...) catch null`
+  fallback did; it states the current decode rule directly
+  (`src/layout/layout.zig:528-531`).
 - **Top-level style hardcoded `.display`** — **OPEN**. `layout.render` still
   starts at display style with no style parameter
   (`src/layout/root.zig:49`); hosts cannot pick text style for a whole
@@ -246,11 +266,11 @@ relations, \textit/\textbf family, \mathop..\mathinner.
    delete **LANDED**; the `main.zig` call site carries the `std.Io.Dir`
    explicitly (`src/main.zig:162`).
 4. **F4 layout/atom** — C2 tree validation **LANDED**, M3 error-set narrow
-   **LANDED**, M7 `lookupAscii` wire **LANDED**, M8 comment trim **OPEN**
-   (`src/parse/lexer.zig:4`), M6 magic drift **LANDED**
-   (`src/layout/metrics.zig:2918`, `src/layout/layout.zig:55`), M5 ink-bounds
-   API **OPEN** (API landed, svg margins still heuristic,
-   `src/svg.zig:62`).
+   **LANDED**, M7 `lookupAscii` wire **LANDED**, M8 comment trim **LANDED**
+   (`src/parse/lexer.zig:1-6`, `src/layout/layout.zig:528`), M6 magic drift
+   **LANDED** (`src/layout/metrics.zig:2918`, `src/layout/layout.zig:55`),
+   M5 ink bounds **LANDED** (`src/layout/draw.zig:130`, `src/svg.zig:66`,
+   `src/raster.zig:146`).
 
 Deferred and still deferred: the feature roadmap above, the runtime MATH-table
 query, the C ABI, and a README.
