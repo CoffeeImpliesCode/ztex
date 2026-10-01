@@ -66,6 +66,11 @@ Run from the repository root:
   is `ZWANZIG`, `~/.local/bin/zwanzig`, then `PATH`. Gate tools prefer local
   `ziglint`, `zlint`, `zbc`, `zig-cov`, and `zwanzig` in `~/.local/bin`, then `PATH`;
   a missing tool is skipped, not failed, so check that the stage actually ran.
+  `zbc` is advisory by default and reports one known false positive,
+  `recursive-parse-fn-without-stack-check` on `parseRow`: the parser guards
+  recursion with its own `max_nesting` counter and returns
+  `error.NestingTooDeep`, and zbc only recognizes `stack_check.is_safe_to_recurse`.
+  Verified: 20 KB and 100 KB of nested input both fail cleanly with a caret.
 - `hyperfine 'zig build bench'` compares benchmark runs.
 
 Start with `jj st`. Keep changes focused. Commit only after formatting, build, tests,
