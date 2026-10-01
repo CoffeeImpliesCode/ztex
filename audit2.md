@@ -273,4 +273,8 @@ relations, \textit/\textbf family, \mathop..\mathinner.
    `src/raster.zig:146`).
 
 Deferred and still deferred: the feature roadmap above, the runtime MATH-table
-query, the C ABI, and a README.
+query, and the C ABI. The README this pass added is the only host-facing doc
+gap that closed; the three items still marked OPEN are API additions or
+deliberate design rather than defects — a top-level style parameter, the
+`glyphEstimate` fallback for codepoints no source has a glyph for, and the
+baked Latin Modern tables behind the `.font` arm.
