@@ -65,19 +65,19 @@ pub fn main(init: std.process.Init) !void {
     var count: u64 = 0;
     var peak_cap: usize = 0;
     if (single) |src| {
-        _ = try ztex.render(gpa, src, 20, null); // warm up
+        _ = try ztex.render(gpa, src, .display, 20, null); // warm up
         for (0..iters) |_| {
-            const dl = try ztex.render(gpa, src, 20, null);
+            const dl = try ztex.render(gpa, src, .display, 20, null);
             total_draws += dl.len();
             count += 1;
             peak_cap = @max(peak_cap, arena.queryCapacity());
             _ = arena.reset(.retain_capacity); // steady-state per render
         }
     } else {
-        _ = try ztex.render(gpa, corpus[0], 20, null); // warm up
+        _ = try ztex.render(gpa, corpus[0], .display, 20, null); // warm up
         for (0..2000) |_| {
             for (corpus) |src| {
-                const dl = try ztex.render(gpa, src, 20, null);
+                const dl = try ztex.render(gpa, src, .display, 20, null);
                 total_draws += dl.len();
                 count += 1;
                 peak_cap = @max(peak_cap, arena.queryCapacity());

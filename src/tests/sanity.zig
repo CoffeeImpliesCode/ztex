@@ -77,7 +77,7 @@ fn expectSanePrimitive(dl: *const ztex.draw.DrawList, d: ztex.draw.Draw) !void {
 
 test "sanity: corpus primitives are finite, in-bounds, and svg-renderable" {
     for (corpus) |src| {
-        var out = try ztex.render(testing.allocator, src, size_pt, null);
+        var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
         defer out.deinit();
         for (out.items.items) |d| try expectSanePrimitive(&out, d);
 
@@ -89,7 +89,7 @@ test "sanity: corpus primitives are finite, in-bounds, and svg-renderable" {
 
 test "sanity: 'abc' is three text primitives on the baseline" {
     const src = "abc";
-    var out = try ztex.render(testing.allocator, src, size_pt, null);
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
     defer out.deinit();
 
     try testing.expectEqual(@as(usize, 3), out.len());
@@ -112,7 +112,7 @@ test "sanity: 'abc' is three text primitives on the baseline" {
 
 test "sanity: 'x^2' raises and shrinks the superscript" {
     const src = "x^2";
-    var out = try ztex.render(testing.allocator, src, size_pt, null);
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
     defer out.deinit();
 
     try testing.expectEqual(@as(usize, 2), out.len());
@@ -135,7 +135,7 @@ test "sanity: 'x^2' raises and shrinks the superscript" {
 
 test "sanity: 'x_2' lowers the subscript below the baseline" {
     const src = "x_2";
-    var out = try ztex.render(testing.allocator, src, size_pt, null);
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
     defer out.deinit();
 
     try testing.expectEqual(@as(usize, 2), out.len());
@@ -156,7 +156,7 @@ test "sanity: 'x_2' lowers the subscript below the baseline" {
 
 test "sanity: fraction rule sits between baselines and spans the width" {
     const src = "\\frac{1}{2}";
-    var out = try ztex.render(testing.allocator, src, size_pt, null);
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
     defer out.deinit();
 
     var num: ?ztex.draw.Text = null;
@@ -193,7 +193,7 @@ test "sanity: fraction rule sits between baselines and spans the width" {
 
 test "sanity: '\\sum_{i=1}^{n}' renders one big-operator glyph" {
     const src = "\\sum_{i=1}^{n}";
-    var out = try ztex.render(testing.allocator, src, size_pt, null);
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
     defer out.deinit();
 
     var sum_count: usize = 0;

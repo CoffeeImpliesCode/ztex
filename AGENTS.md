@@ -48,11 +48,13 @@ Run from the repository root:
 - `zig build` builds `zig-out/bin/ztex`.
 - `zig build run -- -i 'x^2' -o out.svg -s 20 -p 4` writes SVG.
   `zig build run -- -i 'x^2'` writes to stdout.
-- `ztex --help` lists the CLI. Raster output is selected by `--ppm`/`--pgm` or
-  by an output path ending in `.ppm`, `.pnm`, or `.pgm`; there is no PNG
-  encoder, so everything else is SVG.
+- `ztex --help` lists the CLI. `--style display|text` picks the math style
+  for the whole formula (display for a standalone equation, text for inline
+  math). Raster output is selected by `--ppm`/`--pgm` or by an output path
+  ending in `.ppm`, `.pnm`, or `.pgm`; there is no PNG encoder, so everything
+  else is SVG.
 - `zig build test` runs unit, integration, and regression tests across modules
-  (244 tests). `zig build test --summary all` prints per-module counts.
+  (247 tests). `zig build test --summary all` prints per-module counts.
 - `zig build bench` runs the ReleaseFast parse/layout/flatten benchmark.
   Override with `-Dbench-optimize=<Mode>`. `zig build bench -Dcpu=native`
   enables native vector features.

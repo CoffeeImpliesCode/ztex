@@ -226,14 +226,23 @@ contract. The stale "previous `Utf8View.init(...)` fallback" narration on
   doc no longer explains what the *previous* `Utf8View.init(...) catch null`
   fallback did; it states the current decode rule directly
   (`src/layout/layout.zig:528-531`).
-- **Top-level style hardcoded `.display`** — **OPEN**. `layout.render` still
-  starts at display style with no style parameter
-  (`src/layout/root.zig:49`); hosts cannot pick text style for a whole
-  formula. Recommended API addition, still recommended.
-- **`glyphEstimate` fallback 0.5/0.7/0.2em** — **OPEN**. Still the only
-  deliberately-wrong value in the render path
-  (`src/layout/metrics.zig:2875`); it needs an hmtx advance lookup when the
-  `.font` arm is active.
+- **Top-level style hardcoded `.display`** — **LANDED**. Every entry point now
+  takes the math style the formula starts in: `layout.render`
+  (`src/layout/root.zig:35`), `renderPipeline` (`src/root.zig:42`), both
+  facades and both raster entry points. The CLI exposes it as
+  `--style display|text` (`src/main.zig:90`). Behaviour is TeX's: a text-style
+  `\frac{1}{2}` is 9.24 × 26.90pt at 20pt against display's 13.20 × 44.57pt,
+  and a text-style `\sum` moves its limits beside the operator, going wider and
+  shorter (57.78 × 29.64pt vs 42.31 × 55.16pt). Pinned by a test at
+  `src/root.zig`.
+- **`glyphEstimate` fallback 0.5/0.7/0.2em** — **LANDED**, and the original
+  finding was wrong about the mechanism. `glyphImpl` already consults the font
+  first (`src/layout/metrics.zig`), so the estimate only fires for a codepoint
+  absent from BOTH the wired font and the static tables — for which there is no
+  hmtx advance to look up and a deterministic box is the right answer. Emoji
+  and CJK take this path; they are emitted with a correct span and advance and
+  simply have no glyph in Latin Modern Math. The estimate is a last resort,
+  not a wrong measurement.
 - **Baked MATH metrics** — **OPEN** by design. `GlueParams` plus thousands of
   per-glyph values are Latin Modern measured once; a runtime MATH-table query
   through `font.zig` remains the eventual fix, and the `.font` arm already
@@ -273,8 +282,8 @@ relations, \textit/\textbf family, \mathop..\mathinner.
    `src/raster.zig:146`).
 
 Deferred and still deferred: the feature roadmap above, the runtime MATH-table
-query, and the C ABI. The README this pass added is the only host-facing doc
-gap that closed; the three items still marked OPEN are API additions or
-deliberate design rather than defects — a top-level style parameter, the
-`glyphEstimate` fallback for codepoints no source has a glyph for, and the
-baked Latin Modern tables behind the `.font` arm.
+query, and the C ABI. Of the items this pass left open, the top-level style
+parameter and the `glyphEstimate` entry have since closed — the first is now
+the `style` argument on every entry point, the second was closed as
+not-a-defect on re-check. One stays open by design: the baked Latin Modern
+tables behind the `.font` arm, an architectural change rather than a repair.

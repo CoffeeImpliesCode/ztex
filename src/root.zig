@@ -43,6 +43,7 @@ pub fn renderPipeline(
     gpa: std.mem.Allocator,
     fm: *const layout.metrics.FontMetrics,
     src: []const u8,
+    style: layout.Style,
     size_pt: f32,
     err_info: ?*parse.Info,
 ) (parse.Error || error{InvalidAst})!draw.DrawList {
@@ -51,7 +52,7 @@ pub fn renderPipeline(
     // layout.render fails only with OutOfMemory/InvalidAst, both members of
     // the typed set below, so they propagate unmapped — callers match the
     // closed facade set exhaustively instead of re-enumerating errors.
-    return layout.render(gpa, &ast, ast.root, fm, size_pt);
+    return layout.render(gpa, &ast, ast.root, fm, style, size_pt);
 }
 
 /// Full pipeline: LaTeX source → draw list (SVG-style primitives),
@@ -62,10 +63,11 @@ pub fn renderPipeline(
 pub fn render(
     gpa: std.mem.Allocator,
     src: []const u8,
+    style: layout.Style,
     size_pt: f32,
     err_info: ?*parse.Info,
 ) (parse.Error || error{InvalidAst})!draw.DrawList {
-    return renderPipeline(gpa, &layout.metrics.default, src, size_pt, err_info);
+    return renderPipeline(gpa, &layout.metrics.default, src, style, size_pt, err_info);
 }
 
 /// One-shot rasterization: initializes a temporary FontContext and rasterizes
@@ -74,13 +76,14 @@ pub fn render(
 pub fn renderPixels(
     gpa: std.mem.Allocator,
     src: []const u8,
+    style: layout.Style,
     size_pt: f32,
     opts: RasterOptions,
     err_info: ?*parse.Info,
 ) !PixelBuffer {
     var ctx = try Context.init(gpa);
     defer ctx.deinit();
-    return ctx.renderPixels(src, size_pt, opts, err_info);
+    return ctx.renderPixels(src, style, size_pt, opts, err_info);
 }
 test {
     std.testing.refAllDecls(@This());
@@ -92,7 +95,7 @@ const testing = std.testing;
 
 test "facade: render produces drawables with provenance" {
     const src = "\\frac{1}{2}+x";
-    var out = try render(testing.allocator, src, 20, null);
+    var out = try render(testing.allocator, src, .display, 20, null);
     defer out.deinit();
     try testing.expect(out.len() > 0);
     // the fraction bar is a rect; plus the char/frac text primitives
@@ -112,7 +115,7 @@ test "facade: render produces drawables with provenance" {
 
 test "facade: frac renders a rect rule and glyphs" {
     const src = "\\frac{1}{2}";
-    var out = try render(testing.allocator, src, 10, null);
+    var out = try render(testing.allocator, src, .display, 10, null);
     defer out.deinit();
     var saw_rect = false;
     var saw_text = false;
@@ -129,7 +132,7 @@ test "facade: frac renders a rect rule and glyphs" {
 
 test "facade: text renders glyphs with source spans" {
     const src = "\\text{hi}";
-    var out = try render(testing.allocator, src, 10, null);
+    var out = try render(testing.allocator, src, .display, 10, null);
     defer out.deinit();
     try testing.expectEqual(@as(usize, 2), out.len());
     const t0 = out.items.items[0].text;
@@ -143,7 +146,7 @@ test "facade: text renders glyphs with source spans" {
 }
 
 test "facade: renderPixels produces non-empty RGBA pixel buffer" {
-    var pix = try renderPixels(testing.allocator, "x^2 + 1", 20.0, .{}, null);
+    var pix = try renderPixels(testing.allocator, "x^2 + 1", .display, 20.0, .{}, null);
     defer pix.deinit();
     try testing.expect(pix.width > 0);
     try testing.expect(pix.height > 0);
@@ -162,7 +165,7 @@ test "facade: renderPixels produces non-empty RGBA pixel buffer" {
 }
 
 test "facade: renderPixels produces alpha8 mask" {
-    var pix = try renderPixels(testing.allocator, "\\frac{a}{b}", 20.0, .{ .format = .alpha8 }, null);
+    var pix = try renderPixels(testing.allocator, "\\frac{a}{b}", .display, 20.0, .{ .format = .alpha8 }, null);
     defer pix.deinit();
     try testing.expect(pix.width > 0);
     try testing.expect(pix.height > 0);
@@ -176,4 +179,28 @@ test "facade: renderPixels produces alpha8 mask" {
         }
     }
     try testing.expect(has_ink);
+}
+
+test "facade: the math style argument changes the layout" {
+    // A host rendering math inline in prose must be able to ask for text
+    // style; if the parameter were ignored, every inline fraction would come
+    // out display-sized and every \sum would stack its limits.
+    const frac = "\\frac{1}{2}";
+    var disp = try render(testing.allocator, frac, .display, 20, null);
+    defer disp.deinit();
+    var text = try render(testing.allocator, frac, .text, 20, null);
+    defer text.deinit();
+    try testing.expect(text.height < disp.height);
+    try testing.expect(text.width < disp.width);
+
+    // \sum is the sharper case: display sets the limits above and below,
+    // text moves them beside the operator, so the formula gets WIDER and
+    // SHORTER. Equal dimensions would mean the style never reached layout.
+    const sum = "\\sum_{i=1}^{n} i";
+    var sd = try render(testing.allocator, sum, .display, 20, null);
+    defer sd.deinit();
+    var st = try render(testing.allocator, sum, .text, 20, null);
+    defer st.deinit();
+    try testing.expect(st.width > sd.width);
+    try testing.expect(st.height < sd.height);
 }

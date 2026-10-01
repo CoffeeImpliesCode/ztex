@@ -10,6 +10,8 @@ const usage =
     \\  -p <n>        padding around the formula: pt for SVG, px for a raster
     \\                (default 0)
     \\  --dpi <n>     raster resolution in DPI (default 96)
+    \\  --style <s>   math style for the whole formula: display (default,
+    \\                for a standalone equation) or text (for inline math)
     \\  --ppm         write PPM (P6) 24-bit image
     \\  --pgm         write PGM (P5) 8-bit alpha mask
     \\  -b <color>    background: name or #RRGGBB[AA] (default: white; use
@@ -41,6 +43,11 @@ pub fn main(init: std.process.Init) !void {
     var dpi: f32 = 96.0;
     var bg: ?ztex.draw.Color = .{ .r = 255, .g = 255, .b = 255, .a = 255 }; // white
     var raster_format: ?ztex.raster.Format = null;
+    // TeX fixes the style per formula: display for a standalone equation,
+    // text for one set inline in running prose. `--style` lets a caller
+    // rendering inline math pick the latter, which sizes fractions,
+    // integrals and subscripts the way they appear in a paragraph.
+    var style: ztex.layout.Style = .display;
 
     var arg_it = std.process.Args.Iterator.init(init.minimal.args);
     _ = arg_it.next(); // skip argv[0]
@@ -82,6 +89,19 @@ pub fn main(init: std.process.Init) !void {
                 try printUsageErrorArg(io, "invalid resolution for --dpi: '", v, "'\n");
                 std.process.exit(usage_status);
             };
+        } else if (std.mem.eql(u8, arg, "--style")) {
+            const v = arg_it.next() orelse {
+                try printUsageError(io, "option '--style' needs a style: display or text\n");
+                std.process.exit(usage_status);
+            };
+            if (std.mem.eql(u8, v, "display")) {
+                style = .display;
+            } else if (std.mem.eql(u8, v, "text")) {
+                style = .text;
+            } else {
+                try printUsageErrorArg(io, "unknown math style '", v, "' (use display or text)\n");
+                std.process.exit(usage_status);
+            }
         } else if (std.mem.eql(u8, arg, "--ppm")) {
             raster_format = .rgba32;
         } else if (std.mem.eql(u8, arg, "--pgm")) {
@@ -125,7 +145,7 @@ pub fn main(init: std.process.Init) !void {
     // exceptions are not parse errors — `err_info` stays untouched — so
     // they propagate as-is.
     var err_info: ztex.parse.Info = undefined;
-    const dl = ctx.render(src, size, &err_info) catch |e| switch (e) {
+    const dl = ctx.render(src, style, size, &err_info) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.InvalidAst => return e,
         else => {

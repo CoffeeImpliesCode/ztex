@@ -24,7 +24,7 @@ test "sanity: superscript on an accent base uses the char sup floor" {
     // \hat{A}^{\dagger} at 30pt: the dagger baseline must sit only ~sup1
     // (3.63em = 10.89pt) above the A baseline, NOT the accent-box height
     // (~25pt, inflated by the hat on top).
-    var out = try ztex.render(testing.allocator, "\\hat{A}^{\\dagger}", 30, null);
+    var out = try ztex.render(testing.allocator, "\\hat{A}^{\\dagger}", .display, 30, null);
     defer out.deinit();
 
     // Find the A baseline (the 'A' text) and the dagger († U+2020).

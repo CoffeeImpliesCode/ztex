@@ -18,7 +18,7 @@ const testing = std.testing;
 /// Numbers are shortest-round-trip floats / decimal ints (Ryu formatting),
 /// so output is deterministic for a fixed code version.
 pub fn dump(gpa: std.mem.Allocator, src: []const u8, size_pt: f32) ![]u8 {
-    var out = try ztex.render(gpa, src, size_pt, null);
+    var out = try ztex.render(gpa, src, .display, size_pt, null);
     defer out.deinit();
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
@@ -100,7 +100,7 @@ test "regression: draw-list snapshots" {
 /// SVG, with `padding` as the empty margin around the content. Caller owns
 /// the returned bytes.
 pub fn dumpSvg(gpa: std.mem.Allocator, src: []const u8, size_pt: f32, padding: f32) ![]u8 {
-    var dl = try ztex.render(gpa, src, size_pt, null);
+    var dl = try ztex.render(gpa, src, .display, size_pt, null);
     defer dl.deinit();
     const svg = try ztex.svg.render(gpa, &dl, .{ .padding = padding });
     defer gpa.free(svg);

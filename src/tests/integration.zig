@@ -28,7 +28,7 @@ test {
 
 test "integration: corpus renders non-empty with positive bounds" {
     for (corpus) |src| {
-        var out = try ztex.render(testing.allocator, src, size_pt, null);
+        var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
         defer out.deinit();
         try testing.expect(out.len() > 0);
         try testing.expect(out.width > 0);
@@ -38,7 +38,7 @@ test "integration: corpus renders non-empty with positive bounds" {
 
 test "integration: every primitive carries valid provenance into the source" {
     for (corpus) |src| {
-        var out = try ztex.render(testing.allocator, src, size_pt, null);
+        var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
         defer out.deinit();
         for (out.items.items) |d| {
             switch (d) {
@@ -70,7 +70,7 @@ test "integration: every primitive carries valid provenance into the source" {
 
 test "integration: superscript is raised, shrunk, and has exact spans" {
     const src = "x^2";
-    var out = try ztex.render(testing.allocator, src, size_pt, null);
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
     defer out.deinit();
 
     try testing.expectEqual(@as(usize, 2), out.len());
@@ -97,7 +97,7 @@ test "integration: superscript is raised, shrunk, and has exact spans" {
 
 test "integration: fraction draws a rule plus numerator and denominator" {
     const src = "\\frac{1}{2}";
-    var out = try ztex.render(testing.allocator, src, size_pt, null);
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
     defer out.deinit();
 
     var text_count: usize = 0;
@@ -115,7 +115,7 @@ test "integration: fraction draws a rule plus numerator and denominator" {
 
 test "integration: text mode emits one full-size primitive per character" {
     const src = "\\text{hi}";
-    var out = try ztex.render(testing.allocator, src, size_pt, null);
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
     defer out.deinit();
 
     try testing.expectEqual(@as(usize, 2), out.len());

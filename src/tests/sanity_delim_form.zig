@@ -22,7 +22,7 @@ const testing = std.testing;
 
 test "sanity: tall matrix outer parens carry a stretched variant (delim_form >= 6)" {
     const src = "\\begin{pmatrix} a & b \\\\ c & d \\\\ e & f \\\\ g & h \\end{pmatrix}";
-    var out = try ztex.render(testing.allocator, src, 20, null);
+    var out = try ztex.render(testing.allocator, src, .display, 20, null);
     defer out.deinit();
 
     var open_form: u8 = 0;

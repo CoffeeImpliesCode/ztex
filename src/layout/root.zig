@@ -9,6 +9,10 @@ const atom = @import("ztex.atom");
 pub const metrics = @import("metrics.zig");
 pub const draw = @import("draw.zig");
 pub const layout = @import("layout.zig");
+
+/// The math styles a formula can start in (`atom.MathStyle`); the parameter
+/// type of `render` below.
+pub const Style = layout.Style;
 const box = @import("box.zig");
 
 /// Lay out an atom tree and flatten it to a draw list.
@@ -20,6 +24,13 @@ const box = @import("box.zig");
 /// source (and ast) must outlive the draw list. The box pool is scratch and
 /// freed.
 ///
+/// `style` is the math style the formula STARTS in, which TeX fixes per
+/// formula: `.display` for a standalone equation, `.text` for one set inline
+/// in running prose. It sets the base size and the limits/subscript rules for
+/// everything that follows; `\displaystyle` and friends override it locally
+/// from there. A host rendering inline math must pass `.text`, or its
+/// fractions and integrals come out display-sized.
+///
 /// The tree is validated once at this boundary (child counts vs each tag's
 /// expected arity, child indices in bounds, and a tree-shaped
 /// root-reachable subgraph): a malformed hand-built AST returns
@@ -30,6 +41,7 @@ pub fn render(
     ast: *const atom.Ast,
     root: u32,
     fm: *const metrics.FontMetrics,
+    style: Style,
     size_pt: f32,
 ) error{ OutOfMemory, InvalidAst }!draw.DrawList {
     try validateAst(gpa, ast, root);
@@ -46,7 +58,7 @@ pub fn render(
     try list.chars.ensureTotalCapacity(gpa, est_boxes);
     try list.childrefs.ensureTotalCapacity(gpa, est_boxes);
     try list.scratch.ensureTotalCapacity(gpa, est_boxes);
-    const root_box = try layout.layout(&list, ast, root, fm, .display, size_pt, .italic);
+    const root_box = try layout.layout(&list, ast, root, fm, style, size_pt, .italic);
     var out = draw.DrawList.init(gpa);
     errdefer out.deinit();
     // Capacity-only hint: flatten emits at most one draw per box, and boxes
@@ -167,7 +179,7 @@ test "render: a single char yields one text primitive" {
     defer ast.deinit();
     try ast.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
     _ = try ast.createLeaf(.char, 0, 1, 0); // node 0: a char leaf
-    var out = try render(testing.allocator, &ast, 0, &metrics.default, 20);
+    var out = try render(testing.allocator, &ast, 0, &metrics.default, .display, 20);
     defer out.deinit();
     try testing.expectEqual(@as(usize, 1), out.len());
     try testing.expectEqualStrings("𝑥", out.items.items[0].text.bytes);
@@ -181,7 +193,7 @@ test "render: wrong arity returns error.InvalidAst, not a panic" {
     _ = try ast.createNode(.group, 0, 1, &.{}, 0); // a group with 0 children
     try testing.expectError(
         error.InvalidAst,
-        render(testing.allocator, &ast, 0, &metrics.default, 20),
+        render(testing.allocator, &ast, 0, &metrics.default, .display, 20),
     );
 }
 
@@ -200,7 +212,7 @@ test "render: out-of-bounds child index returns error.InvalidAst" {
     });
     try testing.expectError(
         error.InvalidAst,
-        render(testing.allocator, &ast, 0, &metrics.default, 20),
+        render(testing.allocator, &ast, 0, &metrics.default, .display, 20),
     );
 }
 
@@ -219,6 +231,6 @@ test "render: a cyclic tree returns error.InvalidAst" {
     });
     try testing.expectError(
         error.InvalidAst,
-        render(testing.allocator, &ast, 0, &metrics.default, 20),
+        render(testing.allocator, &ast, 0, &metrics.default, .display, 20),
     );
 }

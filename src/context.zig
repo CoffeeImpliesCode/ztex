@@ -51,15 +51,16 @@ const root = @import("root.zig");
 /// metrics.zig). Real-font metrics for `cp` in `style` at the 10pt base
 /// (em × 10, so the layout's s(v, size_pt) scaling applies — LM is a 10pt
 /// design): width = the face's cached hmtx advance, height/depth = the
-/// face's OWN nominal hhea extents. Style `.roman` selects the LM Roman
-/// regular face (`\text`/`\mathrm`), every other style the LM Math face.
+/// face's OWN nominal hhea extents. The face comes from `faceForStyle`
+/// (`\text`/`\mathrm` → LM Roman regular, `\mathbf` → its bold, every other
+/// style → LM Math), the same mapping the rasterizer draws from.
 /// The italic correction stays the static row's value (LM Math's MATH table
 /// is not parsed yet), so sup/sub placement and the post-op tail keep
 /// today's values. Null when the face has no glyph for `cp` — glyph/glyphAt
 /// then fall back to the static tables, and finally to glyphEstimate.
 fn contextGlyph(ctx: *anyopaque, cp: u21, style: atom.CharStyle) ?metrics.Glyph {
     const f: *font.FontContext = @ptrCast(@alignCast(ctx));
-    const face = if (style == .roman) f.romanFace(false) else f.mathFace();
+    const face = f.faceForStyle(style);
     if (face.glyphIndex(cp) == null) return null;
     const m = f.metrics(face, cp, 10.0);
     var ic: f32 = 0;
@@ -117,21 +118,23 @@ pub const Context = struct {
     pub fn render(
         self: *Context,
         src: []const u8,
+        style: layout.Style,
         size_pt: f32,
         err_info: ?*parse.Info,
     ) (parse.Error || error{InvalidAst})!draw.DrawList {
-        return root.renderPipeline(self.gpa, &self.fm, src, size_pt, err_info);
+        return root.renderPipeline(self.gpa, &self.fm, src, style, size_pt, err_info);
     }
 
     /// Render a formula directly to a raster PixelBuffer (RGBA or Alpha mask).
     pub fn renderPixels(
         self: *Context,
         src: []const u8,
+        style: layout.Style,
         size_pt: f32,
         opts: RasterOptions,
         err_info: ?*parse.Info,
     ) !PixelBuffer {
-        var dl = try self.render(src, size_pt, err_info);
+        var dl = try self.render(src, style, size_pt, err_info);
         defer dl.deinit();
         return raster.rasterize(self.gpa, self, &dl, opts);
     }
@@ -150,7 +153,7 @@ test "context: init once, render many — font metrics match the LM table widths
     defer ctx.deinit();
     // x at 20pt: math-italic U+1D465 advance 0.572em × 20 = 11.44
     // row 5.28pt × 2). The font path answers through the metrics cache.
-    var out = try ctx.render("x", 20, null);
+    var out = try ctx.render("x", .display, 20, null);
     defer out.deinit();
     try testing.expectEqual(@as(usize, 1), out.len());
     const t = out.items.items[0].text;
@@ -158,7 +161,7 @@ test "context: init once, render many — font metrics match the LM table widths
     try testing.expectEqual(@as(f32, 20), t.size);
     try testing.expectApproxEqAbs(@as(f32, 11.44), out.width, 0.001);
     // a second render reuses the same context (and its font metric cache)
-    var out2 = try ctx.render("x", 20, null);
+    var out2 = try ctx.render("x", .display, 20, null);
     defer out2.deinit();
     try testing.expectApproxEqAbs(out.width, out2.width, 0.0001);
     // The per-(face, cp) cache holds ONE entry after two renders of "x":
@@ -173,7 +176,7 @@ test "context: unmapped codepoint falls back to the static table / estimate" {
     // to the static table's row (CM width kept for codepoints LM Math does
     // not cover) instead of the 0.5em nominal advance, and rendering still
     // produces a glyph box — graceful, no hole.
-    var out = try ctx.render("\\triangleright", 20, null);
+    var out = try ctx.render("\\triangleright", .display, 20, null);
     defer out.deinit();
     try testing.expect(out.len() > 0);
     try testing.expectApproxEqAbs(@as(f32, 10.00004), out.width, 0.01);

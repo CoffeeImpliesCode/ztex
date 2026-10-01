@@ -38,7 +38,7 @@ test "sanity: \\cfrac numerator gap is larger than a strut-less \\frac" {
 }
 
 fn fracBaselineToRule(src: []const u8, size: f32) ?f32 {
-    var out = ztex.render(std.testing.allocator, src, size, null) catch return null;
+    var out = ztex.render(std.testing.allocator, src, .display, size, null) catch return null;
     defer out.deinit();
     var one_baseline: ?f32 = null;
     var rule_top: ?f32 = null;

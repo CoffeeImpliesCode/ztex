@@ -730,3 +730,34 @@ test "svg: rejects non-finite coordinates" {
     } });
     try testing.expectError(error.NonFiniteCoordinate, render(testing.allocator, &dl, .{}));
 }
+test "svg: \\mathbf declares a bold weight and \\text does not" {
+    // The bitmap path resolves \mathbf to the embedded bold face; the SVG
+    // path cannot embed a face, so it declares the weight instead. Both sides
+    // must agree that \mathbf is bold, or the two outputs diverge.
+    const emit = struct {
+        fn f(style: atom.CharStyle) ![]u8 {
+            var dl = draw.DrawList.init(testing.allocator);
+            defer dl.deinit();
+            try dl.add(.{ .text = .{
+                .bytes = "x",
+                .x = 0,
+                .y = 0,
+                .size = 10,
+                .style = style,
+                .color = .{ .r = 0, .g = 0, .b = 0 },
+                .src_start = 0,
+                .src_end = 1,
+            } });
+            dl.accInk(0, -7, 5, 2);
+            return try render(testing.allocator, &dl, .{});
+        }
+    }.f;
+
+    const bold = try emit(.bold);
+    defer testing.allocator.free(bold);
+    const roman = try emit(.roman);
+    defer testing.allocator.free(roman);
+
+    try testing.expect(std.mem.indexOf(u8, bold, "font-weight=\"bold\"") != null);
+    try testing.expect(std.mem.indexOf(u8, roman, "font-weight=") == null);
+}

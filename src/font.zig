@@ -11,7 +11,7 @@
 //!   TrueType) or execute the Type 2 charstring + Subr INDEXes from the
 //!   `CFF ` table (cubic, flattened to quadratics).
 //! - `FontContext`: the "init once, render many" core. Owns the embedded
-//!   Latin Modern fallback faces (LM Math + LM Roman regular/italic),
+//!   Latin Modern fallback faces (LM Math + LM Roman regular/bold),
 //!   caches faces loaded from disk by path, memoizes disk discovery in
 //!   `findFont`, and serves per-(face, cp) metric lookups from a cache.
 //!
@@ -22,10 +22,11 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const atom = @import("ztex.atom");
 
 const lmmath = @import("fonts/lmmath.zig");
 const lmroman_regular = @import("fonts/lmroman_regular.zig");
-const lmroman_italic = @import("fonts/lmroman_italic.zig");
+const lmroman_bold = @import("fonts/lmroman_bold.zig");
 
 /// Per-glyph metrics at a given size, in points.
 pub const GlyphMetrics = struct {
@@ -1687,18 +1688,18 @@ pub const FontContext = struct {
     math: *FontFace,
     /// Embedded Latin Modern Roman regular — for \text/\mathrm.
     roman: *FontFace,
-    /// Embedded Latin Modern Roman italic.
-    italic: *FontFace,
+    /// Embedded Latin Modern Roman bold — for `\mathbf`.
+    bold: *FontFace,
 
     /// Create a context preloaded with the embedded fallback faces:
-    /// LM Math (math), LM Roman regular and italic (text).
+    /// LM Math (math) plus LM Roman regular and bold (text).
     pub fn init(gpa: std.mem.Allocator) !FontContext {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const a = arena.allocator();
         const math = try createFace(a, lmmath.lmmath_otf[0..]);
         const roman = try createFace(a, lmroman_regular.lmroman10_regular_otf[0..]);
-        const italic = try createFace(a, lmroman_italic.lmroman10_italic_otf[0..]);
+        const bold = try createFace(a, lmroman_bold.lmroman10_bold_otf[0..]);
         return .{
             .gpa = gpa,
             .arena = arena,
@@ -1708,7 +1709,7 @@ pub const FontContext = struct {
             .metrics_cache = .empty,
             .math = math,
             .roman = roman,
-            .italic = italic,
+            .bold = bold,
         };
     }
 
@@ -1720,15 +1721,19 @@ pub const FontContext = struct {
         self.* = undefined;
     }
 
-    /// The embedded Latin Modern Math face (math glyphs).
-    pub fn mathFace(self: *const FontContext) *FontFace {
-        return self.math;
-    }
-
-    /// The embedded Latin Modern Roman face; `italic` selects the italic
-    /// variant (for \text/\mathrm).
-    pub fn romanFace(self: *const FontContext, italic: bool) *FontFace {
-        return if (italic) self.italic else self.roman;
+    /// The face a `CharStyle` draws from: `.roman` the Latin Modern Roman
+    /// regular face, `.bold` its bold face, and every other style the Latin
+    /// Modern Math face — whose math-italic, double-struck, script, fraktur,
+    /// sans and mono glyphs are already styled, so mapping those to a Roman
+    /// face would draw the wrong letterform. Both the metric hook and the
+    /// rasterizer resolve their face here, so a style can never measure from
+    /// one face and be drawn from another.
+    pub fn faceForStyle(self: *const FontContext, style: atom.CharStyle) *FontFace {
+        return switch (style) {
+            .roman => self.roman,
+            .bold => self.bold,
+            else => self.math,
+        };
     }
 
     /// Parse a font file and cache the face by path. Repeated calls with the
@@ -2016,11 +2021,20 @@ test "font: rejects non-sfnt input" {
 test "font: context loads embedded fallbacks and caches metrics" {
     var ctx = try FontContext.init(testing.allocator);
     defer ctx.deinit();
-    const math = ctx.mathFace();
+    const math = ctx.faceForStyle(.italic);
     try testing.expectEqual(@as(u16, 1000), math.unitsPerEm());
-    const roman = ctx.romanFace(false);
-    const italic = ctx.romanFace(true);
-    try testing.expect(roman != italic);
+    // each style resolves to a distinct embedded face: \mathbf must not
+    // measure or draw from the regular Roman face, or it renders unbolded.
+    const roman = ctx.faceForStyle(.roman);
+    const bold = ctx.faceForStyle(.bold);
+    try testing.expect(roman != bold);
+    try testing.expect(math != roman);
+    try testing.expect(math != bold);
+    // every other style is drawn from the math face, whose glyphs for those
+    // series are already styled.
+    for ([_]atom.CharStyle{ .bb, .cal, .frak, .sans, .mono }) |s| {
+        try testing.expectEqual(math, ctx.faceForStyle(s));
+    }
 
     const g = ctx.metrics(math, 'x', 20);
     try testing.expectApproxEqAbs(@as(f32, 10.56), g.width, 0.001);
@@ -2032,17 +2046,18 @@ test "font: context loads embedded fallbacks and caches metrics" {
     try testing.expectApproxEqAbs(g.width, g2.width, 0.0001);
     const g3 = ctx.metrics(math, 'x', 10);
     try testing.expectApproxEqAbs(@as(f32, 5.28), g3.width, 0.001);
-    // roman and italic advances differ (real font data)
+    // regular and bold advances differ (real font data), which is what makes
+    // \mathbf measure and draw differently from \text
     const rx = roman.glyphIndex('x') orelse return error.TestUnexpectedResult;
-    const ix = italic.glyphIndex('x') orelse return error.TestUnexpectedResult;
+    const bx = bold.glyphIndex('x') orelse return error.TestUnexpectedResult;
     try testing.expectApproxEqAbs(@as(f32, 0.528), roman.advanceEm(rx), 0.001);
-    try testing.expectApproxEqAbs(@as(f32, 0.464), italic.advanceEm(ix), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.607), bold.advanceEm(bx), 0.001);
 }
 
 test "font: metrics for an unmapped codepoint use nominal extents" {
     var ctx = try FontContext.init(testing.allocator);
     defer ctx.deinit();
-    const g = ctx.metrics(ctx.mathFace(), 0x10FFFF, 20);
+    const g = ctx.metrics(ctx.faceForStyle(.italic), 0x10FFFF, 20);
     try testing.expectApproxEqAbs(@as(f32, 10.0), g.width, 0.001); // 0.5em fallback
     try testing.expectApproxEqAbs(@as(f32, 16.12), g.height, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 3.88), g.depth, 0.001);
@@ -2657,22 +2672,22 @@ test "font: glyphOutline — CFF glyph id out of range errors, never panics" {
     );
 }
 
-test "font: glyphOutline — regular and italic CFF 'x' shapes differ" {
+test "font: glyphOutline — regular and bold CFF 'x' shapes differ" {
     var reg = try FontFace.fromBytes(
         testing.allocator,
         lmroman_regular.lmroman10_regular_otf[0..],
     );
     defer reg.deinit();
-    var ital = try FontFace.fromBytes(
+    var bld = try FontFace.fromBytes(
         testing.allocator,
-        lmroman_italic.lmroman10_italic_otf[0..],
+        lmroman_bold.lmroman10_bold_otf[0..],
     );
-    defer ital.deinit();
+    defer bld.deinit();
     const reg_gid = reg.glyphIndex('x') orelse return error.TestUnexpectedResult;
     var a = try reg.glyphOutline(testing.allocator, reg_gid);
     defer a.deinit();
-    const ital_gid = ital.glyphIndex('x') orelse return error.TestUnexpectedResult;
-    var b = try ital.glyphOutline(testing.allocator, ital_gid);
+    const bld_gid = bld.glyphIndex('x') orelse return error.TestUnexpectedResult;
+    var b = try bld.glyphOutline(testing.allocator, bld_gid);
     defer b.deinit();
     try testing.expect(a.curves.items.len > 0);
     try testing.expect(b.curves.items.len > 0);

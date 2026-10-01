@@ -280,6 +280,44 @@ test "rasterize: the buffer is sized from the ink bounds, not the box bounds" {
     try testing.expectEqual(@as(usize, 43 * 10), inked);
 }
 
+test "rasterize: \\mathbf draws the bold face, not the regular one" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+
+    // \mathbf used to resolve to the same face as \text, so \mathbf{x} and
+    // \text{x} rasterized identically — the SVG said bold, the bitmap did
+    // not. Compare the two at the same size: a real bold face puts down
+    // noticeably more ink for the same glyph.
+    const inkOf = struct {
+        fn f(
+            c: *context.Context,
+            src: []const u8,
+        ) !usize {
+            var dl = try c.render(src, .display, 40, null);
+            defer dl.deinit();
+            var buf = try rasterize(testing.allocator, c, &dl, .{
+                .dpi = 96,
+                .format = .alpha8,
+            });
+            defer buf.deinit();
+            var n: usize = 0;
+            for (buf.pixels) |p| {
+                if (p != 0) n += 1;
+            }
+            return n;
+        }
+    }.f;
+
+    const bold = try inkOf(&ctx, "\\mathbf{x}");
+    const roman = try inkOf(&ctx, "\\text{x}");
+    try testing.expect(bold > 0);
+    try testing.expect(roman > 0);
+    // Equal ink is the bug: it means \mathbf drew the regular glyph.
+    try testing.expect(bold > roman);
+    // Bold must be a real weight difference, not an antialiasing wobble.
+    try testing.expect(bold * 10 > roman * 11);
+}
+
 fn drawGlyph(
     gpa: std.mem.Allocator,
     ctx: *context.Context,
@@ -302,10 +340,7 @@ fn drawGlyph(
         return;
     };
 
-    const face = switch (t.style) {
-        .roman => ctx.fonts.romanFace(false),
-        else => ctx.fonts.mathFace(),
-    };
+    const face = ctx.fonts.faceForStyle(t.style);
 
     // Resolve OpenType MATH variants for big operators, radicals, and delimiters
     const gid = blk: {

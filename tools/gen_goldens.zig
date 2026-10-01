@@ -71,7 +71,7 @@ const regression_corpus = [_]struct { src: []const u8, padding: f32 }{
 };
 
 fn dumpDraw(gpa: std.mem.Allocator, src: []const u8, size: f32) ![]u8 {
-    var dl = try ztex.render(gpa, src, size, null);
+    var dl = try ztex.render(gpa, src, .display, size, null);
     defer dl.deinit();
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
@@ -92,7 +92,7 @@ fn dumpDraw(gpa: std.mem.Allocator, src: []const u8, size: f32) ![]u8 {
 }
 
 fn dumpSvgOnly(gpa: std.mem.Allocator, src: []const u8, size: f32, padding: f32) ![]u8 {
-    var dl = try ztex.render(gpa, src, size, null);
+    var dl = try ztex.render(gpa, src, .display, size, null);
     defer dl.deinit();
     const svg = try ztex.svg.render(gpa, &dl, .{ .padding = padding });
     defer gpa.free(svg);

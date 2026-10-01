@@ -39,7 +39,7 @@ that only wants the static metric tables links none of those bytes.
 One-shot render, static metric tables:
 
 ```zig
-var dl = try ztex.render(gpa, latex, 20, null);
+var dl = try ztex.render(gpa, latex, .display, 20, null);
 defer dl.deinit();
 const svg = try ztex.svg.render(gpa, &dl, .{});
 defer gpa.free(svg);
@@ -50,20 +50,34 @@ Many renders, real fonts, one context:
 ```zig
 var ctx = try ztex.Context.init(gpa);
 defer ctx.deinit();
-var dl = try ctx.render(latex, 20, null);
+var dl = try ctx.render(latex, .display, 20, null);
 defer dl.deinit();
 ```
 
 Rasterize either path to a `PixelBuffer`:
 
 ```zig
-var pix = try ztex.renderPixels(gpa, latex, 20, .{ .dpi = 200 }, null);
+var pix = try ztex.renderPixels(gpa, latex, .display, 20, .{ .dpi = 200 }, null);
 defer pix.deinit();
 try pix.writePnm(io, file); // PPM for .rgba32, PGM for .alpha8
 ```
 
 `ztex.svg.writeFile` takes an explicit `std.Io.Dir` so a host picks the
 directory; nothing in the library assumes the working directory.
+
+## Math style
+
+Every entry point takes the math style the formula starts in:
+
+- `.display` — a standalone equation: fractions full size, `\sum` limits
+  stacked above and below.
+- `.text` — math set inline in running prose: fractions and big operators
+  at text size, `\sum` limits beside the operator.
+
+TeX fixes this per formula, and a host rendering inline math must pass
+`.text`, or its fractions come out display-sized. `\displaystyle`,
+`\textstyle`, `\scriptstyle` and `\scriptscriptstyle` override it from inside
+the formula. The CLI exposes it as `--style display|text`.
 
 ## Ownership and lifetime
 
