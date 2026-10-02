@@ -1,22 +1,33 @@
-//! ztex.raster — CPU coverage rasterizer for math draw lists.
+//! CPU coverage rasterizer for point-coordinate math draw lists.
 //!
-//! Produces pixel buffers from a `draw.DrawList` using analytic quadratic Bézier
-//! scanline coverage (`coverage.zig`) and exact rectangle/line fills.
-//! Supports customizable resolution (DPI), scale, foreground/background colors,
-//! and pixel formats (RGBA8888, Alpha8).
+//! Reach this module as `@import("ztex").raster`. Call `rasterize` with a
+//! live context and draw list, use the result, then call `PixelBuffer.deinit`.
+//! Resolution, scale, colors, and RGBA/alpha-mask storage are caller choices.
+//! Rendering performs no font discovery or file I/O; `PixelBuffer.writePnm`
+//! uses the caller's explicit file and I/O capability.
 //!
 //! FONT-BACKED ONLY. Unlike `ztex.render`, which measures from static tables,
 //! `rasterize` takes a `context.Context` and resolves every run through the
-//! face that style draws from (`FontContext.faceForStyle`), then decodes that
-//! face's outline — including the OpenType MATH size variant a display big
-//! operator, a stretchy `√` or a `\left`/`\right` fence needs. A face with no
-//! ladder for the request degrades to the unstretched base glyph rather than
-//! failing: the raster path has no per-glyph error channel, and discarding
-//! every other formula on the page because one font lacks a table would be
-//! worse than a short fence.
-//! The frame is the draw list's INK bounds (`DrawList.bounds()`), the same
-//! source svg.zig frames its viewBox from, so a bitmap and an SVG of one draw
-//! list cover the same content.
+//! face that codepoint actually draws from
+//! (`FontContext.faceForCodepoint` — the style's own face when it carries
+//! the glyph, the math face when only that one does), then decodes that
+//! face's outline — including the OpenType MATH form the layout boxed: the
+//! size variant a display big operator, a stretchy `√` or a `\left`/`\right`
+//! fence needs, and, for a fence taller than its whole ladder, the whole
+//! glyph ASSEMBLY stacked to the height TeX asked for. Which glyph that is
+//! comes from `ztex.glyph`, the same resolver `svg.zig` draws with. A face
+//! with no ladder for the request degrades to the unstretched base glyph
+//! rather than failing: the raster path has no per-glyph error channel, and
+//! discarding every other formula on the page because one font lacks a
+//! table would be worse than a short fence.
+//!
+//! ONE LOGICAL GLYPH IS ONE PIECE OF INK. An assembly's parts overlap by the
+//! font's own MinConnectorOverlap, so filling each part on its own applies
+//! the ink alpha twice in every join — a translucent `\left(` came out with
+//! dark seams down its length, where `svg.zig`'s single compound path put one
+//! fill. The parts are therefore cut into disjoint bands along the axis the
+//! stack grows on, so no pixel is ever swept by two of them: each is composited
+//! once, and its antialiased edges stay soft. See `GlyphItem.assignBands`.
 
 const std = @import("std");
 const context = @import("context.zig");
@@ -24,8 +35,18 @@ const coverage = @import("coverage.zig");
 const layout = @import("ztex.layout");
 const draw = layout.draw;
 const atom = @import("ztex.atom");
-const font = @import("font.zig");
+const font = @import("ztex.font");
+const glyph = @import("ztex.glyph");
 
+/// Allocation, option, coordinate, size-limit, and font-decoding failures.
+pub const Error = error{
+    OutOfMemory,
+    InvalidArgument,
+    OutputTooLarge,
+    NonFiniteCoordinate,
+} || font.FontError;
+
+/// Pixel storage format; both variants preserve ink alpha.
 pub const Format = enum {
     /// 32-bit RGBA (R, G, B, A in byte order)
     rgba32,
@@ -37,6 +58,8 @@ pub const Format = enum {
     alpha8,
 };
 
+/// Frame and paint settings for point-coordinate draw lists.
+/// Defaults target a screen at 96 DPI with opaque black ink and no background.
 pub const Options = struct {
     /// Target resolution in DPI (dots per inch). Standard web/screen is 96.0;
     /// print is 300.0+. Must be a positive finite number, or
@@ -48,8 +71,14 @@ pub const Options = struct {
     /// Padding around the content in pixels, on both axes. A margin whose
     /// framed extent or row stride no 32-bit size can describe is
     /// `error.OutputTooLarge`, refused before the pixel block is requested.
+    /// Glyph geometry excludes this margin; only output indexing adds it.
     padding: u32 = 0,
-    /// Output pixel format.
+    /// Largest accepted pixel payload. The default imposes no cap beyond
+    /// `usize`; lower it to bound output memory. Exceeding it returns
+    /// `error.OutputTooLarge` before pixel allocation. It does not bound
+    /// font or scanline scratch allocations.
+    max_bytes: usize = std.math.maxInt(usize),
+    /// RGBA preserves color by default; choose `alpha8` for a coverage mask.
     format: Format = .rgba32,
     /// Ink color for primitives no color scope covers. Default is black
     /// (#000000FF). A primitive an explicit color scope covers paints its own
@@ -63,30 +92,48 @@ pub const Options = struct {
     bg: ?draw.Color = null,
 };
 
-/// A rasterized pixel buffer owned by the caller. Never copy one by value:
-/// `deinit` frees `pixels` exactly once.
+/// Independently owned, row-major pixels; no source or context borrow survives.
+/// Keep the allocator valid and unchanged through exactly one `deinit`.
+/// Copying shares storage, not ownership. Read-only access may be shared;
+/// mutation or disposal must not overlap another use.
 pub const PixelBuffer = struct {
+    /// Borrowed allocator used for `pixels`; must retain its original identity.
     gpa: std.mem.Allocator,
-    /// Pixel payload. For rgba32, length is width * height * 4. For alpha8, width * height.
+    /// Owned payload; length is `height * stride`. RGBA channels use straight alpha.
     pixels: []u8,
+    /// Pixel dimensions; indices satisfy `x < width` and `y < height`.
     width: u32,
     height: u32,
-    /// Bytes per row: width * 4 for rgba32, width for alpha8. Row `y` starts
-    /// at `pixels[y * stride]`, and rows run top-down.
+    /// Bytes per row, top-down: four per RGBA pixel or one per alpha pixel.
+    /// Row offsets must use `usize`, not `u32`: a native payload may exceed 4 GiB.
     stride: u32,
+    /// Encoding of every pixel in `pixels`; changing it invalidates the layout.
     format: Format,
 
+    /// Releases the pixel storage, not the allocator. The value and all aliases
+    /// are invalid afterward; repeat disposal, including through a copy, is invalid.
     pub fn deinit(self: *PixelBuffer) void {
         self.gpa.free(self.pixels);
         self.* = undefined;
     }
 
-    /// Write buffer as a binary Netpbm image: PPM (P6) for rgba32, PGM (P5) for alpha8.
-    pub fn writePnm(self: *const PixelBuffer, io: std.Io, file: std.Io.File) !void {
+    /// Write P6 RGB composited over white, or P5 coverage without a matte.
+    ///
+    /// Borrows `io` and `file` for this blocking call; neither is closed or
+    /// retained. A write error, including `error.Canceled`, may leave a prefix
+    /// in the file. The buffer is unchanged. This adds no image allocation;
+    /// the I/O provider controls its own temporary storage.
+    pub fn writePnm(
+        self: *const PixelBuffer,
+        io: std.Io,
+        file: std.Io.File,
+    ) std.Io.File.Writer.Error!void {
         var hdr_buf: [64]u8 = undefined;
         switch (self.format) {
             .rgba32 => {
-                const hdr = try std.fmt.bufPrint(&hdr_buf, "P6\n{d} {d}\n255\n", .{ self.width, self.height });
+                const hdr = std.fmt.bufPrint(&hdr_buf, "P6\n{d} {d}\n255\n", .{
+                    self.width, self.height,
+                }) catch unreachable;
                 try file.writeStreamingAll(io, hdr);
                 var row_buf: [4096 * 3]u8 = undefined;
                 // usize offsets: the 32-bit frame bounds ONE row, so a
@@ -100,8 +147,21 @@ pub const PixelBuffer = struct {
                     while (x < self.width) {
                         const chunk: usize = @min(self.width - x, row_buf.len / 3);
                         for (0..chunk) |i| {
-                            const src_px = row[(x + i) * 4 .. (x + i) * 4 + 3];
-                            @memcpy(row_buf[i * 3 .. i * 3 + 3], src_px);
+                            const src_px = row[(x + i) * 4 ..][0..4];
+                            const dst = row_buf[i * 3 ..][0..3];
+                            const alpha: u16 = src_px[3];
+                            if (alpha == 255) {
+                                @memcpy(dst, src_px[0..3]);
+                            } else if (alpha == 0) {
+                                @memset(dst, 255);
+                            } else {
+                                const matte: u16 = 255 * (255 - alpha) + 127;
+                                for (0..3) |channel| {
+                                    dst[channel] = @intCast(
+                                        (@as(u16, src_px[channel]) * alpha + matte) / 255,
+                                    );
+                                }
+                            }
                         }
                         try file.writeStreamingAll(io, row_buf[0 .. chunk * 3]);
                         x += chunk;
@@ -109,7 +169,9 @@ pub const PixelBuffer = struct {
                 }
             },
             .alpha8 => {
-                const hdr = try std.fmt.bufPrint(&hdr_buf, "P5\n{d} {d}\n255\n", .{ self.width, self.height });
+                const hdr = std.fmt.bufPrint(&hdr_buf, "P5\n{d} {d}\n255\n", .{
+                    self.width, self.height,
+                }) catch unreachable;
                 try file.writeStreamingAll(io, hdr);
                 try file.writeStreamingAll(io, self.pixels);
             },
@@ -119,62 +181,54 @@ pub const PixelBuffer = struct {
 
 const testing = std.testing;
 
-test "PixelBuffer.writePnm writes wide RGBA rows" {
-    for ([_]u32{ 2730, 2731, 4099 }) |width| {
-        const width_usize: usize = width;
-        const stride = width * 4;
-        var header_buffer: [64]u8 = undefined;
-        const header = try std.fmt.bufPrint(&header_buffer, "P6\n{d} 1\n255\n", .{width});
-
-        const pixels = try testing.allocator.alloc(u8, width_usize * 4);
-        var pixel_buffer: PixelBuffer = .{
-            .gpa = testing.allocator,
-            .pixels = pixels,
-            .width = width,
-            .height = 1,
-            .stride = stride,
-            .format = .rgba32,
-        };
-        defer pixel_buffer.deinit();
-
-        const expected = try testing.allocator.alloc(u8, header.len + width_usize * 3);
-        defer testing.allocator.free(expected);
-        @memcpy(expected[0..header.len], header);
-        for (0..width_usize) |x| {
-            const rgb = [3]u8{
-                @truncate(x),
-                @truncate(x >> 4),
-                @truncate(x >> 8),
-            };
-            const pixel_offset = x * 4;
-            pixels[pixel_offset] = rgb[0];
-            pixels[pixel_offset + 1] = rgb[1];
-            pixels[pixel_offset + 2] = rgb[2];
-            pixels[pixel_offset + 3] = 0xa5;
-
-            const pnm_offset = header.len + x * 3;
-            expected[pnm_offset] = rgb[0];
-            expected[pnm_offset + 1] = rgb[1];
-            expected[pnm_offset + 2] = rgb[2];
-        }
-
-        var tmp = testing.tmpDir(.{});
-        defer tmp.cleanup();
-        {
-            const file = try tmp.dir.createFile(testing.io, "chunked.ppm", .{});
-            defer file.close(testing.io);
-            try pixel_buffer.writePnm(testing.io, file);
-        }
-
-        const actual = try tmp.dir.readFileAlloc(
-            testing.io,
-            "chunked.ppm",
-            testing.allocator,
-            .limited(expected.len + 1),
-        );
-        defer testing.allocator.free(actual);
-        try testing.expectEqualSlices(u8, expected, actual);
+test "PixelBuffer.writePnm white-mattes straight alpha across rows and chunks" {
+    const width: u32 = 4097;
+    const height: u32 = 2;
+    const rgba = [_][4]u8{
+        .{ 0, 45, 155, 0 },
+        .{ 0, 0, 0, 128 },
+        .{ 255, 0, 0, 128 },
+        .{ 17, 63, 250, 255 },
+    };
+    const rgb = [_][3]u8{
+        .{ 255, 255, 255 },
+        .{ 127, 127, 127 },
+        .{ 255, 127, 127 },
+        .{ 17, 63, 250 },
+    };
+    const count: usize = width * height;
+    var pixel_buffer: PixelBuffer = .{
+        .gpa = testing.allocator,
+        .pixels = try testing.allocator.alloc(u8, count * 4),
+        .width = width,
+        .height = height,
+        .stride = width * 4,
+        .format = .rgba32,
+    };
+    defer pixel_buffer.deinit();
+    const header = "P6\n4097 2\n255\n";
+    const expected = try testing.allocator.alloc(u8, header.len + count * 3);
+    defer testing.allocator.free(expected);
+    @memcpy(expected[0..header.len], header);
+    for (0..count) |i| {
+        @memcpy(pixel_buffer.pixels[i * 4 ..][0..4], &rgba[i % rgba.len]);
+        @memcpy(expected[header.len + i * 3 ..][0..3], &rgb[i % rgb.len]);
     }
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const file = try tmp.dir.createFile(testing.io, "chunked.ppm", .{});
+        defer file.close(testing.io);
+        try pixel_buffer.writePnm(testing.io, file);
+    }
+    const actual = try tmp.dir.readFileAlloc(
+        testing.io,
+        "chunked.ppm",
+        testing.allocator,
+        .limited(expected.len + 1),
+    );
+    defer testing.allocator.free(actual);
+    try testing.expectEqualSlices(u8, expected, actual);
 }
 
 /// Where the draw list's ink origin (x = 0, y = the ink top) lands in the
@@ -198,22 +252,23 @@ const Origin = struct {
 /// `error.InvalidArgument` for a `dpi`/`scale` that is not a positive finite
 /// number, on `error.NonFiniteCoordinate` for a draw list with a non-finite
 /// ink extent — the same coordinate error the SVG serializer reports for it —
-/// and on `error.OutputTooLarge` for a frame, row stride or payload no 32-bit
-/// size can describe, each checked BEFORE the pixel block is requested, so a
-/// hostile option is refused rather than wrapped, clamped or trapped in an
-/// integer cast. Allocation failure and a malformed glyph outline in the face
-/// fail as before; a glyph that is merely missing is drawn as nothing.
+/// and on `error.OutputTooLarge` for dimensions or stride beyond `u32`,
+/// a payload beyond `usize`, or a payload above `opts.max_bytes`, before
+/// pixel allocation. A native payload is not otherwise limited to 32 bits.
+/// Missing glyphs paint nothing; malformed glyph outlines return font errors.
+///
+/// The caller owns the returned buffer and releases it with `deinit` once.
+/// `ctx`, `dl`, their source bytes, and borrowed faces must remain valid for
+/// the call only. On error all pixel and scanline allocations are released
+/// and no partial buffer escapes; the context's existing caches remain live.
+/// Serialize access to a shared context. This CPU operation performs no I/O
+/// and has no cancellation points.
 pub fn rasterize(
     gpa: std.mem.Allocator,
     ctx: *context.Context,
     dl: *const draw.DrawList,
     opts: Options,
-) (error{
-    OutOfMemory,
-    InvalidArgument,
-    OutputTooLarge,
-    NonFiniteCoordinate,
-} || font.FontError)!PixelBuffer {
+) Error!PixelBuffer {
     // Every length below is a multiple of the pt → px scale, so a dpi or
     // scale that is not a positive finite number — or a product that
     // overflows to infinity — has no pixel size to compute, and rounding one
@@ -245,6 +300,7 @@ pub fn rasterize(
     const stride = std.math.mul(u32, width, bytes_per_pixel) catch return error.OutputTooLarge;
     const total_bytes = std.math.mul(usize, @as(usize, height), @as(usize, stride)) catch
         return error.OutputTooLarge;
+    if (total_bytes > opts.max_bytes) return error.OutputTooLarge;
 
     const pixels = try gpa.alloc(u8, total_bytes);
     errdefer gpa.free(pixels);
@@ -271,11 +327,17 @@ pub fn rasterize(
 
     const pad_f: f32 = @floatFromInt(pad);
 
+    // One scratch for the whole frame: the per-item buffers below are
+    // reused by every item, and the decoded outline of a glyph is decoded
+    // once for the frame instead of once per placement.
+    var scratch: GlyphScratch = .{ .gpa = gpa };
+    defer scratch.deinit();
+
     for (dl.items.items) |d| {
         switch (d) {
             .text => |t| {
                 try drawGlyph(
-                    gpa,
+                    &scratch,
                     ctx,
                     pixels,
                     width,
@@ -285,7 +347,7 @@ pub fn rasterize(
                     inkOf(opts, t.color, t.color_override),
                     t,
                     pt_to_px,
-                    pad_f,
+                    pad,
                     origin,
                 );
             },
@@ -516,7 +578,7 @@ test "rasterize: a diagonal line paints its stroke band, not its bounding box" {
     // A box fill would have inked it.
     try testing.expectEqual(@as(u8, 0), at(buf, 1, 9));
     try testing.expectEqual(@as(u8, 0), at(buf, 9, 1));
-    // Butt caps, as svg.zig's <line> declares by default (no cap attribute):
+    // Butt caps match the filled SVG band's endpoint planes:
     // the pixel past the endpoint's plane is outside the band, so nothing is
     // painted there and the ink stops exactly where the box extents say.
     try testing.expectEqual(@as(u8, 0), at(buf, 9, 9));
@@ -648,6 +710,67 @@ test "rasterize: a margin shifts the picture and paints nothing outside it" {
     try testing.expect(worst <= 1);
 }
 
+test "rasterize: integer padding preserves glyph coverage" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    const pad: u32 = 4;
+    const cases = [_]struct { source: []const u8, style: layout.Style, size: f32 }{
+        .{ .source = "\\mathrm{\\alpha+\\sqrt{x}}+\\textit{α}", .style = .display, .size = 8 },
+        .{
+            .source = "\\sqrt{1+\\sqrt{1+\\sqrt{1+\\sqrt{1+\\sqrt{1+\\sqrt{1+x}}}}}}",
+            .style = .script,
+            .size = 20,
+        },
+        .{ .source = "\\sqrt{\\frac{a}{b}}", .style = .display, .size = 20 },
+        .{ .source = "x^2_0", .style = .display, .size = 20 },
+    };
+    for (cases) |case| {
+        var dl = try ctx.render(case.source, case.style, case.size, null);
+        defer dl.deinit();
+        var bare = try rasterize(testing.allocator, &ctx, &dl, .{
+            .dpi = 300,
+            .format = .alpha8,
+        });
+        defer bare.deinit();
+        var margined = try rasterize(testing.allocator, &ctx, &dl, .{
+            .dpi = 300,
+            .format = .alpha8,
+            .padding = pad,
+        });
+        defer margined.deinit();
+
+        try testing.expectEqual(bare.width + 2 * pad, margined.width);
+        try testing.expectEqual(bare.height + 2 * pad, margined.height);
+
+        const margin: usize = pad;
+        const core_w: usize = bare.width;
+        const core_h: usize = bare.height;
+        var worst: i32 = 0;
+        for (0..@as(usize, margined.height)) |y| {
+            for (0..@as(usize, margined.width)) |x| {
+                const value = margined.pixels[y * @as(usize, margined.stride) + x];
+                const in_core = y >= margin and y < margin + core_h and
+                    x >= margin and x < margin + core_w;
+                if (!in_core) {
+                    // Measured ink remains inside the unpadded frame.
+                    try testing.expectEqual(@as(u8, 0), value);
+                    continue;
+                }
+                const core = bare.pixels[(y - margin) * @as(usize, bare.stride) + x - margin];
+                const delta = @as(i32, value) - @as(i32, core);
+                worst = @max(worst, if (delta < 0) -delta else delta);
+            }
+        }
+        if (worst != 0) {
+            std.debug.print(
+                "a margin of {d} moved the picture by {d}: {s} at {d}pt {s}\n",
+                .{ pad, worst, case.source, case.size, @tagName(case.style) },
+            );
+        }
+        try testing.expectEqual(@as(i32, 0), worst);
+    }
+}
+
 // Every length in the frame is a multiple of the pt → px scale, so a dpi
 // or scale that is not a positive finite number leaves nothing to round a
 // pixel count from: the product is NaN or infinite, and `@intFromFloat`
@@ -711,6 +834,38 @@ test "rasterize: a frame no 32-bit size can describe is refused before allocatin
         error.OutputTooLarge,
         rasterize(testing.failing_allocator, &ctx, &dl, .{ .dpi = 1e30 }),
     );
+}
+
+test "rasterize: payload cap is checked before allocating and includes every row" {
+    // An empty frame is 2x2 after the minimum content and edge bearing.
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    var dl = draw.DrawList.init(testing.allocator);
+    defer dl.deinit();
+    for ([_]Format{ .rgba32, .alpha8 }) |format| {
+        const bytes: usize = if (format == .rgba32) 16 else 4;
+        try testing.expectError(
+            error.OutputTooLarge,
+            rasterize(testing.failing_allocator, &ctx, &dl, .{
+                .dpi = 72,
+                .format = format,
+                .max_bytes = bytes - 1,
+            }),
+        );
+        var accepted = try rasterize(testing.allocator, &ctx, &dl, .{
+            .dpi = 72,
+            .format = format,
+            .max_bytes = bytes,
+        });
+        defer accepted.deinit();
+        try testing.expectEqual(@as(u32, 2), accepted.width);
+        try testing.expectEqual(@as(u32, 2), accepted.height);
+        try testing.expectEqualSlices(
+            u8,
+            if (format == .rgba32) &([_]u8{0} ** 16) else &([_]u8{0} ** 4),
+            accepted.pixels,
+        );
+    }
 }
 
 // The frame is cut from the ink bounds, so a draw list carrying a non-finite
@@ -778,6 +933,20 @@ fn item(bytes: []const u8, style: atom.CharStyle) draw.Text {
     };
 }
 
+/// The MATH form a draw item asks for, through the same builder `svg.zig`
+/// uses: one request, one resolver, so the two back ends cannot disagree
+/// about which glyph an item paints.
+fn requestOf(t: draw.Text) ?glyph.Request {
+    return glyph.requestFor(t.bytes, .{
+        .bigop_variant = t.bigop_form == .variant,
+        .radical_form = t.radical_form,
+        .delim_form = t.delim_form,
+        .delim_fixed = t.delim_fixed,
+        .delim_req = t.delim_req,
+        .horizontal_req = t.horizontal_req,
+    });
+}
+
 /// Rasterize one draw item at 20pt / 72 dpi (1 px per pt) inside a frame far
 /// larger than any variant, so a taller rung is never clipped by the box.
 fn rasterOne(gpa: std.mem.Allocator, ctx: *context.Context, t: draw.Text) !PixelBuffer {
@@ -821,171 +990,76 @@ fn expectResolved(comptime T: type, subject: []const u8, resolved: ?T) error{Mis
     return error.MissingGlyph;
 }
 
-// The old rasterizer named 62 Latin Modern glyph ids literally: 4 big
-// operators, 6 radical pieces and 52 fence rungs. Every one of them must
-// come back out of the font's own MATH table unchanged, so the lookup is a
-// pure substitution for those families. The ids live only here, as
-// expectations — no draw path names a glyph.
-test "resolveGlyph: the MATH table reproduces every former hardcoded glyph id" {
+// The old rasterizer named 62 Latin Modern glyph ids literally: display
+// operators, radical pieces and fence rungs. Nothing names a glyph id now —
+// the face's own MATH table answers — so what has to hold is that every
+// family those ids covered really GROWS: seven rungs of seven different
+// heights, for every fence the layout can ask for, including the ones the
+// old per-codepoint switch forgot and drew at their base size.
+test "rasterize: every fence family grows through its own variant ladder" {
     var ctx = try context.Context.init(testing.allocator);
     defer ctx.deinit();
-    const face = ctx.fonts.faceForStyle(.italic);
-
-    // Display big operators: .v1 of each operator's own ladder.
-    const bigops = [_]struct { cp: u21, text: []const u8, gid: u32 }{
-        .{ .cp = 0x2211, .text = "\u{2211}", .gid = 3074 }, // ∑ summation.v1
-        .{ .cp = 0x220F, .text = "\u{220F}", .gid = 3075 }, // ∏ product.v1
-        .{ .cp = 0x222B, .text = "\u{222B}", .gid = 3063 }, // ∫ integral.v1
-        .{ .cp = 0x222E, .text = "\u{222E}", .gid = 3067 }, // ∮ contourintegral.v1
-        // The old switch named only the four above, so every other display
-        // operator fell through to its BASE glyph — ∐, ⋃, ⋂, ⨆, ∯ and ∰
-        // all have a .v1 the layout meant to draw.
-        .{ .cp = 0x2210, .text = "\u{2210}", .gid = 3076 }, // ∐ coproduct.v1
-        .{ .cp = 0x222F, .text = "\u{222F}", .gid = 3068 }, // ∯ contourint.v1
-        .{ .cp = 0x2230, .text = "\u{2230}", .gid = 3069 }, // ∰ contouriint.v1
-        .{ .cp = 0x22C3, .text = "\u{22C3}", .gid = 2768 }, // ⋃ nbigcup.v1
-        .{ .cp = 0x22C2, .text = "\u{22C2}", .gid = 2766 }, // ⋂ nbigcap.v1
-        .{ .cp = 0x2A06, .text = "\u{2A06}", .gid = 2793 }, // ⨆ bigsqcup.v1
+    const fences = [_][]const u8{
+        "(",        ")",        "[",        "]",        "{",        "}",
+        "|",        "\u{2223}", "\u{2225}", "\u{230A}", "\u{230B}", "\u{2308}",
+        "\u{2309}", "\u{27E8}", "\u{27E9}", "/",
     };
-    for (bigops) |op| {
-        var t = item(op.text, .italic);
-        t.bigop_form = .variant;
-        try testing.expectEqual(op.gid, resolveGlyph(face, op.cp, &t).?);
-    }
-
-    // The √ vertical variants radical.v1 … radical.v4.
-    for ([_]u32{ 3081, 3082, 3083, 3084 }, 0..) |gid, rung| {
-        var t = item("\u{221A}", .italic);
-        t.radical_form = @intCast(rung + 1);
-        try testing.expectEqual(gid, resolveGlyph(face, radical_cp, &t).?);
-    }
-    // The √ glyph ASSEMBLY's three pieces, bottom → extender → top. The old
-    // switch named only the top two and let radical_form 7 reach the cmap's
-    // U+23B7 — the same glyph in Latin Modern, but only by coincidence of
-    // that font's numbering.
-    const pieces = [_]struct { form: u8, gid: u32 }{
-        .{ .form = radical_form_top, .gid = 3080 },
-        .{ .form = radical_form_extender, .gid = 3079 },
-        .{ .form = radical_form_bottom, .gid = 3078 },
-    };
-    for (pieces) |piece| {
-        var t = item("\u{221A}", .italic);
-        t.radical_form = piece.form;
-        try testing.expectEqual(piece.gid, resolveGlyph(face, radical_cp, &t).?);
-    }
-
-    // Fence ladders .v1 … .v7. `|` and ∣ share the divides construction.
-    const divides = [7]u32{ 2677, 2684, 2691, 2698, 2705, 2712, 2719 };
-    const floor_left = [7]u32{ 2377, 2399, 2421, 2443, 2465, 2487, 2535 };
-    const floor_right = [7]u32{ 2378, 2400, 2422, 2444, 2466, 2488, 2536 };
-    const ceil_left = [7]u32{ 2375, 2397, 2419, 2441, 2463, 2485, 2533 };
-    const ceil_right = [7]u32{ 2376, 2398, 2420, 2442, 2464, 2486, 2534 };
-    const angle_left = [7]u32{ 2583, 2587, 2591, 2595, 2599, 2603, 2607 };
-    const angle_right = [7]u32{ 2584, 2588, 2592, 2596, 2600, 2604, 2608 };
-    const slash = [7]u32{ 2672, 2679, 2686, 2693, 2700, 2707, 2714 };
-    const fences = [_]struct { cp: u21, text: []const u8, ladder: [7]u32 }{
-        .{ .cp = '(', .text = "(", .ladder = .{ 2367, 2389, 2411, 2433, 2455, 2477, 2499 } },
-        .{ .cp = ')', .text = ")", .ladder = .{ 2368, 2390, 2412, 2434, 2456, 2478, 2500 } },
-        .{ .cp = '[', .text = "[", .ladder = .{ 2373, 2395, 2417, 2439, 2461, 2483, 2525 } },
-        .{ .cp = ']', .text = "]", .ladder = .{ 2374, 2396, 2418, 2440, 2462, 2484, 2526 } },
-        .{ .cp = '{', .text = "{", .ladder = .{ 2371, 2393, 2415, 2437, 2459, 2481, 2515 } },
-        .{ .cp = '}', .text = "}", .ladder = .{ 2372, 2394, 2416, 2438, 2460, 2482, 2516 } },
-        .{ .cp = '|', .text = "|", .ladder = divides },
-        .{ .cp = 0x2223, .text = "\u{2223}", .ladder = divides },
-        // ‖ parallel has its own construction. The old switch clamped rungs
-        // 5-7 of divides AND parallel to .v4; the ladder has rungs there.
-        .{
-            .cp = 0x2225,
-            .text = "\u{2225}",
-            .ladder = .{ 2678, 2685, 2692, 2699, 2706, 2713, 2720 },
-        },
-        // The old per-codepoint switch named none of these, so \left⌊,
-        // \left⟨ and \left/ all fell through to their BASE glyph. They have
-        // real ladders; pin the rungs they now draw.
-        .{ .cp = 0x230A, .text = "\u{230A}", .ladder = floor_left },
-        .{ .cp = 0x230B, .text = "\u{230B}", .ladder = floor_right },
-        .{ .cp = 0x2308, .text = "\u{2308}", .ladder = ceil_left },
-        .{ .cp = 0x2309, .text = "\u{2309}", .ladder = ceil_right },
-        .{ .cp = 0x27E8, .text = "\u{27E8}", .ladder = angle_left },
-        .{ .cp = 0x27E9, .text = "\u{27E9}", .ladder = angle_right },
-        .{ .cp = 0x002F, .text = "/", .ladder = slash },
-    };
-    for (fences) |fence| {
-        for (fence.ladder, 0..) |gid, rung| {
-            var t = item(fence.text, .italic);
-            t.delim_form = @intCast(rung + 1);
-            try testing.expectEqual(gid, resolveGlyph(face, fence.cp, &t).?);
+    for (fences) |text| {
+        var previous: ?PixelBuffer = null;
+        defer if (previous) |*p| p.deinit();
+        var previous_rows: usize = 0;
+        for (1..8) |rung| {
+            var t = item(text, .italic);
+            t.delim_form = @intCast(rung);
+            const buffer = try rasterOne(testing.allocator, &ctx, t);
+            const rows = inkedRows(buffer);
+            try testing.expect(rows > previous_rows);
+            if (previous) |before| {
+                // Same frame, same pen position: a differing bitmap means a
+                // DIFFERENT glyph, not the same one nudged.
+                try testing.expectEqual(before.pixels.len, buffer.pixels.len);
+                try testing.expect(!std.mem.eql(u8, before.pixels, buffer.pixels));
+            }
+            if (previous) |*before| before.deinit();
+            previous = buffer;
+            previous_rows = rows;
         }
     }
+}
 
-    // amsmath's FIXED rule: the rung whose ladder ink covers req_em, with
-    // 2.392em (\binom at display) landing on parenleft.v6.
-    const fixed = [_]struct { req_em: f32, gid: u32 }{
-        .{ .req_em = 0.5, .gid = 2367 },
-        .{ .req_em = 0.9, .gid = 2389 },
-        .{ .req_em = 1.2, .gid = 2411 },
-        .{ .req_em = 1.5, .gid = 2433 },
-        .{ .req_em = 1.9, .gid = 2455 },
-        .{ .req_em = 2.392, .gid = 2477 },
-        .{ .req_em = 2.8, .gid = 2499 },
+// Every display operator draws its OWN display form. The old switch named
+// four of them and let the rest fall through to their base glyphs, so ∬ came
+// out identical to ∮; what has to hold now is that no two display operators
+// share a drawing and none of them is its base form.
+test "rasterize: every display operator draws its own display form" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    const operators = [_][]const u8{
+        "\u{2211}", "\u{220F}", "\u{222B}", "\u{222E}", "\u{2210}", "\u{222F}",
+        "\u{2230}", "\u{22C3}", "\u{22C2}", "\u{2A06}", "\u{2A11}",
     };
-    for (fixed) |f| {
-        var t = item("(", .italic);
-        t.delim_fixed = f.req_em;
-        try testing.expectEqual(f.gid, resolveGlyph(face, '(', &t).?);
+    for (operators) |text| {
+        var display = item(text, .italic);
+        display.bigop_form = .variant;
+        const base = item(text, .italic);
+        var display_buffer = try rasterOne(testing.allocator, &ctx, display);
+        defer display_buffer.deinit();
+        var base_buffer = try rasterOne(testing.allocator, &ctx, base);
+        defer base_buffer.deinit();
+        try testing.expect(inkedPixels(display_buffer) > 0);
+        // The display form is a different drawing from the base one.
+        try testing.expect(!std.mem.eql(u8, display_buffer.pixels, base_buffer.pixels));
     }
-}
-
-// U+2A11 ∬ was pinned to U+222E ∮'s .v1, so every double contour integral
-// rasterized as a single one. Its own ladder starts at 3071.
-test "resolveGlyph: a display \\iint draws contourint2.v1, not \\oint's variant" {
-    var ctx = try context.Context.init(testing.allocator);
-    defer ctx.deinit();
-    const face = ctx.fonts.faceForStyle(.italic);
-
+    // ∬ and ∮ used to be the same bitmap; now they are not.
     var oint = item("\u{222E}", .italic);
     oint.bigop_form = .variant;
     var iint = item("\u{2A11}", .italic);
     iint.bigop_form = .variant;
-
-    const oint_gid = try expectResolved(u32, "U+222E .v1", resolveGlyph(face, 0x222E, &oint));
-    const iint_gid = try expectResolved(u32, "U+2A11 .v1", resolveGlyph(face, 0x2A11, &iint));
-    try testing.expectEqual(@as(u32, 3067), oint_gid);
-    try testing.expectEqual(@as(u32, 3071), iint_gid);
-    try testing.expect(iint_gid != oint_gid);
-    // Read back from the table, not from a constant: 3071 IS contourint2.v1.
-    const base = try expectResolved(u32, "U+2A11 base glyph", face.glyphIndex(0x2A11));
-    const ladder = try expectResolved(font.MathVariants, "U+2A11 ladder", face.variants(base));
-    try testing.expectEqual(@as(usize, 1), ladder.len());
-    try testing.expectEqual(iint_gid, ladder.glyph(0));
-}
-
-// The bug reached the pixels, not just the glyph id: with U+2A11 pinned to
-// U+222E's variant, a display ∬ and a display ∮ produced the SAME bitmap.
-test "rasterize: a display \\iint and \\oint no longer rasterize identically" {
-    var ctx = try context.Context.init(testing.allocator);
-    defer ctx.deinit();
-
-    var oint = item("\u{222E}", .italic);
-    oint.bigop_form = .variant;
-    var iint = item("\u{2A11}", .italic);
-    iint.bigop_form = .variant;
-    const iint_base = item("\u{2A11}", .italic);
-
     var oint_buffer = try rasterOne(testing.allocator, &ctx, oint);
     defer oint_buffer.deinit();
     var iint_buffer = try rasterOne(testing.allocator, &ctx, iint);
     defer iint_buffer.deinit();
-    var base_buffer = try rasterOne(testing.allocator, &ctx, iint_base);
-    defer base_buffer.deinit();
-
-    try testing.expect(inkedPixels(oint_buffer) > 0);
-    try testing.expect(inkedPixels(iint_buffer) > 0);
-    // The bug: ∬ was pinned to ∮'s variant, so the two drew the same pixels.
     try testing.expect(!std.mem.eql(u8, iint_buffer.pixels, oint_buffer.pixels));
-    // And the variant rung is what reaches the pixels — ∬ at base size is a
-    // different drawing again, so the ladder is genuinely consulted.
-    try testing.expect(!std.mem.eql(u8, iint_buffer.pixels, base_buffer.pixels));
 }
 
 // A fence must grow along its variant ladder, not by scaling the base
@@ -1031,20 +1105,36 @@ test "rasterize: a fence grows through the variant ladder, rung by rung" {
 // A face with no MATH table must degrade, never fail: the fence still
 // renders as its base cmap glyph, and a codepoint the face cannot map at
 // all is skipped instead of borrowing a glyph id from another font.
-test "resolveGlyph: a face with no MATH table degrades to the base glyph" {
+test "rasterize: a face with no MATH table degrades to the base glyph" {
     var ctx = try context.Context.init(testing.allocator);
     defer ctx.deinit();
     const face = ctx.fonts.faceForStyle(.roman);
+    const original_math = ctx.fonts.math;
+    ctx.fonts.math = face;
+    defer ctx.fonts.math = original_math;
     // Precondition: the Roman face really carries no MATH data.
     try testing.expect(face.mathConstants() == null);
 
     var stretched = item("(", .roman);
     stretched.delim_form = 6;
     const plain = item("(", .roman);
-    try testing.expectEqual(
-        face.glyphIndex('(').?,
-        resolveGlyph(face, '(', &stretched).?,
-    );
+    // The request the CPU resolver answers with: no ladder, no assembly, so
+    // the one glyph it CAN honestly draw is the codepoint's own.
+    const built = (try glyph.plan(
+        testing.allocator,
+        face,
+        requestOf(stretched) orelse return error.NoRequest,
+    )) orelse return error.MissingGlyph;
+    switch (built) {
+        .stack => return error.AssembledWithoutMath,
+        .single => |part| {
+            try testing.expectEqual(
+                face.glyphIndex('(') orelse return error.MissingGlyph,
+                part.glyph,
+            );
+            try testing.expectEqual(@as(f32, 0), part.y_em);
+        },
+    }
 
     var stretched_buffer = try rasterOne(testing.allocator, &ctx, stretched);
     defer stretched_buffer.deinit();
@@ -1057,109 +1147,391 @@ test "resolveGlyph: a face with no MATH table degrades to the base glyph" {
     // ∑ is absent from the Roman face, so there is nothing to degrade TO.
     var op = item("\u{2211}", .roman);
     op.bigop_form = .variant;
-    try testing.expect(resolveGlyph(face, 0x2211, &op) == null);
+    try testing.expectEqual(
+        @as(?glyph.Plan, null),
+        try glyph.plan(testing.allocator, face, requestOf(op) orelse return error.NoRequest),
+    );
     var empty_buffer = try rasterOne(testing.allocator, &ctx, op);
     defer empty_buffer.deinit();
     try testing.expectEqual(@as(usize, 0), inkedPixels(empty_buffer));
 }
 
-/// U+221A √ — the glyph an OpenType MATH table keys the radical's vertical
-/// size variants and its glyph assembly under. layout.zig boxes the ASSEMBLY
-/// pieces under the placeholder codepoints U+F300 (top), U+F301 (extender)
-/// and U+23B7 (bottom); the private-use pair is in no cmap, so those pieces
-/// resolve through this anchor instead of through the codepoint on the draw
-/// item.
-const radical_cp: u21 = 0x221A;
+// A fence whose content outgrew the whole ladder has no glyph to draw: it
+// is a STACK. It must paint taller than the largest variant it replaced,
+// and reach the height layout asked for, or a tall pmatrix comes out with
+// parentheses that stop halfway down the last row.
+test "rasterize: a fence past the largest variant paints an assembly of that height" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    const size: f32 = 20;
 
-/// Which piece of the radical's MATH glyph assembly layout.zig is asking for.
-/// Values below `radical_form_top` select a pre-built vertical size variant.
-const radical_form_top: u8 = 5;
-const radical_form_extender: u8 = 6;
-const radical_form_bottom: u8 = 7;
+    var tallest = item("(", .italic);
+    tallest.size = size;
+    tallest.delim_form = 7;
+    var tallest_buffer = try rasterOne(testing.allocator, &ctx, tallest);
+    defer tallest_buffer.deinit();
+    const tallest_rows = inkedRows(tallest_buffer);
 
-/// The glyph at the 1-based MATH size-variant position `variant_index` of
-/// `cp`'s ladder. Null when the face carries no MATH table, the codepoint has
-/// no glyph, or the ladder is shorter than the requested rung — the caller
-/// degrades rather than inventing an id. `variants` excludes the base glyph,
-/// hence the -1. Allocation free: the ladder is a view over the face's bytes.
-fn mathVariantGlyph(
-    face: *const font.FontFace,
-    cp: u21,
-    variant_index: u8,
-) ?u32 {
-    if (variant_index == 0) return null;
-    const base_gid = face.glyphIndex(cp) orelse return null;
-    const ladder = face.variants(base_gid) orelse return null;
-    const rung: usize = @as(usize, variant_index) - 1;
-    if (rung >= ladder.len()) return null;
-    return ladder.glyph(rung);
+    var previous_rows: usize = 0;
+    for ([_]f32{ 3.4, 4.5, 6.0 }) |req_em| {
+        var tall = item("(", .italic);
+        tall.size = size;
+        tall.delim_req = req_em;
+        var list = try framedList(testing.allocator, &ctx, tall);
+        defer list.deinit();
+        var buffer = try rasterize(
+            testing.allocator,
+            &ctx,
+            &list,
+            .{ .dpi = 72, .format = .alpha8 },
+        );
+        defer buffer.deinit();
+        const rows = inkedRows(buffer);
+        try testing.expect(rows > tallest_rows);
+        try testing.expect(rows > previous_rows);
+        // The request is in em of the run's size; at 72 dpi one point is one pixel.
+        try testing.expectApproxEqAbs(req_em * size, @as(f32, @floatFromInt(rows)), 2.0);
+        previous_rows = rows;
+    }
 }
 
-/// One piece of the radical's MATH glyph assembly: the top piece, the
-/// extender, or the bottom piece. Null when the face has no MATH table, no √
-/// glyph, no assembly, or an empty one.
-fn radicalAssemblyGlyph(face: *const font.FontFace, piece: u8) ?u32 {
-    const base_gid = face.glyphIndex(radical_cp) orelse return null;
-    const stack = face.assembly(base_gid) orelse return null;
-    if (stack.partCount() == 0) return null;
-    // Parts run bottom to top, so the top piece is the last part.
-    if (piece == radical_form_top) return stack.part(stack.partCount() - 1).glyph;
-    if (piece == radical_form_bottom) return stack.part(0).glyph;
-    if (piece != radical_form_extender) return null;
-    // A construction may list several extender glyphs; the last one is the
-    // piece the top part stacks onto, so that is the one to repeat.
-    var i: usize = stack.partCount();
-    while (i > 0) {
-        i -= 1;
-        if (stack.part(i).extender) return stack.part(i).glyph;
-    }
-    return null;
+/// One draw item in a draw list whose frame is cut from the geometry the
+/// request really paints, so an assembly taller than any size variant is
+/// never clipped by the box it is measured against. The caller deinits it.
+fn framedList(gpa: std.mem.Allocator, ctx: *context.Context, t: draw.Text) !draw.DrawList {
+    const request = requestOf(t) orelse return error.NoRequest;
+    const face = if (glyph.needsGeometry(request))
+        ctx.fonts.math
+    else
+        ctx.fonts.faceForCodepoint(request.cp, t.style);
+    const bounds = (try glyph.paintedBounds(gpa, face, request)) orelse return error.NoAssembly;
+    var dl = draw.DrawList.init(gpa);
+    errdefer dl.deinit();
+    try dl.add(.{ .text = t });
+    // `Draw.Text.y` counts down and a placement's run counts up, so the
+    // painted box runs from -y_max to -y_min in points.
+    dl.accInk(
+        bounds.x_min * t.size - 4,
+        -bounds.y_max * t.size - 4,
+        bounds.x_max * t.size + 4,
+        -bounds.y_min * t.size + 4,
+    );
+    return dl;
 }
 
-/// The amsmath FIXED-rule variant position (1-based) for a delimiter boxed at
-/// `req_em` ink: the smallest rung of metrics.delim_ladder whose ascent plus
-/// descent covers the request.
-fn fixedDelimForm(req_em: f32) u8 {
-    if (req_em >= 2.8) return 7;
-    if (req_em >= 2.3) return 6;
-    if (req_em >= 1.9) return 5;
-    if (req_em >= 1.5) return 4;
-    if (req_em >= 1.2) return 3;
-    if (req_em >= 0.9) return 2;
-    return 1;
+/// A closed axis-aligned rectangle in buffer pixels, wound so the interior
+/// lies to the RIGHT of travel. Lines carry p1 at the midpoint, exactly as a
+/// font outline stores them.
+fn rect(x0: f32, y0: f32, x1: f32, y1: f32, out: *[4]coverage.QuadCurve) void {
+    const pts = [4][2]f32{ .{ x0, y0 }, .{ x0, y1 }, .{ x1, y1 }, .{ x1, y0 } };
+    for (pts, 0..) |a, i| {
+        const b = pts[(i + 1) % 4];
+        out[i] = .{
+            .p0 = a,
+            .p1 = .{ (a[0] + b[0]) / 2, (a[1] + b[1]) / 2 },
+            .p2 = b,
+        };
+    }
 }
 
-/// The glyph a draw item paints: the MATH size variant for a stretchy item
-/// (display big operator, √, fence), else the base cmap glyph. Null when the
-/// codepoint has no glyph at all — the caller then draws nothing.
-///
-/// Degrading to the base glyph is deliberate. A face without a MATH table (any
-/// LM Roman face, any user-supplied font) then paints an unstretched but
-/// legible fence, and a ladder too short for the request paints the base glyph
-/// too. Failing the draw instead would discard every other formula on the page
-/// because one font lacks a table, and the raster API has no per-glyph error
-/// channel to report a soft failure through. Nothing here panics and nothing
-/// invents a glyph id: an unresolved stretchy item is never drawn from a
-/// foreign font's numbering.
-fn resolveGlyph(face: *const font.FontFace, cp: u21, t: *const draw.Text) ?u32 {
-    if (t.bigop_form == .variant) {
-        if (mathVariantGlyph(face, cp, 1)) |g| return g;
+/// Clip each rectangle to the band the connector cut gives it, sweep the
+/// clipped parts and add their coverages — the production path's geometry,
+/// driven end to end into a one-pixel alpha8 buffer. Returns that pixel.
+fn clippedUnionPixel(
+    gpa: std.mem.Allocator,
+    rects: []const [4]coverage.QuadCurve,
+    cut: f32,
+) !u8 {
+    var scratch: GlyphScratch = .{ .gpa = gpa };
+    defer scratch.deinit();
+    var fill: GlyphItem = .{
+        .scratch = &scratch,
+        .face = undefined,
+        .frame = .{
+            .t = item("x", .italic),
+            .pt_to_px = 1,
+            .frame_h = 1,
+            .origin = .{ .x = 0, .y = 0 },
+            .gscale = 1,
+        },
+    };
+    for (rects, 0..) |*r, i| {
+        const first: u32 = @intCast(scratch.contours.items.len);
+        scratch.raw.clearRetainingCapacity();
+        try scratch.raw.appendSlice(gpa, r);
+        // The connector is split down its middle: the part below the cut keeps
+        // what is below it, the one above keeps what is above. Both halves
+        // survive, so the two are disjoint and their areas simply add.
+        const half: Half = if (i == 0) .less else .greater;
+        try fill.clipTo(scratch.raw.items, &scratch.clipped, 0, cut, half);
+        try scratch.contours.appendSlice(gpa, scratch.clipped.items);
+        var span: PlacementSpan = .{
+            .first = first,
+            .last = @intCast(scratch.contours.items.len),
+            .y_lo = std.math.inf(f32),
+            .y_hi = -std.math.inf(f32),
+            .x_lo = std.math.inf(f32),
+            .x_hi = -std.math.inf(f32),
+        };
+        for (scratch.clipped.items) |c| {
+            span.y_lo = @min(span.y_lo, @min(c.p0[1], @min(c.p1[1], c.p2[1])));
+            span.y_hi = @max(span.y_hi, @max(c.p0[1], @max(c.p1[1], c.p2[1])));
+            span.x_lo = @min(span.x_lo, @min(c.p0[0], @min(c.p1[0], c.p2[0])));
+            span.x_hi = @max(span.x_hi, @max(c.p0[0], @max(c.p1[0], c.p2[0])));
+        }
+        fill.min_x = @min(fill.min_x, span.x_lo);
+        fill.max_x = @max(fill.max_x, span.x_hi);
+        fill.min_y = @min(fill.min_y, span.y_lo);
+        fill.max_y = @max(fill.max_y, span.y_hi);
+        try scratch.parts.append(gpa, span);
     }
-    if (t.radical_form > 0) {
-        // Rungs above the ladder (form 5..7) fall through to the assembly;
-        // anything past `radical_form_bottom` is rejected by both.
-        const piece = mathVariantGlyph(face, radical_cp, t.radical_form) orelse
-            radicalAssemblyGlyph(face, t.radical_form);
-        if (piece) |g| return g;
+    var pixels = [_]u8{0};
+    try fill.sweep(&pixels, 1, 1, 0, 1, .alpha8, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+    return pixels[0];
+}
+
+// THE FIRST COUNTEREXAMPLE, and the reason a raw sum cannot be clamped into a
+// union. Two IDENTICAL parts, each covering the right half of one pixel. The
+// union of two coincident shapes is that same half — 0.5 — but their signed
+// areas add to 1.0, and a clamp happily reports 1.0. Only clipping the
+// connector between them and ADDING the two disjoint halves recovers 0.5.
+test "rasterize: two coincident half-covered parts union to half, not to full" {
+    var a: [4]coverage.QuadCurve = undefined;
+    var b: [4]coverage.QuadCurve = undefined;
+    rect(0.5, 0.0, 1.0, 1.0, &a);
+    rect(0.5, 0.0, 1.0, 1.0, &b);
+    const rects = [_][4]coverage.QuadCurve{ a, b };
+
+    // The connector runs from 0.5 to 1.0, so the cut is its middle, 0.75.
+    const covered = try clippedUnionPixel(testing.allocator, &rects, 0.75);
+    try testing.expectApproxEqAbs(@as(f32, 128.0), @as(f32, @floatFromInt(covered)), 2.0);
+
+    // What the unclipped sum would have reported, for the contrast.
+    var raw: [1]f32 = undefined;
+    var both: [8]coverage.QuadCurve = undefined;
+    @memcpy(both[0..4], &a);
+    @memcpy(both[4..8], &b);
+    coverage.coverageRow(&both, 0, 0, &raw);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), raw[0], 0.0001);
+}
+
+// THE SECOND COUNTEREXAMPLE, and the reason the cut cannot be rounded to a
+// pixel boundary. Two parts overlap by 0.2px of a single pixel: A reaches
+// 0.6 across it, B reaches 0.4 from the other side. The union is the whole
+// pixel, 1.0 — but giving the pixel to ONE owner (the left one, at a cut
+// rounded to ceil(0.5) = 1) yields A alone, 0.6, and B's 0.4 of real ink is
+// simply lost. Clipping keeps both shares and adds them.
+test "rasterize: a sub-pixel overlap keeps both parts' shares of the pixel" {
+    var a: [4]coverage.QuadCurve = undefined;
+    var b: [4]coverage.QuadCurve = undefined;
+    rect(0.0, 0.0, 0.6, 1.0, &a);
+    rect(0.4, 0.0, 1.0, 1.0, &b);
+    const rects = [_][4]coverage.QuadCurve{ a, b };
+
+    // The connector runs from 0.4 to 0.6, so the cut is its middle, 0.5.
+    const covered = try clippedUnionPixel(testing.allocator, &rects, 0.5);
+    try testing.expectApproxEqAbs(@as(f32, 255.0), @as(f32, @floatFromInt(covered)), 2.0);
+}
+
+// THE REGRESSION. An assembly's parts share the font's own connector
+// material, and each part used to be composited into the buffer on its own:
+// in the shared band the ink alpha was applied twice, so a translucent
+// `\left(` came out with a dark seam down every join, at twice the alpha of
+// the ink beside it — while the SVG of the very same formula, filled as one
+// compound path, showed a uniform fence.
+test "rasterize: an assembled fence's join carries the ink alpha once, not twice" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+
+    // A fence asked for far more ink than its largest variant covers, so the
+    // resolver MUST hand back an assembly. Asserted, not assumed: a run that
+    // quietly picked a single variant would make every assertion below pass
+    // without ever touching a join.
+    // 8pt at 96 dpi is the regime the bug hides in: LM's MinConnectorOverlap
+    // is 0.02em, about 0.21 of a pixel here, so a join is SUB-PIXEL and any
+    // rounding of the cut to a pixel loses a real share of a real edge.
+    var fence = item("(", .italic);
+    fence.size = 8;
+    fence.delim_req = 6.0;
+    var built = (try glyph.plan(
+        testing.allocator,
+        ctx.fonts.math,
+        requestOf(fence) orelse return error.NoRequest,
+    )) orelse return error.MissingGlyph;
+    var placements: usize = 0;
+    switch (built) {
+        .single => return error.NoAssembly,
+        .stack => |*cursor| while (cursor.next()) |part| {
+            _ = part;
+            placements += 1;
+        },
     }
-    if (t.delim_form > 0 or t.delim_fixed > 0) {
-        const variant_index = if (t.delim_form > 0)
-            t.delim_form
-        else
-            fixedDelimForm(t.delim_fixed);
-        if (mathVariantGlyph(face, cp, variant_index)) |g| return g;
+    try testing.expect(placements >= 3);
+
+    const ink: draw.Color = .{ .r = 0, .g = 0, .b = 0, .a = 64 };
+    var dl = try framedList(testing.allocator, &ctx, fence);
+    defer dl.deinit();
+    var rgba = try rasterize(testing.allocator, &ctx, &dl, .{
+        .dpi = 96,
+        .format = .rgba32,
+        .fg = ink,
+    });
+    defer rgba.deinit();
+    var mask = try rasterize(testing.allocator, &ctx, &dl, .{ .dpi = 96, .format = .alpha8, .fg = ink });
+    defer mask.deinit();
+    var solid = try rasterize(testing.allocator, &ctx, &dl, .{
+        .dpi = 96,
+        .format = .alpha8,
+    });
+    defer solid.deinit();
+
+    // Subpixel stems need not cover a whole pixel. Their opacity still scales
+    // linearly with the ink alpha; blending overlapping pieces twice does not.
+    for (mask.pixels, solid.pixels) |actual, coverage_alpha| {
+        const expected = @as(f32, @floatFromInt(coverage_alpha)) * 64.0 / 255.0;
+        try testing.expectApproxEqAbs(expected, @as(f32, @floatFromInt(actual)), 1.0);
     }
-    return face.glyphIndex(cp);
+
+    // The same picture in both formats on the SAME ink: an alpha8 mask is the
+    // rgba alpha scaled by nothing, and the two back ends disagreeing here
+    // is the defect this whole path exists to remove.
+    for (0..@as(usize, rgba.height)) |y| {
+        for (0..@as(usize, rgba.width)) |x| {
+            try testing.expectApproxEqAbs(
+                @as(f32, @floatFromInt(mask.pixels[y * @as(usize, mask.stride) + x])),
+                @as(f32, @floatFromInt(rgbaAt(rgba, x, y)[3])),
+                1.0,
+            );
+        }
+    }
+}
+
+test "rasterize: a Roman radical preserves its math surd and upright body" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    for ([_]atom.MathStyle{ .display, .text }) |style| {
+        for ([_]f32{ 8, 20, 60 }) |size| {
+            var outer = try ctx.renderPixels(
+                "\\mathrm{\\sqrt{x}}",
+                style,
+                size,
+                .{ .dpi = 192, .format = .alpha8 },
+                null,
+            );
+            defer outer.deinit();
+            var body = try ctx.renderPixels(
+                "\\sqrt{\\mathrm{x}}",
+                style,
+                size,
+                .{ .dpi = 192, .format = .alpha8 },
+                null,
+            );
+            defer body.deinit();
+            try testing.expectEqual(body.width, outer.width);
+            try testing.expectEqual(body.height, outer.height);
+            try testing.expectEqualSlices(u8, body.pixels, outer.pixels);
+        }
+    }
+}
+
+test "rasterize: fixed delimiter commands paint their four distinct MATH heights" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    const sources = [_][]const u8{ "\\big(", "\\Big(", "\\bigg(", "\\Bigg(" };
+    const heights = [_]f32{ 1.094, 1.792, 2.392, 2.990 };
+    for (sources, heights) |source, height_em| {
+        var pixels = try ctx.renderPixels(
+            source,
+            .display,
+            20,
+            .{ .dpi = 192, .format = .alpha8 },
+            null,
+        );
+        defer pixels.deinit();
+        const painted_height: f32 = @floatFromInt(inkedRows(pixels));
+        try testing.expectApproxEqAbs(height_em * 20 * (192.0 / 72.0), painted_height, 2.0);
+    }
+}
+
+// An assembly long enough to need more parts than a fixed-size placement
+// buffer would hold: every row from the first ink to the last must carry
+// ink, or the fence has a hole in it. This is the shape claim that a
+// truncated part list, or a sweep that drops the joins, both produce.
+test "rasterize: an assembly of hundreds of parts is unbroken top to bottom" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    var tall = item("(", .italic);
+    tall.delim_req = 200.0;
+
+    // More parts than any fixed-size placement buffer: the plan has to walk,
+    // not enumerate into one.
+    const request = requestOf(tall) orelse return error.NoRequest;
+    var built = (try glyph.plan(testing.allocator, ctx.fonts.math, request)) orelse
+        return error.MissingGlyph;
+    var parts: usize = 0;
+    switch (built) {
+        .single => return error.NoAssembly,
+        .stack => |*cursor| while (cursor.next()) |part| {
+            _ = part;
+            parts += 1;
+        },
+    }
+    try testing.expect(parts > 64);
+
+    var dl = try framedList(testing.allocator, &ctx, tall);
+    defer dl.deinit();
+    var buf = try rasterize(testing.allocator, &ctx, &dl, .{ .dpi = 72, .format = .alpha8 });
+    defer buf.deinit();
+
+    const s = tall.size;
+
+    const rows = inkedRows(buf);
+    try testing.expectApproxEqAbs(@as(f32, @floatFromInt(rows)), 200.0 * s, 4.0);
+    // Continuous: no row between the first and the last inked row is empty.
+    var first: usize = 0;
+    while (first < @as(usize, buf.height) and rowIsEmpty(buf, first)) first += 1;
+    var last = @as(usize, buf.height);
+    while (last > first and rowIsEmpty(buf, last - 1)) last -= 1;
+    try testing.expect(last > first);
+    for (first..last) |y| try testing.expect(!rowIsEmpty(buf, y));
+}
+
+fn rowIsEmpty(buffer: PixelBuffer, y: usize) bool {
+    const at = y * @as(usize, buffer.stride);
+    for (buffer.pixels[at..][0..@as(usize, buffer.width)]) |v| {
+        if (v != 0) return false;
+    }
+    return true;
+}
+
+/// One pixel's ink as a coverage: the mask byte, or the rgba32 alpha. Both
+/// formats answer the same number, which is what makes a PGM and a PPM of one
+/// picture agree about how much ink there is.
+fn inkByte(buffer: PixelBuffer, x: usize, y: usize) u8 {
+    const at = y * @as(usize, buffer.stride);
+    return switch (buffer.format) {
+        .alpha8 => buffer.pixels[at + x],
+        .rgba32 => buffer.pixels[at + x * 4 + 3],
+    };
+}
+
+/// The ink one row carries, in PIXELS: the sum of its coverage, so a row a
+/// rule covers by a third measures a third of a pixel. Only an OPAQUE ink is
+/// measured this way; a translucent one scales every byte by its own alpha.
+fn rowInk(buffer: PixelBuffer, y: usize) f32 {
+    var total: f32 = 0;
+    for (0..@as(usize, buffer.width)) |x| {
+        total += @as(f32, @floatFromInt(inkByte(buffer, x, y))) / 255.0;
+    }
+    return total;
+}
+
+/// The whole buffer's ink, in pixels: what a picture weighs against the
+/// geometry that claims to have produced it.
+fn totalInk(buffer: PixelBuffer) f32 {
+    var total: f32 = 0;
+    for (0..@as(usize, buffer.height)) |y| total += rowInk(buffer, y);
+    return total;
 }
 
 /// The ink a primitive paints: its own color when an explicit color scope
@@ -1222,8 +1594,8 @@ inline fn blendPixel(
 /// segment — 1 inside the band, a linear ramp across the outer half
 /// pixel, 0 outside — so a diagonal stroke is a thin diagonal band at a
 /// constant width, not the bounding box of its endpoints (which for a
-/// diagonal is the whole wedge between them). The caps match svg.zig's
-/// <line>, which declares none: the band stops at each endpoint's plane.
+/// diagonal is the whole wedge between them). Both backends paint the same
+/// butt-cap geometry: the band stops at each endpoint's plane.
 fn strokeSegment(
     pixels: []u8,
     width: u32,
@@ -1263,9 +1635,9 @@ fn strokeSegment(
             const px = @as(f32, @floatFromInt(c)) + 0.5;
             // Where the pixel's perpendicular meets the segment.
             const t = ((px - x0f) * dx + (py - y0f) * dy) / len_sq;
-            // BUTT caps — what svg.zig's <line> declares by default, with no
-            // cap attribute: the band stops in the plane through each
-            // endpoint instead of rounding past it. Layout sized the box's
+            // Butt caps match the filled SVG band: the segment stops in the
+            // plane through each endpoint instead of rounding past it.
+            // Layout sized the box's
             // h/d from exactly this extent, so a round cap would paint
             // outside the ink bbox (clipped at zero padding) and the two back
             // ends would disagree on where the ink ends.
@@ -1279,8 +1651,8 @@ fn strokeSegment(
     }
 }
 
-/// Fill the half-open pixel box [x0f, x1f) x [y0f, y1f) with `ink`. `row`
-/// counts from the top of the buffer, as the rgba32 payload is stored.
+/// Coverage is the box/pixel intersection area, not its integer bounds.
+/// Blend once so scoped alpha multiplies coverage once in both formats.
 fn fillRect(
     pixels: []u8,
     width: u32,
@@ -1294,6 +1666,9 @@ fn fillRect(
     y1f: f32,
 ) void {
     if (ink.a == 0) return;
+    // `!(hi > lo)` and not `hi <= lo`: a NaN end is refused too, and the
+    // `@intFromFloat` calls below would trap on one.
+    if (!(x1f > x0f) or !(y1f > y0f)) return;
     const c0: i64 = @max(@as(i64, @intFromFloat(@floor(x0f))), 0);
     const c1: i64 = @min(@as(i64, @intFromFloat(@ceil(x1f))), @as(i64, @intCast(width)));
     const r0: i64 = @max(@as(i64, @intFromFloat(@floor(y0f))), 0);
@@ -1302,15 +1677,772 @@ fn fillRect(
 
     var r = r0;
     while (r < r1) : (r += 1) {
+        // Every column in this row has the same vertical coverage.
+        const share_y = axisShare(y0f, y1f, r);
         var c = c0;
         while (c < c1) : (c += 1) {
-            blendPixel(pixels, @intCast(r), @intCast(c), stride, format, ink, 1.0);
+            const cov = axisShare(x0f, x1f, c) * share_y;
+            blendPixel(pixels, @intCast(r), @intCast(c), stride, format, ink, cov);
         }
     }
 }
 
-fn drawGlyph(
+/// Intersection length with one unit-width pixel.
+inline fn axisShare(lo: f32, hi: f32, index: i64) f32 {
+    const left: f32 = @floatFromInt(index);
+    return @max(0.0, @min(hi, left + 1.0) - @max(lo, left));
+}
+
+// A RULE IS NOT A BOX OF WHOLE PIXELS. A 0.8pt vinculum is 2.1333px of ink
+// at 192 dpi: two whole rows and 0.1333 of a third. Rounding the box out to
+// whole pixels painted three whole rows — 1.125pt of ink for a 0.8pt rule,
+// 40% too heavy, on every radical bar, fraction bar and overline the CPU
+// backend drew, in both of its pixel formats.
+test "rasterize: a 0.8pt rule paints 2.133px of ink, not three whole rows" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    // The real \sqrt{x} vinculum of the captured corpus, in the frame it was
+    // captured in: `rect x=20 y=0 w=61.248886 h=0.8` inside an
+    // 81.248886 x 24pt ink box, which at 192 dpi cuts the 218 x 65 pixel
+    // buffer the CLI actually wrote for it.
+    var dl = draw.DrawList.init(testing.allocator);
+    defer dl.deinit();
+    try dl.add(.{ .rect = .{
+        .x = 20,
+        .y = 0,
+        .w = 61.248886,
+        .h = 0.8,
+        .color = .{ .r = 0, .g = 0, .b = 0, .a = 255 },
+        .src_start = 0,
+        .src_end = 1,
+    } });
+    dl.accInk(0, 0, 81.248886, 24);
+    var mask = try rasterize(testing.allocator, &ctx, &dl, .{ .dpi = 192, .format = .alpha8 });
+    defer mask.deinit();
+    var rgba = try rasterize(testing.allocator, &ctx, &dl, .{ .dpi = 192, .format = .rgba32 });
+    defer rgba.deinit();
+    try testing.expectEqual(@as(u32, 218), mask.width);
+    try testing.expectEqual(@as(u32, 65), mask.height);
+
+    // 61.248886pt of rule at 8/3 px per pt is 163.3304px of width, so rows 0
+    // and 1 carry a whole row of it, row 2 carries the 0.13333 left over, and
+    // row 3 — the frame's one-pixel bearing — carries none of it at all.
+    const full_row: f32 = 163.3304;
+    try testing.expectApproxEqAbs(full_row, rowInk(mask, 0), 0.5);
+    try testing.expectApproxEqAbs(full_row, rowInk(mask, 1), 0.5);
+    try testing.expectApproxEqAbs(full_row * 0.13333, rowInk(mask, 2), 0.5);
+    try testing.expectEqual(@as(f32, 0), rowInk(mask, 3));
+    // The rule as a whole is its own AREA in pixels, 348.4381. A box that
+    // paints more than its area is painting a heavier rule than TeX asked
+    // for, which is all this defect is.
+    try testing.expectApproxEqAbs(@as(f32, 348.4381), totalInk(mask), 0.5);
+    // Three rows carry ink, not four: the 0.13333 share of row 2 is real ink
+    // that a fill rounding the row away would have dropped, and a fill
+    // rounding it UP is what painted row 3 in the first place.
+    try testing.expectEqual(@as(usize, 3), inkedRows(mask));
+
+    // Both CPU formats are the same picture: every pixel's mask byte IS its
+    // alpha byte, boundary rows included.
+    for (0..@as(usize, rgba.height)) |y| {
+        for (0..@as(usize, rgba.width)) |x| {
+            try testing.expectEqual(inkByte(mask, x, y), inkByte(rgba, x, y));
+        }
+    }
+}
+
+// The share of a pixel an axis-aligned box covers is the product of its two
+// axis shares, so a box edge INSIDE a pixel splits that pixel instead of
+// rounding it away. [0.25, 3.25) x [0.5, 2.5) has the column shares
+// 0.75, 1, 1, 0.25 and the row shares 0.5, 1, 0.5, and every one of those
+// numbers is a byte a caller can see.
+test "fillRect: a box edge inside a pixel splits that pixel's coverage" {
+    const ink: draw.Color = .{ .r = 10, .g = 20, .b = 30, .a = 255 };
+    var mask = [_]u8{0} ** 16;
+    fillRect(&mask, 4, 4, 4, .alpha8, ink, 0.25, 3.25, 0.5, 2.5);
+    // The middle row is the box's only whole row.
+    try testing.expectEqualSlices(u8, &.{ 191, 255, 255, 64 }, mask[4..8]);
+    // ... and each half row is exactly half of it.
+    try testing.expectEqualSlices(u8, &.{ 96, 128, 128, 32 }, mask[0..4]);
+    try testing.expectEqualSlices(u8, &.{ 96, 128, 128, 32 }, mask[8..12]);
+    // Below the box and right of it the frame is untouched.
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, mask[12..16]);
+}
+
+// A box that runs off the frame is CLIPPED to it, and a pixel it shares with
+// an edge keeps only the part that is really inside. Nothing wraps to the
+// far side, nothing outside the frame is touched, and a box with no area
+// paints nothing.
+test "fillRect: a box clipped by the frame paints only what is inside it" {
+    const ink: draw.Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 };
+    var mask = [_]u8{0} ** 16;
+    // [-1.5, 1.5) x [-0.5, 1.5) in a 4 x 4 frame: column 0 lies wholly
+    // inside it, column 1 keeps its left half, row 0 wholly inside, row 1 its
+    // top half. The corner pixel the two partials share is a quarter of the
+    // ink of a whole one.
+    fillRect(&mask, 4, 4, 4, .alpha8, ink, -1.5, 1.5, -0.5, 1.5);
+    try testing.expectEqualSlices(u8, &.{ 255, 128, 0, 0 }, mask[0..4]);
+    try testing.expectEqualSlices(u8, &.{ 128, 64, 0, 0 }, mask[4..8]);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, mask[8..12]);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, mask[12..16]);
+
+    // The far corner the same way: only the half of column 3 and the quarter
+    // of row 0 that lie inside the box's own last pixel are painted.
+    @memset(mask[0..], 0);
+    fillRect(&mask, 4, 4, 4, .alpha8, ink, 3.5, 6.0, -0.25, 0.25);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 32 }, mask[0..4]);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, mask[4..8]);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, mask[8..12]);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, mask[12..16]);
+
+    // No area, wholly outside, and a degenerate axis: an empty rule is not a
+    // rule, and none of these may touch the buffer.
+    @memset(mask[0..], 0);
+    fillRect(&mask, 4, 4, 4, .alpha8, ink, 2, 2, 0, 4);
+    fillRect(&mask, 4, 4, 4, .alpha8, ink, -9, -5, 0, 4);
+    fillRect(&mask, 4, 4, 4, .alpha8, ink, 0, 4, 9, 12);
+    for (mask) |v| try testing.expectEqual(@as(u8, 0), v);
+}
+
+// The geometric share and the ink's alpha are ONE product: a pixel half
+// covered by half-transparent ink is a quarter inked, not a half and not an
+// eighth. Both formats take that same product, so the mask strength and the
+// stored alpha stay the same number.
+test "fillRect: translucent ink scales the geometric coverage exactly once" {
+    const ink: draw.Color = .{ .r = 12, .g = 34, .b = 56, .a = 128 };
+    var mask = [_]u8{0} ** 16;
+    var rgba = [_]u8{0} ** 64;
+    fillRect(&mask, 4, 4, 4, .alpha8, ink, 0.0, 4.0, 0.5, 2.5);
+    fillRect(&rgba, 4, 4, 16, .rgba32, ink, 0.0, 4.0, 0.5, 2.5);
+    for (0..3) |y| {
+        // Rows 0 and 2 are half covered, row 1 is whole; the ink's own alpha
+        // halves what each of them carries, once.
+        const carried: u8 = if (y == 1) 128 else 64;
+        try testing.expectEqual(carried, mask[y * 4 + 1]);
+        try testing.expectEqualSlices(u8, &.{ 12, 34, 56, carried }, rgba[y * 16 + 4 ..][0..4]);
+    }
+    // ... and a fully covered pixel of a translucent rule carries the ink's
+    // own alpha once: neither doubled nor dropped.
+    try testing.expectEqual(@as(u8, 128), mask[1 * 4 + 1]);
+}
+
+/// One decoded glyph outline, normalized once and reused by every placement
+/// of that glyph id: an assembly repeats its extender, and a tall fence can
+/// place the same piece a hundred times.
+const CachedOutline = struct {
+    /// Keyed by glyph id ALONE, which is only sound because the cache never
+    /// outlives one item: a gid names a different shape in every face, and
+    /// one item resolves all of its placements against ONE face. See
+    /// `GlyphScratch.releaseOutlines`, which is what upholds it.
+    glyph: u32,
+    /// Normalized, in FONT units. Never transformed in place — each
+    /// placement transforms its own copy into the item's contour list.
+    curves: std.ArrayList(font.QuadCurve) = .empty,
+};
+
+/// Where one placement's CLIPPED contours sit in `GlyphScratch.contours`, and
+/// the pixel extent they actually cover. The extents bound the control
+/// points, which is what bounds a curve, so a placement that cannot reach a
+/// scan line is left out of that line's sweep.
+const PlacementSpan = struct {
+    first: u32,
+    last: u32,
+    y_lo: f32,
+    y_hi: f32,
+    x_lo: f32,
+    x_hi: f32,
+};
+
+/// Buffers reused by every glyph in one frame: the decoded outlines, the
+/// transformed and clipped contour lists, the placement index, the connector
+/// cuts, and two rows of coverage. Nothing here is per part and nothing is
+/// per pixel — a fence of a hundred parts decodes three distinct outlines and
+/// allocates nothing once the first item has warmed them.
+const GlyphScratch = struct {
     gpa: std.mem.Allocator,
+    outlines: std.ArrayList(CachedOutline) = .empty,
+    /// One placement's transformed contours, before clipping. Reused per
+    /// placement, so it holds one part, never the whole stack.
+    raw: std.ArrayList(coverage.QuadCurve) = .empty,
+    /// The other side of the clip ping-pong, so a second cut reads the first
+    /// cut's output instead of the untouched outline.
+    clipped: std.ArrayList(coverage.QuadCurve) = .empty,
+    /// Every placement's contours, transformed AND clipped to its own band.
+    contours: std.ArrayList(coverage.QuadCurve) = .empty,
+    parts: std.ArrayList(PlacementSpan) = .empty,
+    /// Each placement's ink extent along the axis the stack grows on, in
+    /// buffer pixels; the connector cuts are the midpoints of the overlaps
+    /// between neighbours.
+    extents: std.ArrayList([2]f32) = .empty,
+    /// `extents.len + 1` cut planes; the first is -inf and the last +inf, so
+    /// the outermost placements are clipped on one side only.
+    cuts: std.ArrayList(f32) = .empty,
+    /// Coverage accumulated across the placements, and one placement's own
+    /// sweep before it is added in.
+    row: std.ArrayList(f32) = .empty,
+    one_row: std.ArrayList(f32) = .empty,
+
+    fn deinit(self: *GlyphScratch) void {
+        self.releaseOutlines();
+        self.outlines.deinit(self.gpa);
+        self.raw.deinit(self.gpa);
+        self.clipped.deinit(self.gpa);
+        self.contours.deinit(self.gpa);
+        self.parts.deinit(self.gpa);
+        self.extents.deinit(self.gpa);
+        self.cuts.deinit(self.gpa);
+        self.row.deinit(self.gpa);
+        self.one_row.deinit(self.gpa);
+    }
+
+    /// `glyph`'s decoded, normalized outline, decoded on this item's first
+    /// use. The returned slice is invalidated by the next call for a
+    /// DIFFERENT glyph id (the cache may grow), so a caller transforms its
+    /// copy before asking again.
+    fn outline(self: *GlyphScratch, face: *font.FontFace, glyph_id: u32) ![]const font.QuadCurve {
+        for (self.outlines.items) |*cached| {
+            if (cached.glyph == glyph_id) return cached.curves.items;
+        }
+        var decoded = try face.glyphOutline(self.gpa, glyph_id);
+        errdefer decoded.deinit();
+        normalizeWinding(decoded.curves.items);
+        try self.outlines.append(self.gpa, .{ .glyph = glyph_id, .curves = decoded.curves });
+        return self.outlines.items[self.outlines.items.len - 1].curves.items;
+    }
+
+    /// Drop every decoded outline, keeping the cache's own capacity for the
+    /// next item. This is what makes the gid-only key above sound: a glyph
+    /// id names a different shape in a different face, so nothing decoded
+    /// against one item's face may survive into the next item's.
+    ///
+    /// The outlines are the only per-item allocation the fill makes; every
+    /// other buffer here keeps its capacity for the rest of the frame.
+    fn releaseOutlines(self: *GlyphScratch) void {
+        for (self.outlines.items) |*cached| cached.curves.deinit(self.gpa);
+        self.outlines.clearRetainingCapacity();
+    }
+};
+
+/// Reverse every contour run so the sweep — whose signed area fills the
+/// interior to the RIGHT of travel — paints this font's shapes, which CFF and
+/// Latin Modern wind the other way. The reversal is uniform over the whole
+/// outline, which is what keeps a COUNTER subtracting from its own solid:
+/// outer and inner keep opposite senses and nonzero winding leaves the
+/// counter empty. Every placement normalizes the same way, so two parts that
+/// overlap ADD — the property the union sweep below is built on.
+fn normalizeWinding(curves: []font.QuadCurve) void {
+    var run_start: usize = 0;
+    var i: usize = 0;
+    while (i < curves.len) : (i += 1) {
+        const at_end = i + 1 == curves.len;
+        const boundary = !at_end and (curves[i].p2[0] != curves[i + 1].p0[0] or
+            curves[i].p2[1] != curves[i + 1].p0[1]);
+        if (!at_end and !boundary) continue;
+
+        var lo = run_start;
+        var hi = i;
+        while (lo < hi) : ({
+            lo += 1;
+            hi -= 1;
+        }) {
+            const tmp = curves[lo];
+            curves[lo] = .{ .p0 = curves[hi].p2, .p1 = curves[hi].p1, .p2 = curves[hi].p0 };
+            curves[hi] = .{ .p0 = tmp.p2, .p1 = tmp.p1, .p2 = tmp.p0 };
+        }
+        if (lo == hi) {
+            const c = curves[lo];
+            curves[lo] = .{ .p0 = c.p2, .p1 = c.p1, .p2 = c.p0 };
+        }
+        run_start = i + 1;
+    }
+}
+
+/// Which side of a cut plane a clip keeps. The plane is perpendicular to
+/// `axis` (0 = x, 1 = y), so this reads as "keeps what is above/below" on a
+/// vertical stack and "right of / left of" on a horizontal one.
+const Half = enum { greater, less };
+
+inline fn along(p: [2]f32, axis: usize) f32 {
+    return if (axis == 0) p[0] else p[1];
+}
+
+/// The parameter in (0,1) where a MONOTONIC quadratic crosses `cut` along
+/// `axis`, or null when it does not cross inside the span. Monotonicity is
+/// what makes this unambiguous: the piece crosses at most once, so there is
+/// never a choice between two roots and never a tangent double root whose
+/// small numerical error would spawn a spurious piece.
+///
+/// The roots come from the numerically STABLE pairing — q = −(qb ± √disc)/2,
+/// then t = q/qa and t = qc/q — never from `(−qb ± √disc) / 2qa`. In that
+/// form, when √disc ≈ qb the two terms cancel and a crossing that is nearly
+/// linear (qa → 0, which is exactly what a straight edge in a font outline
+/// gives) computes to plain zero, so the clip silently drops that piece and
+/// punches a hole in the glyph. Here the cancellation is confined to the root
+/// that is not needed.
+fn crossT(c: coverage.QuadCurve, axis: usize, cut: f32) ?f32 {
+    const a0 = along(c.p0, axis);
+    const a1 = along(c.p1, axis);
+    const a2 = along(c.p2, axis);
+    const qa = a0 - 2.0 * a1 + a2;
+    const qb = 2.0 * (a1 - a0);
+    const qc = a0 - cut;
+    if (@abs(qa) < 1e-9) {
+        if (@abs(qb) < 1e-12) return null;
+        const t = -qc / qb;
+        return if (t > 0 and t < 1) t else null;
+    }
+    const disc = qb * qb - 4.0 * qa * qc;
+    if (disc < 0) return null;
+    const root = @sqrt(disc);
+    // The root that WOULD cancel is the one built from the same sign as qb.
+    const q = -0.5 * (qb + if (qb >= 0) root else -root);
+    const t1 = q / qa;
+    if (t1 > 0 and t1 < 1) return t1;
+    if (q != 0) {
+        const t2 = qc / q;
+        if (t2 > 0 and t2 < 1) return t2;
+    }
+    return null;
+}
+
+/// Split a quadratic at `t` by de Casteljau. Direction is preserved, so a
+/// clipped piece winds exactly like the curve it came from — which is what
+/// keeps the run's outer and counter contours opposite after a clip.
+fn splitAt(c: coverage.QuadCurve, t: f32) [2]coverage.QuadCurve {
+    const lerp = struct {
+        fn f(a: [2]f32, b: [2]f32, k: f32) [2]f32 {
+            return .{ a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k };
+        }
+    }.f;
+    const a = lerp(c.p0, c.p1, t);
+    const b = lerp(c.p1, c.p2, t);
+    const m = lerp(a, b, t);
+    return .{
+        .{ .p0 = c.p0, .p1 = a, .p2 = m },
+        .{ .p0 = m, .p1 = b, .p2 = c.p2 },
+    };
+}
+
+/// A straight run between two points on the cut, as a degenerate quadratic:
+/// what closes a clipped chain back into a loop. Font outlines store straight
+/// edges exactly this way (p1 at the midpoint), so the closing edge is
+/// indistinguishable from any other line in the outline.
+fn segment(a: [2]f32, b: [2]f32) coverage.QuadCurve {
+    return .{
+        .p0 = a,
+        .p1 = .{ (a[0] + b[0]) / 2, (a[1] + b[1]) / 2 },
+        .p2 = b,
+    };
+}
+
+/// Whether two points are the same point to within a rounding step. A clip
+/// splits a curve at a computed parameter, so the endpoint it produces and the
+/// endpoint of the piece next to it are the SAME expression evaluated twice —
+/// bit-identical in principle, but the tolerance keeps a clip from inserting
+/// a zero-length (or sliver) closing edge where none is wanted.
+fn samePoint(a: [2]f32, b: [2]f32) bool {
+    return @abs(a[0] - b[0]) < 1e-6 and @abs(a[1] - b[1]) < 1e-6;
+}
+
+/// Margin-free pixel coordinates keep clipping and coverage decisions stable.
+/// Adding integer padding before f32 second differences can flip a crossing;
+/// the margin belongs only in the final output index.
+const ItemFrame = struct {
+    t: draw.Text,
+    pt_to_px: f32,
+    /// Canvas height excluding both padding margins, independent of padding.
+    frame_h: f32,
+    origin: Origin,
+    /// Font units → frame pixels.
+    gscale: f32,
+
+    /// A part's origin. `Draw.Text.y` grows DOWN and the frame's y grows
+    /// with it, so a part's Y-UP run above the run's baseline moves its
+    /// origin UP — the same single rise `svg.zig` applies to the same outline.
+    fn originX(self: ItemFrame, part: glyph.Placed) f32 {
+        return (self.t.x + self.origin.x + part.x_em * self.t.size) * self.pt_to_px;
+    }
+
+    fn originY(self: ItemFrame, part: glyph.Placed) f32 {
+        return self.frame_h - (self.t.y + self.origin.y) * self.pt_to_px +
+            part.y_em * self.t.size * self.pt_to_px;
+    }
+};
+
+/// ONE LOGICAL GLYPH, filled as one piece of ink.
+///
+/// This is NOT a nonzero fill of the whole compound path. `coverageRow` sums
+/// the signed areas of the curves it is handed and clamps the sum to [0, 1],
+/// which is the true coverage only while the winding number stays at 0 or 1.
+/// Feed it overlapping parts and the shared zone carries winding 2, so the sum
+/// is twice the ink there, and a half-covered shared edge saturates to a full,
+/// hard edge that no other edge in the picture has.
+///
+/// So the stack is cut GEOMETRICALLY first. Each placement's transformed
+/// contours are clipped to its own band — the connector between two
+/// neighbours is split at its mid-plane, and the clip is a real half-plane
+/// clip that closes the run along the cut (`clipTo`), not a per-pixel
+/// ownership rule. The clipped parts are then DISJOINT, so:
+///
+///   * every individual sweep sees winding ≤ 1, and the kernel's clamp is
+///     that part's exact coverage;
+///   * the parts' coverages are ADDED across a pixel that several of them
+///     reach, and since they are disjoint the sum is exactly the union's
+///     coverage — 0.5 where two half-covered edges coincide, not the 1.0 a
+///     clamped sum would report;
+///   * the ink is composited ONCE, after the sum, so a join can never apply
+///     the alpha twice the way filling each part into the buffer on its own
+///     did, and a translucent `\left(` loses its dark seams.
+///
+/// Rounding the cut to a pixel boundary and giving each pixel to one owner
+/// does NOT work, and is not used: when the connector is thinner than a pixel
+/// (LM's MinConnectorOverlap is 0.02em, about a fifth of a pixel at 8pt/96dpi)
+/// the whole straddled pixel would go to one part and the other part's share
+/// of it — up to 0.4 of a pixel of real ink — would be lost. Clipping keeps
+/// both shares, in the same pixel, as the sum they are.
+const GlyphItem = struct {
+    scratch: *GlyphScratch,
+    frame: ItemFrame,
+    face: *font.FontFace,
+    min_x: f32 = std.math.inf(f32),
+    max_x: f32 = -std.math.inf(f32),
+    min_y: f32 = std.math.inf(f32),
+    max_y: f32 = -std.math.inf(f32),
+    bar: ?struct { x0: f32, x1: f32, y0: f32, y1: f32 } = null,
+
+    /// Pass one: the ink extent of one placement ALONG the growth axis, which
+    /// is all the connector cuts need. Nothing is stored but two numbers.
+    ///
+    /// A placement with no ink records a degenerate extent AT ITS ORIGIN
+    /// rather than skipping, so this pass and `place` agree on how many
+    /// placements there are and a later placement's index still names its own
+    /// band. A blank glyph is a malformed assembly, not a normal one, but a
+    /// misaligned index would silently clip a real neighbour.
+    fn measure(self: *GlyphItem, part: glyph.Placed, axis: usize) !void {
+        const curves = try self.scratch.outline(self.face, part.glyph);
+        const x0 = self.frame.originX(part);
+        const y0 = self.frame.originY(part);
+        const scale = self.frame.gscale;
+        if (curves.len == 0) {
+            const at = if (axis == 0) x0 else y0;
+            try self.scratch.extents.append(self.scratch.gpa, .{ at, at });
+            return;
+        }
+        var lo: f32 = std.math.inf(f32);
+        var hi: f32 = -std.math.inf(f32);
+        for (curves) |c| {
+            for ([_][2]f32{ c.p0, c.p1, c.p2 }) |p| {
+                const v = if (axis == 0) x0 + p[0] * scale else y0 + p[1] * scale;
+                lo = @min(lo, v);
+                hi = @max(hi, v);
+            }
+        }
+        try self.scratch.extents.append(self.scratch.gpa, .{ lo, hi });
+    }
+
+    /// The cut planes: one per connector, at the mid-plane of the material
+    /// the two neighbours share, bounded by -inf and +inf at the ends. Two
+    /// placements that share nothing get the midpoint of the gap between
+    /// them, which is where no part inks anyway.
+    fn planCuts(self: *GlyphItem) std.mem.Allocator.Error!void {
+        const gpa = self.scratch.gpa;
+        self.scratch.cuts.clearRetainingCapacity();
+        // The count is known BEFORE a single cut is written: one per
+        // connector plus the two open ends. Reserving it up front means the
+        // fills cannot fail, so an allocation error leaves the list EMPTY
+        // rather than a prefix of the cuts — a prefix would clip later parts
+        // against planes that belong to other parts and tear the stack.
+        try self.scratch.cuts.ensureTotalCapacityPrecise(gpa, self.scratch.extents.items.len + 1);
+        self.scratch.cuts.appendAssumeCapacity(-std.math.inf(f32));
+        const extents = self.scratch.extents.items;
+        for (1..extents.len) |i| {
+            self.scratch.cuts.appendAssumeCapacity((extents[i - 1][1] + extents[i][0]) / 2);
+        }
+        self.scratch.cuts.appendAssumeCapacity(std.math.inf(f32));
+    }
+
+    /// Pass two: transform one placement into frame space and clip it to
+    /// the band between its two cuts. The clipped contours are appended to
+    /// `contours`, and the span records what they cover.
+    fn place(
+        self: *GlyphItem,
+        part: glyph.Placed,
+        index: usize,
+        axis: usize,
+    ) !void {
+        const gpa = self.scratch.gpa;
+        const curves = try self.scratch.outline(self.face, part.glyph);
+        if (curves.len == 0) {
+            // A blank glyph paints nothing, but it still occupies its slot so
+            // the placement indices match `measure`'s.
+            const at = self.scratch.contours.items.len;
+            try self.scratch.parts.append(gpa, .{
+                .first = @intCast(at),
+                .last = @intCast(at),
+                .y_lo = std.math.inf(f32),
+                .y_hi = -std.math.inf(f32),
+                .x_lo = std.math.inf(f32),
+                .x_hi = -std.math.inf(f32),
+            });
+            return;
+        }
+        const x0 = self.frame.originX(part);
+        const y0 = self.frame.originY(part);
+        const scale = self.frame.gscale;
+
+        self.scratch.raw.clearRetainingCapacity();
+        try self.scratch.raw.ensureUnusedCapacity(gpa, curves.len);
+        var rightmost: f32 = -std.math.inf(f32);
+        for (curves) |c| {
+            const mapped: coverage.QuadCurve = .{
+                .p0 = .{ x0 + c.p0[0] * scale, y0 + c.p0[1] * scale },
+                .p1 = .{ x0 + c.p1[0] * scale, y0 + c.p1[1] * scale },
+                .p2 = .{ x0 + c.p2[0] * scale, y0 + c.p2[1] * scale },
+            };
+            self.scratch.raw.appendAssumeCapacity(mapped);
+            if (self.bar != null) {
+                rightmost = @max(rightmost, @max(mapped.p0[0], @max(mapped.p1[0], mapped.p2[0])));
+            }
+        }
+
+        // Clipping is a ping-pong between `raw` and `clipped`, so the second
+        // cut sees the first one's output rather than the untouched outline.
+        const cuts = self.scratch.cuts.items;
+        var source: []const coverage.QuadCurve = self.scratch.raw.items;
+        var sink = &self.scratch.clipped;
+        const upper = cuts[index + 1];
+        if (std.math.isFinite(upper)) {
+            try self.clipTo(source, sink, axis, upper, .less);
+            source = sink.items;
+            sink = &self.scratch.raw;
+            sink.clearRetainingCapacity();
+        }
+        const lower = cuts[index];
+        if (std.math.isFinite(lower)) {
+            try self.clipTo(source, sink, axis, lower, .greater);
+            source = sink.items;
+            sink = if (sink == &self.scratch.raw) &self.scratch.clipped else &self.scratch.raw;
+        }
+        const first: u32 = @intCast(self.scratch.contours.items.len);
+        if (self.bar) |bar| {
+            if (rightmost > bar.x0) {
+                // Remove the covered cap span, not a tail beyond a narrow
+                // vinculum. The retained ink and rule have disjoint areas.
+                try self.clipTo(source, sink, 0, bar.x0, .less);
+                try self.scratch.contours.appendSlice(gpa, sink.items);
+                if (rightmost > bar.x1) {
+                    try self.clipTo(source, sink, 0, bar.x1, .greater);
+                    try self.scratch.contours.appendSlice(gpa, sink.items);
+                }
+            } else {
+                try self.scratch.contours.appendSlice(gpa, source);
+            }
+        } else {
+            try self.scratch.contours.appendSlice(gpa, source);
+        }
+        var span: PlacementSpan = .{
+            .first = first,
+            .last = @intCast(self.scratch.contours.items.len),
+            .y_lo = std.math.inf(f32),
+            .y_hi = -std.math.inf(f32),
+            .x_lo = std.math.inf(f32),
+            .x_hi = -std.math.inf(f32),
+        };
+        for (self.scratch.contours.items[span.first..span.last]) |c| {
+            span.y_lo = @min(span.y_lo, @min(c.p0[1], @min(c.p1[1], c.p2[1])));
+            span.y_hi = @max(span.y_hi, @max(c.p0[1], @max(c.p1[1], c.p2[1])));
+            span.x_lo = @min(span.x_lo, @min(c.p0[0], @min(c.p1[0], c.p2[0])));
+            span.x_hi = @max(span.x_hi, @max(c.p0[0], @max(c.p1[0], c.p2[0])));
+        }
+        // Recorded even when the band held no ink, so `parts` has exactly one
+        // entry per placement and the sweep's index walk stays aligned with
+        // `cuts`. An empty span simply never reaches a scan line.
+        if (span.first != span.last) {
+            self.min_y = @min(self.min_y, span.y_lo);
+            self.max_y = @max(self.max_y, span.y_hi);
+            self.min_x = @min(self.min_x, span.x_lo);
+            self.max_x = @max(self.max_x, span.x_hi);
+        }
+        try self.scratch.parts.append(gpa, span);
+    }
+
+    /// Clip every contour run of `src` to the half-plane at `cut` along
+    /// `axis`, appending the clipped runs to `out`. Contour breaks are
+    /// preserved — a run is clipped on its own — so a glyph's counter stays a
+    /// counter instead of being welded to its outer contour.
+    fn clipTo(
+        self: *GlyphItem,
+        src: []const coverage.QuadCurve,
+        out: *std.ArrayList(coverage.QuadCurve),
+        axis: usize,
+        cut: f32,
+        half: Half,
+    ) !void {
+        out.clearRetainingCapacity();
+        var run_start: usize = 0;
+        var i: usize = 0;
+        while (i < src.len) : (i += 1) {
+            const at_end = i + 1 == src.len;
+            const boundary = !at_end and (src[i].p2[0] != src[i + 1].p0[0] or
+                src[i].p2[1] != src[i + 1].p0[1]);
+            if (!at_end and !boundary) continue;
+            try self.clipRun(src[run_start .. i + 1], out, axis, cut, half);
+            run_start = i + 1;
+        }
+    }
+
+    /// Clip one closed contour run. Each curve is split at its coordinate
+    /// extrema first (`coverage.monotonicize`), so every piece is monotonic
+    /// along `axis` and crosses the cut at most once — that is what keeps the
+    /// root search unambiguous and free of tangent double roots.
+    fn clipRun(
+        self: *GlyphItem,
+        run: []const coverage.QuadCurve,
+        out: *std.ArrayList(coverage.QuadCurve),
+        axis: usize,
+        cut: f32,
+        half: Half,
+    ) !void {
+        const gpa = self.scratch.gpa;
+        // The kept chain's own first point and its current open end. The chain
+        // closes back to that FIRST KEPT point at the end, not to the run's
+        // original start: when the run's first curve is itself clipped away
+        // the chain was cut open there, and joining it to a point that no
+        // longer exists would draw a stray edge across the cut.
+        var start: ?[2]f32 = null;
+        var open: ?coverage.QuadCurve = null;
+
+        for (run) |curve| {
+            const mono = coverage.monotonicize(curve);
+            for (mono.pieces[0..mono.n]) |piece| {
+                const one = self.keptHalf(piece, axis, cut, half) orelse continue;
+                if (open) |prev| {
+                    // A gap means something between here and there was
+                    // clipped away; both of its neighbours' ends sit on the
+                    // cut, so a straight run along the cut closes the loop.
+                    if (!samePoint(prev.p2, one.p0)) {
+                        try out.append(gpa, segment(prev.p2, one.p0));
+                    }
+                } else {
+                    start = one.p0;
+                }
+                try out.append(gpa, one);
+                open = one;
+            }
+        }
+        if (open) |last| {
+            if (start) |s| {
+                if (!samePoint(last.p2, s)) try out.append(gpa, segment(last.p2, s));
+            }
+        }
+    }
+
+    /// The part of one monotonic piece that lies in the kept half, or null
+    /// when the piece lies entirely in the discarded half. Monotonicity makes
+    /// the split point single, so there is no second candidate to choose
+    /// between and no tangent double root to reject.
+    fn keptHalf(
+        self: *GlyphItem,
+        piece: coverage.QuadCurve,
+        axis: usize,
+        cut: f32,
+        half: Half,
+    ) ?coverage.QuadCurve {
+        _ = self;
+        if (crossT(piece, axis, cut)) |t| {
+            const halves = splitAt(piece, t);
+            const at_lo = along(halves[0].p0, axis);
+            const at_hi = along(halves[1].p2, axis);
+            if (half == .greater) {
+                if (at_hi >= cut) return halves[1];
+                if (at_lo >= cut) return halves[0];
+            } else {
+                if (at_lo <= cut) return halves[0];
+                if (at_hi <= cut) return halves[1];
+            }
+            return null;
+        }
+        const at = along(piece.p0, axis);
+        if (if (half == .greater) at >= cut else at <= cut) return piece;
+        return null;
+    }
+    /// Sum disjoint coverage and compose once; padding shifts output indices.
+    fn sweep(
+        self: *const GlyphItem,
+        pixels: []u8,
+        width: u32,
+        height: u32,
+        pad: u32,
+        stride: u32,
+        format: Format,
+        ink: draw.Color,
+    ) !void {
+        if (self.scratch.parts.items.len == 0) return;
+        const margin: i64 = @intCast(pad);
+        const frame_w: i64 = @as(i64, @intCast(width)) - 2 * margin;
+        const frame_h: i64 = @as(i64, @intCast(height)) - 2 * margin;
+        var wy0: i64 = @intFromFloat(@floor(self.min_y));
+        var wy1: i64 = @intFromFloat(@floor(self.max_y));
+        if (wy0 >= frame_h + margin or wy1 < -margin) return;
+        wy0 = @max(wy0, -margin);
+        wy1 = @min(wy1, frame_h + margin - 1);
+
+        var cx0: i64 = @intFromFloat(@floor(self.min_x));
+        var cx1: i64 = @intFromFloat(@ceil(self.max_x));
+        cx0 = @max(cx0, -margin);
+        cx1 = @min(cx1, frame_w + margin);
+        if (cx1 <= cx0) return;
+        const ncols: usize = @intCast(cx1 - cx0);
+        try self.scratch.row.resize(self.scratch.gpa, ncols);
+        try self.scratch.one_row.resize(self.scratch.gpa, ncols);
+        const total = self.scratch.row.items;
+        const one = self.scratch.one_row.items;
+
+        var wy = wy0;
+        while (wy <= wy1) : (wy += 1) {
+            const y: f32 = @floatFromInt(wy);
+            @memset(total, 0);
+            // The placements whose clipped ink can reach this line. They are
+            // disjoint by construction, so adding their coverages gives the
+            // union's coverage for this line, with no pixel counted twice.
+            for (self.scratch.parts.items) |part| {
+                if (part.y_hi <= y or part.y_lo >= y + 1.0) continue;
+                coverage.coverageRow(
+                    self.scratch.contours.items[part.first..part.last],
+                    y,
+                    @floatFromInt(cx0),
+                    one,
+                );
+                for (total, one) |*acc, cov| acc.* += cov;
+            }
+            if (self.bar) |bar| {
+                const share_y = axisShare(bar.y0, bar.y1, wy);
+                if (share_y > 0) {
+                    for (total, 0..) |*cov, k| {
+                        const column = cx0 + @as(i64, @intCast(k));
+                        cov.* += axisShare(bar.x0, bar.x1, column) * share_y;
+                    }
+                }
+            }
+            const row: usize = @intCast(frame_h - 1 - wy + margin);
+            for (total, 0..) |raw_cov, k| {
+                const cov = @min(1.0, @max(0.0, raw_cov));
+                if (cov <= 0.0) continue;
+                blendPixel(
+                    pixels,
+                    row,
+                    @as(usize, @intCast(cx0 + margin)) + k,
+                    stride,
+                    format,
+                    ink,
+                    cov,
+                );
+            }
+        }
+    }
+};
+
+fn drawGlyph(
+    scratch: *GlyphScratch,
     ctx: *context.Context,
     pixels: []u8,
     width: u32,
@@ -1320,114 +2452,149 @@ fn drawGlyph(
     ink: draw.Color,
     t: draw.Text,
     pt_to_px: f32,
-    pad_f: f32,
+    pad: u32,
     origin: Origin,
 ) !void {
     if (ink.a == 0) return;
-    const cp: u21 = blk: {
-        if (t.bytes.len == 0) return;
-        if (t.bytes.len == 1) break :blk t.bytes[0];
-        if (t.bytes.len == 2) break :blk std.unicode.utf8Decode2(t.bytes[0..2].*) catch return;
-        if (t.bytes.len == 3) break :blk std.unicode.utf8Decode3(t.bytes[0..3].*) catch return;
-        if (t.bytes.len == 4) break :blk std.unicode.utf8Decode4(t.bytes[0..4].*) catch return;
-        return;
+    const request = requestOf(t) orelse return;
+
+    // Every stretchy item resolves through the face's own MATH table (see
+    // `ztex.glyph.plan`): a glyph id is font-specific, so baking one in
+    // draws the wrong shape on every font but Latin Modern — and a fence
+    // taller than its whole ladder is a STACK of parts, not one glyph.
+    // Same rule as svg.zig: a stretchy item is a MATH construction whatever
+    // style it was typed in, so `\mathrm{\sqrt{x}}` draws the math font's
+    // radical — the style's face has no ladder, and its plain U+221A is a
+    // short mark with a detached bar. An ORDINARY item asks for the face that
+    // actually carries the codepoint, so a letter only the math face has
+    // draws rather than coming out blank.
+    const face = if (glyph.needsGeometry(request))
+        ctx.fonts.math
+    else
+        ctx.fonts.faceForCodepoint(request.cp, t.style);
+    var built = (try glyph.plan(scratch.gpa, face, request)) orelse return;
+
+    // An ORDINARY item's one placement is the glyph the size resolves to
+    // (`font.resolvedGlyphId`): the prime composites paint the face's
+    // unencoded alternates at script size, exactly the glyph layout measured
+    // and svg.zig drew. A stretchy item is never one — its placements come
+    // from the face's own MATH constructions, and a construction that names a
+    // prime is not a thing this font builds.
+    if (!glyph.needsGeometry(request)) {
+        if (font.resolvedGlyphId(face, request.cp, t.size)) |gid| {
+            if (built == .single) built.single.glyph = gid;
+        }
+    }
+
+    // The scratch is the frame's, reused by every item; only its contents
+    // are this item's. The decoded outlines are the one thing that cannot
+    // be carried across, so they are released on the way out — on every
+    // exit path, including a failed decode.
+    defer {
+        scratch.releaseOutlines();
+        scratch.parts.clearRetainingCapacity();
+        scratch.contours.clearRetainingCapacity();
+        scratch.extents.clearRetainingCapacity();
+    }
+
+    // Subtract integer margins before conversion to keep glyph geometry stable.
+    const frame_h: f32 = @floatFromInt(height - 2 * pad);
+    var fill: GlyphItem = .{
+        .scratch = scratch,
+        .face = face,
+        .frame = .{
+            .t = t,
+            .pt_to_px = pt_to_px,
+            .frame_h = frame_h,
+            .origin = origin,
+            .gscale = t.size * pt_to_px /
+                @as(f32, @floatCast(@as(f64, @floatFromInt(face.unitsPerEm())))),
+        },
     };
-
-    const face = ctx.fonts.faceForStyle(t.style);
-
-    // Stretchy glyphs resolve through the face's own MATH table (see
-    // `resolveGlyph`): a glyph id is font-specific, so baking one in draws
-    // the wrong shape on every font but Latin Modern.
-    const gid = resolveGlyph(face, cp, &t) orelse return;
-    var outline = try face.glyphOutline(gpa, gid);
-    defer outline.deinit();
-    if (outline.curves.items.len == 0) return;
-    // Normalization: reverse CCW contours (CFF / Latin Modern convention) to CW (Y-up right-hand rule)
-    var run_start: usize = 0;
-    var i: usize = 0;
-    while (i < outline.curves.items.len) : (i += 1) {
-        const at_end = i + 1 == outline.curves.items.len;
-        const boundary = !at_end and (outline.curves.items[i].p2[0] != outline.curves.items[i + 1].p0[0] or
-            outline.curves.items[i].p2[1] != outline.curves.items[i + 1].p0[1]);
-        if (!at_end and !boundary) continue;
-
-        var lo = run_start;
-        var hi = i;
-        while (lo < hi) : ({
-            lo += 1;
-            hi -= 1;
-        }) {
-            const tmp = outline.curves.items[lo];
-            outline.curves.items[lo] = .{
-                .p0 = outline.curves.items[hi].p2,
-                .p1 = outline.curves.items[hi].p1,
-                .p2 = outline.curves.items[hi].p0,
-            };
-            outline.curves.items[hi] = .{
-                .p0 = tmp.p2,
-                .p1 = tmp.p1,
-                .p2 = tmp.p0,
-            };
-        }
-        if (lo == hi) {
-            const c = outline.curves.items[lo];
-            outline.curves.items[lo] = .{ .p0 = c.p2, .p1 = c.p1, .p2 = c.p0 };
-        }
-        run_start = i + 1;
-    }
-
-    const gscale = t.size * pt_to_px / @as(f32, @floatCast(@as(f64, @floatFromInt(face.unitsPerEm()))));
-    const ox = pad_f + (t.x + origin.x) * pt_to_px;
-    const h_f: f32 = @floatFromInt(height);
-    const ybase = h_f - (pad_f + (t.y + origin.y) * pt_to_px);
-
-    var min_x: f32 = std.math.inf(f32);
-    var max_x: f32 = -std.math.inf(f32);
-    var min_y: f32 = std.math.inf(f32);
-    var max_y: f32 = -std.math.inf(f32);
-
-    for (outline.curves.items) |*c| {
-        const points = [_]*[2]f32{ &c.p0, &c.p1, &c.p2 };
-        for (points) |p| {
-            const fx = ox + p[0] * gscale;
-            const fy = ybase + p[1] * gscale;
-            p[0] = fx;
-            p[1] = fy;
-            min_x = @min(min_x, fx);
-            max_x = @max(max_x, fx);
-            min_y = @min(min_y, fy);
-            max_y = @max(max_y, fy);
+    if (t.radical_bar) |bar| {
+        const x0 = (t.x + origin.x + bar.x) * pt_to_px;
+        const x1 = x0 + bar.w * pt_to_px;
+        const y1 = frame_h - (t.y + origin.y + bar.y) * pt_to_px;
+        const y0 = y1 - bar.h * pt_to_px;
+        if (!std.math.isFinite(x0) or !std.math.isFinite(x1) or
+            !std.math.isFinite(y0) or !std.math.isFinite(y1))
+            return error.NonFiniteCoordinate;
+        if (x1 > x0 and y1 > y0) {
+            fill.bar = .{ .x0 = x0, .x1 = x1, .y0 = y0, .y1 = y1 };
+            fill.min_x = x0;
+            fill.max_x = x1;
+            fill.min_y = y0;
+            fill.max_y = y1;
         }
     }
+    // A single glyph overlaps nothing, so its axis never matters; a stack
+    // says which way it grows, and that is the axis it is cut on.
+    var axis: glyph.Axis = .vertical;
+    switch (built) {
+        .single => {},
+        .stack => |copy| axis = copy.axis,
+    }
+    const axis_index: usize = if (axis == .horizontal) 0 else 1;
 
-    const h_i: i64 = @intCast(height);
-    var wy0: i64 = @intFromFloat(@floor(min_y));
-    var wy1: i64 = @intFromFloat(@floor(max_y));
-    if (wy0 >= h_i or wy1 < 0) return;
-    wy0 = @max(wy0, 0);
-    wy1 = @min(wy1, h_i - 1);
+    // TWO PASSES over the placements. The first records each one's ink extent
+    // along the growth axis; the second transforms and clips it against the
+    // cuts those extents imply. Both walks visit the placements in the same
+    // order the SVG serializer emits them, and both record one entry per
+    // placement — including a blank one, whose empty span simply paints
+    // nothing — so a placement's index is the same in both passes.
+    const measure_walk = built;
+    switch (measure_walk) {
+        .single => |part| try fill.measure(part, axis_index),
+        .stack => |copy| {
+            var stack = copy;
+            while (stack.next()) |part| try fill.measure(part, axis_index);
+        },
+    }
+    try fill.planCuts();
 
-    var cx0: i64 = @intFromFloat(@floor(min_x));
-    var cx1: i64 = @intFromFloat(@ceil(max_x));
-    cx0 = @max(cx0, 0);
-    cx1 = @min(cx1, @as(i64, @intCast(width)));
-    if (cx1 <= cx0) return;
+    const place_walk = built;
+    var index: usize = 0;
+    switch (place_walk) {
+        .single => |part| try fill.place(part, index, axis_index),
+        .stack => |copy| {
+            var stack = copy;
+            while (stack.next()) |part| {
+                try fill.place(part, index, axis_index);
+                index += 1;
+            }
+        },
+    }
+    try fill.sweep(pixels, width, height, pad, stride, format, ink);
+}
 
-    const ncols: usize = @intCast(cx1 - cx0);
-    const row_buf = try gpa.alloc(f32, ncols);
-    defer gpa.free(row_buf);
-
-    const cov_curves: []const coverage.QuadCurve =
-        std.mem.bytesAsSlice(coverage.QuadCurve, std.mem.sliceAsBytes(outline.curves.items));
-
-    var wy = wy0;
-    while (wy <= wy1) : (wy += 1) {
-        coverage.coverageRow(cov_curves, @floatFromInt(wy), @floatFromInt(cx0), row_buf);
-        const row: usize = @intCast(h_i - 1 - wy);
-        for (row_buf, 0..) |cov, k| {
-            if (cov <= 0.0) continue;
-            const x = @as(usize, @intCast(cx0)) + k;
-            blendPixel(pixels, row, x, stride, format, ink, cov);
+/// The width in points of a bare `\prime`'s painted mark, from the alpha mask
+/// alone: the columns carrying any coverage. The dpi is high enough that a
+/// script-size mark is a dozen pixels across.
+fn paintedWidthPt(ctx: *context.Context, src: []const u8, size: f32) !f32 {
+    const dpi: f32 = 600;
+    var buffer = try ctx.renderPixels(src, .display, size, .{ .dpi = dpi, .format = .alpha8 }, null);
+    defer buffer.deinit();
+    var columns: u32 = 0;
+    var x: u32 = 0;
+    while (x < buffer.width) : (x += 1) {
+        var y: u32 = 0;
+        while (y < buffer.height) : (y += 1) {
+            if (buffer.pixels[y * buffer.stride + x] == 0) continue;
+            columns += 1;
+            break;
         }
     }
+    return @as(f32, @floatFromInt(columns)) * 72.0 / dpi;
+}
+
+test "raster: the painted prime crosses the script gate with its glyph" {
+    var ctx = try context.Context.init(testing.allocator);
+    defer ctx.deinit();
+    // A bare `\prime` is drawn at the size it is typed at, so the gate alone
+    // decides which composite is painted: below it the face's unencoded
+    // alternate, whose single mark is far wider than the cmap's composite's.
+    // Same face, same ink rows, drawn sizes half a point apart.
+    const below = try paintedWidthPt(&ctx, "\\prime", 5.5);
+    const above = try paintedWidthPt(&ctx, "\\prime", 6.5);
+    try testing.expect(below > above * 1.2);
 }

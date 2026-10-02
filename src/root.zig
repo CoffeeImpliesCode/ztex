@@ -1,27 +1,19 @@
-//! ztex — LaTeX math parsing + layout → SVG-style draw list.
+//! LaTeX math to draw lists, SVG, and CPU pixel buffers.
 //!
-//! Facade over independently usable modules:
-//! - `ztex.parse` — LaTeX source → superflat atom tree
-//! - `ztex.layout` — atom tree + font metrics → box tree → draw list
-//! - `ztex.svg` — draw list → SVG document
+//! Import the registered `ztex` module for this facade, or `ztex.atom`,
+//! `ztex.parse`, `ztex.layout`, `ztex.font`, `ztex.glyph`, and `ztex.svg`
+//! independently. `raster` is available through this facade.
 //!
-//! plus two back ends that turn a draw list into pixels or markup:
-//! `ztex.svg.render` and `raster.rasterize` (re-exported below; the latter
-//! always needs a `Context`, because it resolves every glyph through the
-//! real faces).
+//! Call `render`, serialize with `svg.render`, then release the bytes with
+//! the supplied allocator and the draw list with `deinit`. Draw lists borrow
+//! the original source, which must remain alive and unchanged until their
+//! last use. `Context` reuses embedded faces and caches across calls;
+//! `renderPixels` creates a temporary context for one formula.
 //!
-//! Module weight: importing `ztex` pulls 1,193,544 bytes (1.14 MiB) of
-//! embedded Latin Modern faces (`font.zig` → `src/fonts/`) — LM Math plus
-//! LM Roman regular, italic, bold and bold italic — because the `Context`
-//! facade measures from them and the rasterizer draws from them.
-//! `ztex.parse` and `ztex.layout` do NOT depend on `font.zig` — they reach
-//! real fonts through an opaque `metrics.FontHook`, so a host that only
-//! wants the static tables can import those two modules and never link the
-//! font bytes. The static path answers from compiled-in numbers instead:
-//! the Computer Modern rows, plus rows generated from those SAME embedded
-//! faces for the text styles the CM tables do not describe and sparse ink
-//! edges for all five, so a glyph is framed by the outline it is drawn
-//! from.
+//! Static parsing and layout do not open files. Embedded font payloads are
+//! reached by font-backed rendering, not unconditionally by an import;
+//! Zig lazily analyzes declarations. `renderPipeline` is an internal
+//! cross-file helper, not a supported consumer entry point.
 const std = @import("std");
 
 pub const atom = @import("ztex.atom");
@@ -29,7 +21,7 @@ pub const parse = @import("ztex.parse");
 pub const layout = @import("ztex.layout");
 pub const draw = layout.draw;
 pub const svg = @import("ztex.svg");
-pub const font = @import("font.zig");
+pub const font = @import("ztex.font");
 pub const raster = @import("raster.zig");
 pub const PixelBuffer = raster.PixelBuffer;
 pub const RasterOptions = raster.Options;
@@ -37,24 +29,21 @@ pub const RasterOptions = raster.Options;
 // through `ztex.Context` below.
 const context = @import("context.zig");
 
-/// Font-backed rendering context: owns a FontContext (five embedded Latin
-/// Modern faces plus the per-(face, codepoint) metric cache) and a
-/// FontMetrics wired to it — "initialize once, render many" (see
-/// context.zig). Its `.font` arm also borrows LM Math's decoded MATH
-/// constants, valid for the life of the context. Rasterizing a draw list
-/// needs one: `raster.rasterize` resolves every run's face through it.
 pub const Context = context.Context;
+
+/// Failures from source parsing or checked layout; no partial draw list escapes.
+pub const RenderError = parse.Error || layout.Error;
+/// Rendering plus pixel allocation and glyph decoding failures.
+pub const PixelRenderError = RenderError || raster.Error || font.FontError;
+
 /// Shared parse+layout pipeline behind both facades. Internal — not part of
 /// the host-facing API: `ztex.render` and `Context.render` are the public
 /// entry points, differing only in the metric source (`&metrics.default`
 /// vs a Context's `.font` arm).
 ///
-/// The returned `DrawList`'s `text` primitives alias `src`, so `src` must
-/// outlive the draw list. `size_pt` is the base font size in points. On a
-/// parse error, `err_info` (when non-null) is filled with the kind + span.
-/// Errors propagate unmapped: `layout.render`'s closed set (OutOfMemory,
-/// InvalidAst) is a subset of this facade's typed return set, so callers
-/// match the typed set exhaustively instead of re-enumerating errors.
+/// `src` remains borrowed by the returned list; parsing scratch is released.
+/// Invalid `size_pt` is refused before parsing. Diagnostics change only on
+/// a syntax/source-limit failure, not on allocation, option, or font failure.
 pub fn renderPipeline(
     gpa: std.mem.Allocator,
     fm: *const layout.metrics.FontMetrics,
@@ -62,39 +51,41 @@ pub fn renderPipeline(
     style: layout.Style,
     size_pt: f32,
     err_info: ?*parse.Info,
-) (parse.Error || error{InvalidAst})!draw.DrawList {
+) RenderError!draw.DrawList {
+    if (!std.math.isFinite(size_pt) or size_pt <= 0) return error.InvalidArgument;
     var ast = try parse.parse(gpa, src, err_info);
     defer ast.deinit();
-    // layout.render fails only with OutOfMemory/InvalidAst, both members of
-    // the typed set below, so they propagate unmapped — callers match the
-    // closed facade set exhaustively instead of re-enumerating errors.
     return layout.render(gpa, &ast, ast.root, fm, style, size_pt);
 }
 
-/// Full pipeline: LaTeX source → draw list (SVG-style primitives),
-/// measured from the bundled static tables (`layout.metrics.default`).
-/// Those tables are compiled-in numbers — the Computer Modern rows, plus
-/// rows and ink edges generated from the same embedded faces — so this
-/// entry point touches no font file and holds no mutable state, and is
-/// shareable across threads. `Context.render` is the same pipeline measured
-/// from the real fonts; both share the body in `renderPipeline` above.
-/// Details on the returned draw list's lifetime and `err_info` are
-/// documented there.
+/// Lay out `src` with immutable bundled metric tables, without font I/O.
+///
+/// `size_pt` must be finite and positive; otherwise `error.InvalidArgument`
+/// is returned before parsing or allocating. On success the caller owns a
+/// `DrawList`, releases it once with `deinit`, and keeps `src` alive and
+/// unchanged until its last use. The list stores `gpa` for cleanup.
+///
+/// `err_info = null` requests no diagnostic. A syntax/source-limit error fills
+/// it; success and all other errors leave it unchanged. Errors release all
+/// temporary allocations and return no partial list. Independent calls may
+/// run concurrently when their allocator and source are safe to share.
 pub fn render(
     gpa: std.mem.Allocator,
     src: []const u8,
     style: layout.Style,
     size_pt: f32,
     err_info: ?*parse.Info,
-) (parse.Error || error{InvalidAst})!draw.DrawList {
+) RenderError!draw.DrawList {
     return renderPipeline(gpa, &layout.metrics.default, src, style, size_pt, err_info);
 }
 
-/// One-shot rasterization: initializes a temporary Context — the
-/// rasterizer needs real faces, so this is not a static-table path — and
-/// rasterizes the formula to a PixelBuffer. For batch rendering, prefer
-/// initializing a persistent `ztex.Context` and calling `ctx.renderPixels`,
-/// so the faces and the metric cache are built once.
+/// Render one formula with a temporary embedded-font context.
+///
+/// Repeated callers can reuse `Context.renderPixels` to keep its faces and
+/// metric cache. The returned buffer is independent of `src` and the context;
+/// the caller keeps `gpa` valid and calls `PixelBuffer.deinit` exactly once.
+/// Size and diagnostic rules are those of `render`; raster options and
+/// payload limits are those of `raster.rasterize`. No partial buffer escapes.
 pub fn renderPixels(
     gpa: std.mem.Allocator,
     src: []const u8,
@@ -102,7 +93,8 @@ pub fn renderPixels(
     size_pt: f32,
     opts: RasterOptions,
     err_info: ?*parse.Info,
-) !PixelBuffer {
+) PixelRenderError!PixelBuffer {
+    if (!std.math.isFinite(size_pt) or size_pt <= 0) return error.InvalidArgument;
     var ctx = try Context.init(gpa);
     defer ctx.deinit();
     return ctx.renderPixels(src, style, size_pt, opts, err_info);
@@ -225,4 +217,22 @@ test "facade: the math style argument changes the layout" {
     defer st.deinit();
     try testing.expect(st.width > sd.width);
     try testing.expect(st.height < sd.height);
+}
+
+test "facade: invalid font size is refused before parsing or allocating" {
+    // A bad size must not enter layout or overwrite a syntax diagnostic.
+    const sizes = [_]f32{ 0, -5, std.math.nan(f32), std.math.inf(f32) };
+    for (sizes) |size| {
+        var info: parse.Info = .{ .kind = .missing_script, .span = .{ .start = 3, .end = 4 } };
+        const before = info;
+        try testing.expectError(
+            error.InvalidArgument,
+            render(testing.failing_allocator, "\\frac{", .display, size, &info),
+        );
+        try testing.expectEqualDeep(before, info);
+        try testing.expectError(
+            error.InvalidArgument,
+            renderPixels(testing.failing_allocator, "x", .display, size, .{}, null),
+        );
+    }
 }

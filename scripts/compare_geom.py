@@ -2,7 +2,7 @@
 """Compare ztex vs MicroTeX math layout geometry over a fixed corpus.
 
 Renders (already produced) live in /tmp/ztex_cmp:
-  <n>.svg        ztex      (each glyph = <text x y font-size>)
+  <n>.svg        ztex      (glyph outlines carry data-text/data-x/data-y/font-size)
   <n>_ref.svg    MicroTeX  (each glyph = <use x y>, glyph outlines in <defs>)
 
 All invariants are RELATIVE / structural (font metrics differ between the
@@ -26,6 +26,9 @@ import json
 import re
 import subprocess
 import sys
+import unicodedata
+import xml.etree.ElementTree as ET
+from pathlib import Path
 
 DIR = "/tmp/ztex_cmp"
 
@@ -50,12 +53,25 @@ EXPECT_SEQ = {1: ["x"], 2: ["x", "2"], 3: ["x", "2"], 4: ["x", "2", "i"],
 DIGIT_FULL_H = 13.31  # measured full-size digit height in MicroTeX frac (formula 5/6)
 
 
-def parse_ztex(path):
+def parse_ztex(path: str) -> tuple[
+    list[tuple[str, float, float, float]], list[tuple[float, float, float, float]]
+]:
     """-> (texts, rules): texts=[(char,x,y,size)], rules=[(x,y,w,h)] non-white rects."""
-    s = open(path).read()
-    texts = [(m.group(4), float(m.group(1)), float(m.group(2)), float(m.group(3)))
-             for m in re.finditer(
-                 r'<text x="([\d.]+)" y="([\d.]+)" font-size="([\d.]+)"[^>]*>([^<]*)</text>', s)]
+    s = Path(path).read_text(encoding="utf-8")
+    texts = []
+    for node in ET.fromstring(s).iter():
+        kind = node.tag.rsplit("}", 1)[-1]
+        if kind == "path":
+            content = node.get("data-text")
+            x, y = node.get("data-x"), node.get("data-y")
+        elif kind == "text":
+            content = node.text
+            x, y = node.get("x"), node.get("y")
+        else:
+            continue
+        size = node.get("font-size")
+        if content and x is not None and y is not None and size is not None:
+            texts.append((unicodedata.normalize("NFKC", content), float(x), float(y), float(size)))
     rules = [(float(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4)))
              for m in re.finditer(
                  r'<rect x="([\d.]+)" y="([\d.]+)" width="([\d.]+)" height="([\d.]+)" fill="([^"]*)"', s)
@@ -71,8 +87,8 @@ def parse_microtex(path):
     """-> (uses, bbox, rules). bbox[gid]=(xmin,xmax,ymin,ymax) in glyph-local coords
     where (x,y) of the <use> is the origin (baseline for text glyphs, box top for
     big operators). rules = [(x1,y1,x2,y2)] stroked segments in canvas coords."""
-    s = open(path).read()
-    defs = dict(re.findall(r'<g id="(glyph-[\d-]+)">\s*(.*?)</g>', s, re.S))
+    s = Path(path).read_text(encoding="utf-8")
+    defs = dict(re.findall(r'<g id="(glyph-[\d-]+)">\s*(.*?)</g>', s, re.DOTALL))
     bbox = {}
     for gid, body in defs.items():
         xs, ys = [], []
@@ -297,18 +313,6 @@ def main():
         muses, mbbox, mrules = parse_microtex(f"{DIR}/{idx}_ref.svg")
         zc = checks_ztex(idx, kind, ztexts, zrules)
         mc = checks_microtex(idx, kind, muses, mbbox, mrules)
-        if idx == 10:  # \mathbf visual weight
-            zsvg = open(f"{DIR}/{idx}.svg").read()
-            zbold = "font-weight" in zsvg
-            ref1 = open(f"{DIR}/1_ref.svg").read()
-            xg1 = re.search(r'<g id="(glyph-[\d-]+)">\s*<path d="([^"]*)"', ref1)
-            xg10 = re.search(r'<g id="(glyph-[\d-]+)">\s*<path d="([^"]*)"',
-                             open(f"{DIR}/{idx}_ref.svg").read())
-            glyph_diff = xg1 and xg10 and xg1.group(2) != xg10.group(2)
-            zc.append(("bold-attr", not zbold,
-                       "ztex emits NO font-weight -> \\mathbf is a visual no-op (regular x)"))
-            mc.append(("bold-glyphs", glyph_diff,
-                       "MicroTeX 'x' outline differs from plain x (bold font run) vs ztex identical"))
         if kind == "spaces":
             zg = measure_ztex_gaps(idx, ztexts)
             mg = []
@@ -335,7 +339,9 @@ def main():
         print("  microtex :", " | ".join(f"{c[0]}:{'OK' if c[1] else 'FAIL'}" for c in mc))
         for c in mfail:
             print(f"      microtex FAIL {c[0]} -- {c[2]}")
-    json.dump(report, open(f"{DIR}/results.json", "w"), indent=1, default=str)
+    Path(f"{DIR}/results.json").write_text(
+        json.dumps(report, indent=1, default=str) + "\n", encoding="utf-8"
+    )
     print(f"\nOVERALL: {'ALL PASS' if all_ok else 'SOME MISMATCHES'}")
     return 0 if all_ok else 1
 

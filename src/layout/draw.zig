@@ -1,6 +1,10 @@
 //! ztex.layout.draw — box tree → painter-ordered draw list of absolute-
 //! coordinate primitives (text/rect/line), each carrying its box's byte span.
-
+//!
+//! The module owns the draw list and the flattening walk; it does not decide
+//! where anything goes on a page. `ztex.svg` and `ztex.raster` consume the
+//! list this produces, and both frame from `DrawList.bounds()` rather than
+//! the box extents.
 const std = @import("std");
 const box = @import("box.zig");
 pub const atom = @import("ztex.atom");
@@ -9,6 +13,13 @@ pub const atom = @import("ztex.atom");
 /// `\color`/`\textcolor` arguments (`atom.parseColorChecked`).
 pub const Color = atom.Color;
 
+/// One painter's-algorithm primitive. The variant names the shape; every
+/// variant carries the source byte span of the box it came from, and only
+/// `.text` borrows bytes. Coordinates are absolute output POINTS with the
+/// root box's baseline at y = 0, so a consumer never walks a tree.
+///
+/// `accInk` is what records the ink extent of whichever variant a producer
+/// appends; `add` alone does not.
 pub const Draw = union(enum) {
     /// a glyph run at its baseline (x, y)
     text: Text,
@@ -18,6 +29,10 @@ pub const Draw = union(enum) {
     line: Line,
 };
 
+/// One glyph run. `bytes` is the only borrowed payload in the whole draw
+/// list; every other field is a scalar, and the MATH fields carry the form
+/// the layout selected so the back ends resolve the SAME outline the box was
+/// measured against instead of re-deciding it from the font size.
 pub const Text = struct {
     /// utf-8 glyph bytes. Two ownership domains, discriminated by
     /// `synthetic`: false = a slice into the source (never copied); true =
@@ -49,10 +64,10 @@ pub const Text = struct {
     /// rasterizer/verifier resolve the variant); everything else stays the
     /// default `.base`.
     bigop_form: box.BigOpForm = .base,
-    /// radical MATH-table variant index (0 = base √, 1–4 = radical.v1–v4),
-    /// carried from the box so svg.zig can emit data-radical="vN". Set only
-    /// for stretchy √ glyphs in layoutSqrt; 0 for every other text.
+    /// MATH variant index from the box; whole radical assemblies use delim_req.
     radical_form: u8 = 0,
+    /// A connected vinculum, relative to this run's baseline.
+    radical_bar: ?box.RadicalBar = null,
     /// amsmath FIXED-rule delimiter req_em (`\binom`/`\genfrac-with-delims`
     /// — e.g. 2.392 at display, ~1.09 at text), carried from the box so
     /// svg.zig can emit data-fixed-req and the rasterizer resolve the same
@@ -71,18 +86,29 @@ pub const Text = struct {
     /// base size, not the base glyph scaled up — the variant ladder
     /// keeps the stroke constant; scaling thickens it).
     delim_form: u8 = 0,
-    /// content-sized `\left`/`\right` fence required ink in em (TeX
-    /// make_delim's 2δ·901/1000), carried from the box when the content is
-    /// TALLER than the largest MATH-table variant (delim_form == 7 but the
-    /// content still exceeds v7's ink). svg.zig emits `data-delim-req` so
-    /// the rasterizer assembles the XeTeX GlyphAssembly (top + extenders +
-    /// bottom) to exactly this height. 0 = the variant covers the content.
+    /// Required vertical assembly ink height in em for a fence or radical.
+    /// Both backends resolve the same complete glyph construction rather
+    /// than painting its overlapping parts as separate draw items.
     delim_req: f32 = 0,
-    // provenance
+    /// Required HORIZONTAL advance for this run's glyph, in em: 0 for
+    /// ordinary text, nonzero for the stretchy MATH forms that grow along x
+    /// — an over/under brace (U+23DE / U+23DF) and the wide `\widehat` /
+    /// `\widetilde` accent (U+0302 / U+0303). The run's own bytes say WHICH
+    /// glyph; this says how wide it must come out, and the back ends resolve
+    /// the same horizontal form the layout boxed (the face's own size variant,
+    /// or a balanced assembly past the ladder). Copied verbatim from the
+    /// box in `flatten`, alongside the vertical MATH fields above.
+    horizontal_req: f32 = 0,
+    /// byte offsets into the source this run came from, copied from the box;
+    /// for a synthetic run they point at the command that asked for the
+    /// glyph, not at the bytes in `bytes`.
     src_start: u32,
     src_end: u32,
 };
 
+/// A filled axis-aligned rectangle, in points, with the same baseline-anchored
+/// coordinates as `Text.x`/`Text.y`: `y` is the TOP edge, so height grows
+/// downward.
 pub const Rect = struct {
     x: f32,
     y: f32,
@@ -92,10 +118,17 @@ pub const Rect = struct {
     /// see `Text.color_override`: true = an explicit color scope covers
     /// this rule and `color` wins over the host foreground.
     color_override: bool = false,
+    /// byte offsets into the source this rule came from; see
+    /// `Text.src_start`.
     src_start: u32,
     src_end: u32,
 };
 
+/// One stroked, BUTT-CAPPED segment of a `.poly` box's stroke, in points and
+/// in the same baseline-anchored, y-down coordinates as every other
+/// primitive. A polyline becomes one of these per segment, each already
+/// prolonged through its interior vertices by the miter reach, and each
+/// carries the whole stroke's source span.
 pub const Line = struct {
     x0: f32,
     y0: f32,
@@ -106,33 +139,12 @@ pub const Line = struct {
     /// this line and `color` wins over the host foreground.
     color_override: bool = false,
     width: f32,
+    /// byte offsets into the source this stroke came from; see
+    /// `Text.src_start`.
     src_start: u32,
     src_end: u32,
 };
 
-/// The ordered draw list. Painter's order; absolute coordinates.
-///
-/// Do NOT copy a DrawList by value: it owns the `items` array and the
-/// `glyph_arena` (which owns every synthetic glyph's bytes) and deinits
-/// them exactly once. `init`/`deinit` must be paired 1:1; after `deinit`
-/// the list is unusable.
-///
-/// Two bound sources, both relative to the root box's reference point
-/// (baseline at y = 0, left edge at x = 0):
-///   - `width`/`height`/`depth` — the BOX bounds: the laid-out root box's
-///     advance and design extents (set by the caller, e.g. layout/root.zig
-///     render from the root box). Boxes can under-bind the drawn ink
-///     (italic overhang past the advance, a display variant taller than its
-///     box) and can over-bind it (an alignment strut), so a frame drawn from
-///     them can either clip the ink or carry empty border; the consumers
-///     (svg.zig's viewBox, raster.zig's pixel buffer) frame from `bounds()`.
-///   - `bounds()` — the INK bounds accumulated by `flatten`: the exact
-///     vertical ink extents of every drawn glyph (char boxes carry the
-///     drawn glyph's ink as their h/d) and the exact rect areas, with each
-///     glyph's horizontal extent taken from its ADVANCE box UNIONED with the
-///     real ink edges the layout measured from the drawn face — so a glyph
-///     that leans past its advance is inside the frame, not shaved off it.
-///
 /// Exact INK bounds of everything `flatten` drew, relative to the root
 /// reference point. `min_x`/`min_y` are where that ink actually starts: the
 /// reference point is (0, 0) for a draw list whose first drawn primitive
@@ -152,13 +164,43 @@ pub const InkBounds = struct {
     depth: f32,
 };
 
+/// The ordered draw list. Painter's order; absolute coordinates.
+///
+/// Do NOT copy a DrawList by value: it owns the `items` array and the
+/// `glyph_arena` (which owns every synthetic glyph's bytes) and deinits
+/// them exactly once. `init`/`deinit` must be paired 1:1; after `deinit`
+/// the list is unusable.
+///
+/// A non-synthetic `Text.bytes` ALIASES the source `flatten` was given and
+/// is never copied, so those bytes must outlive the list; `deinit` frees
+/// only what the list itself owns.
+///
+/// Two bound sources, both relative to the root box's reference point
+/// (baseline at y = 0, left edge at x = 0):
+///   - `width`/`height`/`depth` — the BOX bounds: the laid-out root box's
+///     advance and design extents (set by the caller, e.g. layout/root.zig
+///     render from the root box). Boxes can under-bind the drawn ink
+///     (italic overhang past the advance, a display variant taller than its
+///     box) and can over-bind it (an alignment strut), so a frame drawn from
+///     them can either clip the ink or carry empty border; the consumers
+///     (svg.zig's viewBox, raster.zig's pixel buffer) frame from `bounds()`.
+///   - `bounds()` — the INK bounds accumulated by `flatten`: the exact
+///     vertical ink extents of every drawn glyph (char boxes carry the
+///     drawn glyph's ink as their h/d) and the exact rect areas, with each
+///     glyph's horizontal extent taken from its ADVANCE box UNIONED with the
+///     real ink edges the layout measured from the drawn face — so a glyph
+///     that leans past its advance is inside the frame, not shaved off it.
 pub const DrawList = struct {
+    /// The allocator that receives `items` and backs `glyph_arena`; the
+    /// caller owns it and it must outlive this list.
     gpa: std.mem.Allocator,
+    /// The primitives, in painter's order. Appending may reallocate, so a
+    /// primitive passed to `add` is copied into the list, never referenced.
     items: std.ArrayList(Draw) = .empty,
     /// arena for generated glyphs (e.g. big-operator ∑) that have no source
     /// bytes; frees with the draw list
     glyph_arena: std.heap.ArenaAllocator,
-    /// total laid-out BOX bounds (for an SVG viewBox); see the struct doc
+    /// Laid-out box width in points; output framing uses the ink `bounds()`.
     width: f32 = 0,
     height: f32 = 0,
     depth: f32 = 0,
@@ -170,6 +212,8 @@ pub const DrawList = struct {
     ink_max_x: f32 = 0,
     ink_max_y: f32 = 0,
 
+    /// Allocates nothing on its own; the arena is bound to `gpa` and lives
+    /// until `deinit`. Pair with `deinit` exactly once.
     pub fn init(gpa: std.mem.Allocator) DrawList {
         return .{
             .gpa = gpa,
@@ -177,16 +221,21 @@ pub const DrawList = struct {
         };
     }
 
+    /// Releases `items` and every synthetic glyph's bytes. The allocator is
+    /// not released, and source bytes the primitives alias are untouched.
+    /// The list is unusable afterward; a second call is a double free.
     pub fn deinit(self: *DrawList) void {
         self.items.deinit(self.gpa);
         self.glyph_arena.deinit();
         self.* = undefined;
     }
 
+    /// Appends one primitive. On `error.OutOfMemory` nothing is appended.
     pub fn add(self: *DrawList, d: Draw) !void {
         try self.items.append(self.gpa, d);
     }
 
+    /// Number of primitives drawn so far.
     pub fn len(self: *const DrawList) usize {
         return self.items.items.len;
     }
@@ -232,10 +281,26 @@ pub const DrawList = struct {
 
 const black: Color = .{ .r = 0, .g = 0, .b = 0 };
 
-/// `(x, y)` is the box's reference point (baseline); children land at
-/// `(x + cr.x_shift, y + cr.shift)` as computed by layout. Every emitted
+/// Flattens the box tree rooted at `root` into `out`, appending in painter's
+/// order. `(x, y)` is the root box's reference point (baseline); children land
+/// at `(x + cr.x_shift, y + cr.shift)` as computed by layout. Every emitted
 /// primitive's extent is also unioned into `out`'s running ink bbox (see
-/// `DrawList.bounds()`).
+/// `DrawList.bounds()`); a primitive recorded without that union makes
+/// `bounds()` under-report.
+///
+/// PRECONDITIONS, established by `layout.render` and NOT checked here: `list`
+/// is a pool `layout.layout` filled from a tree that boundary already
+/// validated, `root` is a box index in range, and `src` is the same source
+/// the layout read, so every non-synthetic char box's `src_start ..
+/// src_end` names a valid slice of it. A pool that breaks any of them makes
+/// this read out of bounds — `BoxList.get`'s assert and the `src` slice are
+/// the whole defence, and neither reports an error.
+///
+/// `out` is appended to, not cleared, and its box bounds (`width`/`height`/
+/// `depth`) are left as the caller set them; only the ink bbox is updated.
+/// On `error.OutOfMemory` the primitives already appended stay appended and
+/// the failing one is dropped, so a caller that retries must start from a
+/// fresh list.
 ///
 /// The whole formula starts outside every color scope: a formula with no
 /// `\color`/`\textcolor`/`\boxed` emits plain black primitives with no
@@ -293,9 +358,11 @@ fn flattenIn(
                 .synthetic = ch.synthetic,
                 .bigop_form = ch.bigop_form,
                 .radical_form = ch.radical_form,
+                .radical_bar = ch.radical_bar,
                 .delim_fixed = ch.delim_fixed,
                 .delim_form = ch.delim_form,
                 .delim_req = ch.delim_req,
+                .horizontal_req = ch.horizontal_req,
                 .src_start = b.src_start,
                 .src_end = b.src_end,
             } });
@@ -310,17 +377,23 @@ fn flattenIn(
             // Both are 0 for a glyph whose ink fits its advance box, which
             // is why a hand-built DrawList keeps its exact old extent.
             //
-            // A box that draws a MATH-table VARIANT — a stretched delimiter
-            // (`delim_form`), an amsmath fixed fence (`delim_fixed`), a
-            // radical variant or a display big-op's `.v1` form — paints
-            // another glyph than its `cp` names, so the base codepoint's
-            // horizontal bounds are meaningless there and are dropped: the
-            // variant's own advance box frames it.
+            // Selected MATH forms carry their own outline's overhangs.
             const base_glyph = ch.delim_form == 0 and ch.delim_fixed == 0 and
-                ch.radical_form == 0 and ch.bigop_form == .base;
-            const left = if (base_glyph) ch.ink_left else 0;
-            const right = if (base_glyph) ch.ink_right else 0;
+                ch.delim_req == 0 and ch.radical_form == 0 and ch.bigop_form == .base;
+            const measured_ink = base_glyph or ch.horizontal_req > 0 or
+                ch.delim_form > 0 or ch.delim_fixed > 0 or ch.delim_req > 0 or
+                ch.radical_form > 0;
+            const left = if (measured_ink) ch.ink_left else 0;
+            const right = if (measured_ink) ch.ink_right else 0;
             out.accInk(x - left, y - b.height, x + b.width + right, y + b.depth);
+            if (ch.radical_bar) |bar| {
+                out.accInk(
+                    x + bar.x,
+                    y + bar.y,
+                    x + bar.x + bar.w,
+                    y + bar.y + bar.h,
+                );
+            }
         },
         .rule => {
             try out.add(.{ .rect = .{
@@ -359,9 +432,8 @@ fn flattenIn(
                 // Each segment is prolonged THROUGH its interior vertices by
                 // that vertex's miter reach (`extend`): two butt-capped bands
                 // meeting at a corner leave a notch on the outside of the
-                // turn — a full miter's reach at the hat's apex. The two
-                // ENDS carry no extension, so the stroke's outer extent
-                // stays exactly on the box's edges.
+                // turn. The two ENDS carry no extension, so the stroke's
+                // outer extent stays exactly on the box's edges.
                 const dx = sx / len;
                 const dy = sy / len;
                 const back: f32 = if (k > 0) stroke.extend[k] else 0;
@@ -609,36 +681,6 @@ test "bounds: a glyph whose ink fits its advance box keeps the advance box" {
     try testing.expectApproxEqAbs(@as(f32, 4), b.width, 0.001);
 }
 
-test "bounds: a variant glyph is framed by its own advance box" {
-    // A stretched delimiter, an amsmath fixed fence, a radical variant and a
-    // display big-op's .v1 form each paint a DIFFERENT glyph than their `cp`
-    // names. The base codepoint's horizontal edges describe another outline
-    // entirely, so they must not reach the frame even when they are set.
-    const Form = enum { delim, fixed_fence, radical, bigop };
-    const forms = [_]Form{ .delim, .fixed_fence, .radical, .bigop };
-    for (forms) |form| {
-        var list = box.BoxList.init(testing.allocator);
-        defer list.deinit();
-        var out = DrawList.init(testing.allocator);
-        defer out.deinit();
-        const c = try list.createLeaf(.char, 4.0, 3.0, 0.5, .{ .start = 0, .end = 1 });
-        list.charDataPtr(c).cp = 'f';
-        const ch = list.charDataPtr(c);
-        ch.ink_left = 0.5;
-        ch.ink_right = 1.25;
-        switch (form) {
-            .delim => ch.delim_form = 6,
-            .fixed_fence => ch.delim_fixed = 2.392,
-            .radical => ch.radical_form = 2,
-            .bigop => ch.bigop_form = .variant,
-        }
-        try flatten(&list, c, "f", 10, 0, &out);
-        const b = out.bounds();
-        try testing.expectApproxEqAbs(@as(f32, 10), b.min_x, 0.001);
-        try testing.expectApproxEqAbs(@as(f32, 4), b.width, 0.001);
-    }
-}
-
 // ── color scopes ─────────────────────────
 
 /// A `.char` box 4pt wide with `cp` drawn at 10pt, spanning one source byte
@@ -865,7 +907,7 @@ test "flatten: a scope over a script box colors base and scripts alike" {
     }
 }
 
-// ── wide accents ─────────────────────────
+// ── long-tilde stroke ────────────────────
 
 // A stroke through `vertices`, with `reach[i]` at each vertex — the miter
 // extension layout sets. Vertices past the run keep the degenerate default
@@ -879,18 +921,17 @@ fn polyStroke(vertices: []const box.PolyPoint, reach: []const f32, width: f32) b
     return stroke;
 }
 
-// The long \widehat / \widetilde form is ONE connected stroke: `count`
-// vertices make `count - 1` segments. A run of repeated mark boxes would
-// draw a sawtooth instead, so the count of emitted segments IS the
-// geometry — and each one must carry the stroke's width, the box's span and
-// the enclosing color scope. With no miter reach set, segment k runs
-// vertex to vertex.
+// The long \widetilde form is ONE connected stroke: `count` vertices make
+// `count - 1` segments. A run of repeated mark boxes would draw a sawtooth
+// instead, so the count of emitted segments IS the geometry — and each one
+// must carry the stroke's width, the box's span and the enclosing color
+// scope. With no miter reach set, segment k runs vertex to vertex.
 test "flatten: a poly box emits its segments as one connected stroke" {
     var list = box.BoxList.init(testing.allocator);
     defer list.deinit();
     var out = DrawList.init(testing.allocator);
     defer out.deinit();
-    // A two-segment hat: left foot, ONE apex, right foot.
+    // A minimal three-vertex run: up to a crest, back down to the trough.
     const stroke = polyStroke(
         &.{
             .{ .dx = 0, .dy = 4 },
@@ -900,11 +941,11 @@ test "flatten: a poly box emits its segments as one connected stroke" {
         &.{ 0, 0, 0 },
         0.4,
     );
-    const p = try list.createPoly(stroke, 20.0, 6.0, 0.0, .{ .start = 0, .end = 8 });
+    const p = try list.createPoly(stroke, 20.0, 6.0, 0.0, .{ .start = 0, .end = 10 });
     const children = [_]box.ChildRef{.{ .idx = p, .x_shift = 0, .shift = 0 }};
-    const h = try scopeBox(&list, &children, 20.0, .{ .start = 0, .end = 8 });
+    const h = try scopeBox(&list, &children, 20.0, .{ .start = 0, .end = 10 });
     setColor(&list, h, .{ .r = 0, .g = 0, .b = 255 });
-    try flatten(&list, h, "\\widehat", 0, 0, &out);
+    try flatten(&list, h, "\\widetilde", 0, 0, &out);
 
     try testing.expectEqual(@as(usize, 2), out.len());
     const first = out.items.items[0].line;
@@ -922,7 +963,7 @@ test "flatten: a poly box emits its segments as one connected stroke" {
     for ([_]Line{ first, second }) |seg| {
         try testing.expectEqual(@as(f32, 0.4), seg.width);
         try testing.expectEqual(@as(u32, 0), seg.src_start);
-        try testing.expectEqual(@as(u32, 8), seg.src_end);
+        try testing.expectEqual(@as(u32, 10), seg.src_end);
         try testing.expectEqualSlices(u8, &.{ 0, 0, 255 }, &rgb(seg.color));
         try testing.expect(seg.color_override);
     }
@@ -937,9 +978,9 @@ test "flatten: a poly box emits its segments as one connected stroke" {
 // A vertex's miter reach makes the two bands OVERLAP there, so the corner
 // closes instead of notching. Each segment is prolonged by its interior
 // vertices' reach along its own direction: the first runs 1.3pt past the
-// apex, the second starts 1.3pt before it — 1.3/√2 on each axis of a 45°
-// pair. The ENDS move by nothing, so the stroke's outer extent is still the
-// box's own left and right edges.
+// shared vertex, the second starts 1.3pt before it — 1.3/√2 on each axis of
+// a 45° pair. The ENDS move by nothing, so the stroke's outer extent is
+// still the box's own left and right edges.
 test "flatten: a miter reach closes the corner without moving the ends" {
     var list = box.BoxList.init(testing.allocator);
     defer list.deinit();
@@ -954,13 +995,14 @@ test "flatten: a miter reach closes the corner without moving the ends" {
         &.{ 0, 1.3, 0 },
         0.4,
     );
-    const p = try list.createPoly(stroke, 20.0, 6.0, 0.0, .{ .start = 0, .end = 8 });
-    try flatten(&list, p, "\\widehat", 0, 0, &out);
+    const p = try list.createPoly(stroke, 20.0, 6.0, 0.0, .{ .start = 0, .end = 10 });
+    try flatten(&list, p, "\\widetilde", 0, 0, &out);
     try testing.expectEqual(@as(usize, 2), out.len());
     const first = out.items.items[0].line;
     const second = out.items.items[1].line;
-    // The overlap: segment 1 ends PAST the apex, segment 2 starts BEFORE it.
-    // Without the reach both land exactly on it and the corner notches.
+    // The overlap: segment 1 ends PAST the shared vertex, segment 2 starts
+    // BEFORE it. Without the reach both land exactly on it and the corner
+    // notches.
     try testing.expectApproxEqAbs(@as(f32, 10.919), first.x1, 0.001);
     try testing.expectApproxEqAbs(@as(f32, -6.919), first.y1, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 9.081), second.x0, 0.001);
@@ -987,7 +1029,7 @@ test "flatten: a two-vertex poly emits exactly one segment" {
         &.{ 0, 0 },
         0.4,
     );
-    const p = try list.createPoly(stroke, 8.0, 0.0, 0.0, .{ .start = 0, .end = 8 });
+    const p = try list.createPoly(stroke, 8.0, 0.0, 0.0, .{ .start = 0, .end = 10 });
     try flatten(&list, p, "\\widetilde", 0, 0, &out);
     try testing.expectEqual(@as(usize, 1), out.len());
     const seg = out.items.items[0].line;
@@ -1014,8 +1056,8 @@ test "flatten: a degenerate poly draws nothing and frames nothing" {
         &.{ 1.3, 1.3, 1.3 },
         0.4,
     );
-    const p = try list.createPoly(stroke, 8.0, 6.0, 1.0, .{ .start = 0, .end = 8 });
-    try flatten(&list, p, "\\widehat", 0, 0, &out);
+    const p = try list.createPoly(stroke, 8.0, 6.0, 1.0, .{ .start = 0, .end = 10 });
+    try flatten(&list, p, "\\widetilde", 0, 0, &out);
     try testing.expectEqual(@as(usize, 0), out.len());
     try testing.expect(!out.ink_valid);
     const ink = out.bounds();
@@ -1041,8 +1083,8 @@ test "flatten: a partly degenerate poly still frames its real segment" {
         &.{ 0, 0, 0 },
         0.4,
     );
-    const p = try list.createPoly(stroke, 8.0, 8.0, 0.0, .{ .start = 0, .end = 8 });
-    try flatten(&list, p, "\\widehat", 0, 0, &out);
+    const p = try list.createPoly(stroke, 8.0, 8.0, 0.0, .{ .start = 0, .end = 10 });
+    try flatten(&list, p, "\\widetilde", 0, 0, &out);
     try testing.expectEqual(@as(usize, 1), out.len());
     try testing.expectEqual(@as(f32, 8), out.items.items[0].line.x1);
     try testing.expectEqual(@as(f32, -4), out.items.items[0].line.y1);

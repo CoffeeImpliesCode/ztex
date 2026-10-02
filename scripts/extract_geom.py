@@ -12,17 +12,17 @@ per-glyph JSON record to /tmp/cmp/<engine>_<i>.json:
 Coordinate conventions (identical across engines):
   * x,y = glyph baseline origin, SVG y-down (page/top-left origin), in pt.
   * up = false (never flipped to y-up).
-  * size = font-size in pt (ztex <text font-size>, XeTeX <use> matrix scale,
+  * size = font-size in pt (ztex <text>/<path> font-size, XeTeX <use> matrix
     MicroTeX glyph bbox height -- MicroTeX has no font-size in its SVG).
   * ink = [xmin, ymin, xmax, ymax] ink bounding box in the same y-down page
     coordinates as x,y (None/absent when the ink cannot be derived).
 
 Ink derivation per engine:
-  * ztex:   the SVG carries only <text> with a font-family chain headed by
-            "Latin Modern Math"; the drawn ink is what the viewer's font
-            renderer produces. We compute it exactly from the Latin Modern
-            Math OTF metrics (fontTools) at the declared font-size, so a
-            missing/fallback font or a wrong scale shows up as an ink delta.
+  * ztex:   resolvable glyphs are absolute <path> outlines carrying data-text,
+            data-x, data-y and font-size. Their `d` (M/L/Q/Z in page
+            coordinates) IS the painted outline, so ink is its exact bbox.
+            An unavailable-glyph <text> fallback depends on the viewer's
+            external font; an LM metric estimate is not proof of its ink.
   * XeTeX:  mutool embeds the real glyph outlines in <defs>. Both mutool
             output generations are handled: the classic one
             (<use data-text transform="matrix(a,0,0,-a,x,y)"/> with paths in
@@ -86,15 +86,20 @@ _PATH_NUM = re.compile(r"[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?")
 
 def _bez_extent(p0, p1, p2, p3):
     """Exact min/max of a cubic bezier coordinate on t in [0,1]."""
-    vals = [p0, p1, p2, p3]
+    # Only points the curve really passes through seed the range; a control
+    # point may sit outside the curve it shapes, and taking it would
+    # reproduce the control-polygon bbox this exists to avoid.
+    vals = [p0, p3]
+    # B(t) = a*t**3 + b*t**2 + c*t + p0, so an interior extremum sits where
+    # B'(t) = 3a*t**2 + 2b*t + c vanishes, not where a*t**2 + b*t + c does.
     a = -p0 + 3 * p1 - 3 * p2 + p3
-    b = 2 * (p0 - 2 * p1 + p2)
-    c = p1 - p0
+    b = 3 * (p0 - 2 * p1 + p2)
+    c = 3 * (p1 - p0)
     if abs(a) > 1e-12:
-        disc = b * b - 4 * a * c
+        disc = (2 * b) ** 2 - 12 * a * c
         if disc >= 0:
             sq = disc ** 0.5
-            for t in ((-b + sq) / (2 * a), (-b - sq) / (2 * a)):
+            for t in ((-2 * b + sq) / (6 * a), (-2 * b - sq) / (6 * a)):
                 if 0.0 < t < 1.0:
                     tm = 1 - t
                     vals.append(tm * tm * tm * p0 + 3 * tm * tm * t * p1
@@ -108,13 +113,34 @@ def _bez_extent(p0, p1, p2, p3):
     return min(vals), max(vals)
 
 
+def _quad_extent(p0, p1, p2):
+    """Exact min/max of a quadratic bezier coordinate on t in [0,1]."""
+    vals = [p0, p2]  # the curve passes through its ends, never the control
+    a = p0 - 2 * p1 + p2
+    b = 2 * (p1 - p0)
+    if abs(a) > 1e-12:
+        t = -b / (2 * a)
+        if 0.0 < t < 1.0:
+            tm = 1 - t
+            vals.append(tm * tm * p0 + 2 * tm * t * p1 + t * t * p2)
+    return min(vals), max(vals)
+
+
+def _smooth_ctrl(ctrl, p):
+    """Control point of a smooth curve through p: ctrl reflected in p, or p."""
+    if ctrl is None:
+        return list(p)
+    return [2 * p[0] - ctrl[0], 2 * p[1] - ctrl[1]]
+
+
 def _path_bbox(d):
     """Exact ink bbox (xmin, ymin, xmax, ymax) of a mutool SVG path.
 
-    Parses M/L/C/H/V/S/Z (absolute or relative) and evaluates exact cubic
-    bezier extents, so control points never inflate the bbox. On any
-    malformed path it falls back to the coordinate-point bbox (never
-    crashes; the point bbox is a slight over-estimate).
+    Parses M/L/C/H/V/Q/T/Z (absolute or relative) and evaluates exact cubic
+    and quadratic bezier extents, so a control point never inflates the bbox
+    when the curve turns back inside it. On any malformed path it falls back
+    to the coordinate-point bbox (never crashes; the point bbox is a slight
+    over-estimate).
     """
     if not d:
         return None
@@ -125,6 +151,8 @@ def _path_bbox(d):
         if not nums:
             return None
         xs, ys = nums[0::2], nums[1::2]
+        if not xs or not ys:
+            return None
         return (min(xs), min(ys), max(xs), max(ys))
 
 
@@ -132,13 +160,14 @@ _CMD = re.compile(r"[A-Za-z]|[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?")
 
 
 def _path_bbox_exact(d):
-    """Exact bbox of an SVG path with M/L/C/H/V/Z (absolute or relative)."""
+    """Exact bbox of an SVG path with M/L/C/H/V/Q/T/Z (absolute or relative)."""
     toks = _CMD.findall(d)
     if not toks:
         return None
     i = 0
     cur = [0.0, 0.0]
     start = [0.0, 0.0]
+    last_q = None  # previous quadratic control point, for a T reflection
     xs, ys = [], []
 
     def num():
@@ -159,6 +188,12 @@ def _path_bbox_exact(d):
         lo, hi = _bez_extent(p0[1], p1[1], p2[1], p3[1])
         ys.extend((lo, hi))
 
+    def quad(p0, p1, p2):
+        lo, hi = _quad_extent(p0[0], p1[0], p2[0])
+        xs.extend((lo, hi))
+        lo, hi = _quad_extent(p0[1], p1[1], p2[1])
+        ys.extend((lo, hi))
+
     def is_cmd(t):
         return len(t) == 1 and t.isalpha()
 
@@ -171,6 +206,7 @@ def _path_bbox_exact(d):
         if not is_cmd(t):
             raise ValueError("expected command, got %r" % t)
         lower = t.islower()
+        prev_q, last_q = last_q, None
         if t in "Mm":
             x, y = num(), num()
             if lower:
@@ -216,6 +252,38 @@ def _path_bbox_exact(d):
                 p3 = [rel(lower, p0[0], args[4]), rel(lower, p0[1], args[5])]
                 cub(p0, p1, p2, p3)
                 cur = p3
+        elif t in "Qq":
+            p0 = list(cur)
+            x1, y1, x, y = num(), num(), num(), num()
+            ctrl = [rel(lower, p0[0], x1), rel(lower, p0[1], y1)]
+            end = [rel(lower, p0[0], x), rel(lower, p0[1], y)]
+            quad(p0, ctrl, end)
+            last_q = ctrl
+            cur = end
+            while i < len(toks) and not is_cmd(toks[i]):
+                p0 = list(cur)
+                x1, y1, x, y = num(), num(), num(), num()
+                ctrl = [rel(lower, p0[0], x1), rel(lower, p0[1], y1)]
+                end = [rel(lower, p0[0], x), rel(lower, p0[1], y)]
+                quad(p0, ctrl, end)
+                last_q = ctrl
+                cur = end
+        elif t in "Tt":
+            p0 = list(cur)
+            x, y = num(), num()
+            ctrl = _smooth_ctrl(prev_q, p0)
+            end = [rel(lower, p0[0], x), rel(lower, p0[1], y)]
+            quad(p0, ctrl, end)
+            last_q = ctrl
+            cur = end
+            while i < len(toks) and not is_cmd(toks[i]):
+                p0 = list(cur)
+                x, y = num(), num()
+                ctrl = _smooth_ctrl(last_q, p0)
+                end = [rel(lower, p0[0], x), rel(lower, p0[1], y)]
+                quad(p0, ctrl, end)
+                last_q = ctrl
+                cur = end
         elif t in "Hh":
             x = num()
             if lower:
@@ -361,25 +429,79 @@ def render_xetex(i, formula):
 
 # ---------------------------------------------------------------- parsing
 
-def parse_ztex_svg(path):
-    """<text x y font-size font-family> -> per-glyph records with ink.
+_SVG_ATTRS = re.compile(r'([\w:.-]+)="([^"]*)"')
+# ztex paints one logical glyph either as a <text> run the browser
+# rasterizes or, for a stretched MATH form, as an absolute <path> whose `d`
+# is the painted outline. One pass over both keeps painter order.
+_ZTEX_GLYPH = re.compile(r"<text\b([^>]*)>(.*?)</text>|<path\b([^>]*)/?>", re.S)
 
-    The font-space ink bbox is y-up with the baseline at 0 while the SVG is
-    y-down, so ink = [x + xmin*s, y - ymax*s, x + xmax*s, y - ymin*s].
+
+def _attr_num(value):
+    """Leading number of an attribute value; a `pt` suffix is ignored."""
+    m = re.match(_PATH_NUM, value.strip())
+    return float(m.group()) if m else None
+
+
+def _ink_union(a, b):
+    """Smallest (xmin, ymin, xmax, ymax) box holding both, or the one given."""
+    if a is None:
+        return list(b)
+    if b is None:
+        return list(a)
+    return [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]
+
+
+def parse_ztex_svg(path):
+    """ztex SVG -> one record per logical glyph, in painter order.
+
+    An owned-font glyph arrives as an absolute <path>: its `d` is the exact
+    painted outline in page coordinates. The metadata carries its text,
+    baseline and nominal size, so no font metric is guessed for its ink.
+    A <text> run is only an unavailable-glyph fallback; the viewer's chosen
+    font remains external to this comparison.
+
+    Elements that repeat one logical glyph's metadata -- a compound `d`, or
+    an assembly split over several paths -- fold into a single record whose
+    ink is the union, so one glyph is never reported twice.
     """
     s = open(path, encoding="utf-8").read()
     out = []
-    for m in re.finditer(
-            r'<text x="([-\d.eE]+)pt?" y="([-\d.eE]+)pt?" font-size="([-\d.eE]+)pt?"[^>]*>([^<]*)</text>', s):
-        x, y, size = float(m.group(1)), float(m.group(2)), float(m.group(3))
-        txt = html.unescape(m.group(4))
-        rec = {"glyph": txt, "x": x, "y": y, "size": size}
-        if len(txt) == 1:
-            b = _ztex_ink_bbox(txt, size)
-            if b is not None:
-                xmin, ymin, xmax, ymax = b
-                rec["ink"] = [x + xmin, y - ymax, x + xmax, y - ymin]
-        out.append(rec)
+    by_key = {}
+    for m in _ZTEX_GLYPH.finditer(s):
+        if m.group(1) is not None:
+            attrs = dict(_SVG_ATTRS.findall(m.group(1)))
+            txt = html.unescape(m.group(2))
+            x = _attr_num(attrs.get("x", ""))
+            y = _attr_num(attrs.get("y", ""))
+            size = _attr_num(attrs.get("font-size", ""))
+            if x is None or y is None or size is None:
+                continue
+            ink = None
+            if len(txt) == 1:
+                b = _ztex_ink_bbox(txt, size)
+                if b is not None:
+                    xmin, ymin, xmax, ymax = b
+                    ink = [x + xmin, y - ymax, x + xmax, y - ymin]
+        else:
+            raw = (m.group(3) or "").rstrip()
+            if raw.endswith("/"):
+                raw = raw[:-1]
+            attrs = dict(_SVG_ATTRS.findall(raw))
+            txt = html.unescape(attrs.get("data-text", ""))
+            x = _attr_num(attrs.get("data-x", ""))
+            y = _attr_num(attrs.get("data-y", ""))
+            size = _attr_num(attrs.get("font-size", ""))
+            if not txt or x is None or y is None or size is None:
+                continue
+            ink = _path_bbox(attrs.get("d", ""))
+        key = (txt, x, y, size)
+        rec = by_key.get(key)
+        if rec is None:
+            rec = {"glyph": txt, "x": x, "y": y, "size": size}
+            by_key[key] = rec
+            out.append(rec)
+        if ink is not None:
+            rec["ink"] = _ink_union(rec.get("ink"), ink)
     return out
 
 

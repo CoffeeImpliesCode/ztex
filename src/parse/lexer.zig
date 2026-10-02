@@ -4,12 +4,22 @@
 //! pass over `ast.src` appends a `Token` per lexical element; whitespace and
 //! comments are skipped. Every token carries its byte span into the source,
 //! so later atoms map back to source text in O(1).
+//!
+//! A private file: nothing outside this module reaches it by name, and a
+//! consumer parses through `ztex.parse.parse`. It allocates only the token
+//! entries appended to the Ast it is handed, all of which the Ast's own
+//! `deinit` releases; it stores no source of its own.
 
 const std = @import("std");
 const atom = @import("ztex.atom");
 const zg = @import("zg");
 const parse_err = @import("error.zig");
 
+/// Everything `lex` can fail with. `error.OutOfMemory` is the allocator's own
+/// tag and reaches the caller with the Ast holding the tokens appended so
+/// far — the Ast is the caller's and its `deinit` still releases them. The two
+/// syntax tags carry a `Kind` in `Info` when the caller passed a channel, and
+/// no allocation survives either of them beyond the tokens already appended.
 pub const Error = std.mem.Allocator.Error || error{
     /// a backslash at end of input with nothing after it
     DanglingEscape,
@@ -20,6 +30,25 @@ pub const Error = std.mem.Allocator.Error || error{
 /// Pre-lex `ast.src` into `ast.tokens`. Whitespace and comments are skipped.
 /// On a lex error, `err_info` (when non-null) is filled with the kind and
 /// the offending byte span before the error is returned.
+///
+/// APPENDS: whatever tokens `ast.tokens` already holds are kept, and this
+/// runs from the start of `ast.src` again — a caller wanting a clean table
+/// clears it first. `ast.src` is read and never written or copied, and every
+/// span written into a token is a byte offset into that borrowed slice, so it
+/// is the caller's job to keep `src` alive and unmodified for as long as the
+/// tokens are read.
+///
+/// On `error.DanglingEscape` or `error.InvalidUtf8` the tokens appended
+/// BEFORE the offending byte stay appended, and `err_info` holds the failing
+/// span (for `error.InvalidUtf8`, the offending leading byte alone). On
+/// `error.OutOfMemory` `err_info` is untouched: an allocation failure is not
+/// a position in the source.
+///
+/// A `null` `err_info` skips the diagnostic writes and changes no error
+/// value; the channel is caller-owned and is never retained past the call.
+/// `ast` itself is only appended to and is not otherwise mutated, so a caller
+/// may hold a `*atom.Ast` across this call as long as nothing else writes the
+/// same Ast or its source concurrently.
 pub fn lex(ast: *atom.Ast, err_info: ?*parse_err.Info) Error!void {
     const src = ast.src;
     var pos: usize = 0;

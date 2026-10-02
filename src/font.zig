@@ -1,28 +1,54 @@
-//! ztex.font — minimal OTF/TTF font parser + cached FontContext.
+//! ztex.font — sfnt parsing (OpenType/CFF and TrueType/glyf), OpenType MATH
+//! decoding, and a cached layer that hands out faces and glyph metrics.
 //!
-//! Two layers:
-//! - `FontFace`: a parsed font. Handles the sfnt container and the tables
-//!   needed for horizontal metrics: `head` (unitsPerEm), `hhea`
-//!   (ascender/descender/lineGap), `hmtx` (per-glyph advance widths),
-//!   `maxp` (glyph count), `OS/2` (sTypo*/usWin* extents), and `cmap`
-//!   (codepoint → glyph id, formats 4 and 12). Both OTF (`OTTO`/CFF) and
-//!   TTF (0x00010000/glyf) containers parse through the same code. Metrics
-//!   always; glyph outlines (`glyphOutline`) read `loca`/`glyf` (quadratic
-//!   TrueType) or execute the Type 2 charstring + Subr INDEXes from the
-//!   `CFF ` table (cubic, flattened to quadratics). The `MATH` table is
-//!   parsed when present (mathConstants/mathValues and the vertical AND
-//!   horizontal variants/assemblies) and costs nothing when absent: a face
-//!   without it reports no math data.
-//! - `FontContext`: the "init once, render many" core. Owns the embedded
-//!   Latin Modern fallback faces (LM Math + LM Roman regular/italic/bold/
-//!   bold italic), caches faces loaded from disk by path, memoizes disk
-//!   discovery in `findFont`, and serves per-(face, cp) metric lookups
-//!   from a cache.
+//! Two layers, each usable on its own:
 //!
-//! All values returned in "em" units are font-relative (value ÷ unitsPerEm),
-//! so callers multiply by the desired size in points. Every number asserted
-//! in the tests below was measured from the real fonts with fontTools, then
-//! cross-checked against this parser's own tables.
+//! - `FontFace`: one parsed font. It reads the sfnt container and the tables
+//!   horizontal metrics need — `head` (unitsPerEm), `hhea` (ascender,
+//!   descender, lineGap), `hmtx` (per-glyph advances), `maxp` (glyph count)
+//!   and `OS/2` (sTypo*/usWin* extents) — plus `cmap` (codepoint → glyph id,
+//!   formats 4 and 12). Metrics always; `glyphOutline` additionally reads
+//!   `loca`/`glyf` (quadratic TrueType) or executes the Type 2 charstrings
+//!   and Subr INDEXes of the `CFF ` table (cubic, flattened to quadratics).
+//!   A `MATH` table is decoded when the font carries one (constants, per-glyph
+//!   values, and both the vertical AND the horizontal variants and
+//!   assemblies) and costs nothing when it does not: such a face reports no
+//!   math data.
+//! - `FontContext`: the "init once, render many" layer. One arena holds the
+//!   embedded Latin Modern fallbacks (LM Math plus LM Roman regular, italic,
+//!   bold and bold italic), the faces loaded from disk, and the metric cache.
+//!
+//! Import routes: `ztex.font`, which the root module `ztex` re-exports under
+//! the same name, and the relative path `font.zig` inside this tree.
+//!
+//! What this module deliberately does not do: it draws nothing and lays
+//! nothing out (`ztex.svg` and `ztex.raster` consume it), it keeps no
+//! `std.Io` of its own — the two entry points that touch the file system take
+//! one per call — and it holds no process-wide state, so two contexts never
+//! share a cache.
+//!
+//! Units: every value named "em units" is font-relative (the font's own value
+//! ÷ its `unitsPerEm`), so a caller multiplies it by the size it draws at.
+//! Glyph outline coordinates are the exception — `glyphOutline` returns raw
+//! font units, Y-up, and the caller scales by `size_pt ÷ unitsPerEm`.
+//!
+//! Ownership: the allocator is the caller's and is never released here. A
+//! `FontFace` from `fromBytes` owns its copy of the font bytes and releases
+//! them in exactly one `deinit`; a `FontFace` a `FontContext` hands out is
+//! arena-owned and needs none. A `FontContext` owns one arena and releases
+//! every face, path and cache row it created in one `deinit`. `glyphOutline`
+//! allocates from the allocator it is given and the caller frees that
+//! `Outline`.
+//!
+//! Shortest sequence:
+//!
+//! ```zig
+//! var face = try font.FontFace.fromBytes(gpa, bytes);
+//! defer face.deinit();
+//! const gid = face.glyphIndex('x') orelse return error.MissingGlyph;
+//! var outline = try face.glyphOutline(gpa, gid);
+//! defer outline.deinit();
+//! ```
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -37,6 +63,11 @@ const lmroman_bold_italic = @import("fonts/lmroman_bold_italic.zig");
 /// Per-glyph metrics at a given size, in points. The MATH measurements are
 /// the face's own per-glyph values when it carries a MATH table, and null
 /// when it records none (every text face is such a font).
+///
+/// A plain value: it owns nothing, and its numbers describe one glyph of one
+/// face, so it says nothing about that face after the face is released. Ask
+/// `FontContext.metrics` again for another size rather than scaling a stored
+/// row yourself — the MATH fields are null-or-present, never zero-for-absent.
 pub const GlyphMetrics = struct {
     /// Horizontal advance (width).
     width: f32,
@@ -46,13 +77,18 @@ pub const GlyphMetrics = struct {
     depth: f32,
     /// Nominal line gap (hhea lineGap) at this size.
     line_gap: f32,
-    /// MATH horizontal italic correction at this size; null when unknown.
+    /// MATH horizontal italic correction at this size; null when the font
+    /// records none for the glyph.
     italic_correction: ?f32 = null,
-    /// MATH horizontal accent attachment at this size; null when unknown.
+    /// MATH horizontal accent attachment at this size; null when the font
+    /// records none for the glyph.
     top_accent_attachment: ?f32 = null,
 };
 
-/// Errors from parsing a font. All tables are bounds-checked.
+/// What a font file can be refused for. Every table is bounds-checked, so a
+/// truncated or malformed file fails with one of these instead of reading
+/// past its bytes. A parse that returns one of them leaves the caller's
+/// memory as it found it.
 pub const FontError = error{
     /// Not an sfnt container (bad scaler or truncated header).
     InvalidSfnt,
@@ -67,21 +103,71 @@ pub const FontError = error{
     UnsupportedFont,
 };
 
-/// A quadratic Bézier segment in font units (em), Y-up (y grows up,
-/// FreeType convention). TrueType glyphs are quadratic by construction;
-/// a line is stored with p1 = midpoint(p0, p2).
+/// What `FontFace.fromBytes` and `FontContext.init` can fail with: one
+/// `FontError` for the font data, plus the allocator.
+pub const ParseError = FontError || std.mem.Allocator.Error;
+
+/// What `FontContext.loadFromFile` can fail with: the `ParseError` of the
+/// face it builds, plus the file read that supplies the bytes.
+pub const LoadError = ParseError || std.Io.Dir.ReadFileAllocError;
+
+/// What `FontFace.glyphOutline` can fail with. A `gid` the face does not
+/// have, a table the face lacks and a malformed outline are all separate
+/// answers, so a caller can tell "this font cannot draw" from "this glyph is
+/// not here".
+/// Named explicitly rather than inferred, so the mutual recursion between
+/// the glyf decoders does not form an inferred-error-set cycle.
+pub const OutlineError = error{
+    /// The caller allocator failed while the curve list grew.
+    OutOfMemory,
+    /// The glyph id is past the face's last glyph, or its outline data is
+    /// malformed.
+    InvalidTable,
+    /// The face carries neither `glyf`/`loca` nor a `CFF ` table, so it has
+    /// no outline data at all.
+    MissingTable,
+    /// The CFF is CID-keyed; its charstrings need an FDArray this module
+    /// does not decode.
+    UnsupportedFont,
+};
+
+/// One quadratic Bézier segment of a glyph outline, in raw font units — the
+/// font's own design grid, not em fractions — Y-up (y grows up, FreeType
+/// convention). TrueType glyphs are quadratic by construction and a CFF
+/// glyph's cubics are flattened into quadratics before they arrive here, so
+/// every segment in one outline is quadratic; a straight segment is carried
+/// as `p1 = midpoint(p0, p2)`.
+///
+/// A caller draws at a point size by multiplying every coordinate by
+/// `size_pt / unitsPerEm`; nothing here is pre-normalized.
 pub const QuadCurve = struct {
+    /// Segment start, in font units.
     p0: [2]f32,
+    /// Control point, in font units.
     p1: [2]f32,
+    /// Segment end, in font units.
     p2: [2]f32,
 };
 
-/// A glyph's outline: every contour reduced to quadratic segments.
-/// Points are in font units (em), Y-up. Free with `deinit`.
+/// One glyph's outline: every contour reduced to quadratic segments, in raw
+/// font units and Y-up (see `QuadCurve`). A glyph with no contours — a space,
+/// or a contour count the format does not define — yields an empty `curves`.
+///
+/// An `Outline` owns `curves` and nothing else. `glyphOutline` allocates it
+/// from the allocator it is given, and one `deinit` releases it through that
+/// same allocator; the allocator must stay the one `glyphOutline` was given.
+/// A copy made before that call shares the same buffer, so it is not a second
+/// owner and must not be deinited.
 pub const Outline = struct {
+    /// Allocator `curves` is allocated from and `deinit` frees through it.
     gpa: std.mem.Allocator,
+    /// The flattened contour segments, in the order the decoders emitted them:
+    /// one contour after another, and within a contour a chain the caller
+    /// walks by matching `p2` against the next segment's `p0`.
     curves: std.ArrayList(QuadCurve) = .empty,
 
+    /// Releases `curves` through `gpa` and leaves the outline unusable; a
+    /// second call frees the same memory again.
     pub fn deinit(self: *Outline) void {
         self.curves.deinit(self.gpa);
         self.* = undefined;
@@ -285,28 +371,34 @@ const MathConstants = atom.MathConstants;
 /// A glyph's size-variant ladder along one extension axis — vertical for a
 /// fence or a radical, horizontal for a wide bar or an extensible arrow —
 /// smallest first and excluding the base glyph: `glyph(0)` is the first size
-/// variant, the glyph a renderer draws when it needs one step of growth. A
-/// view over the face's own font bytes — valid until the face is freed, and
-/// never copied or allocated per lookup.
+/// variant, the glyph a renderer draws when it needs one step of growth.
+///
+/// A borrowed view over the face's own font bytes, not a copy and not an
+/// allocation: the two fields point into `FontFace.data`, and both are valid
+/// until that face is released. Copying the struct copies the view, so a copy
+/// dies at the same moment.
 pub const MathVariants = struct {
-    /// Variant records — glyph id then advance measurement, 4 bytes each
-    /// — sliced from the MATH table.
+    /// Variant records — glyph id then advance measurement, 4 bytes each —
+    /// sliced from the MATH table.
     records: []const u8,
+    /// The face's design units per em: the divisor `advanceEm` applies.
     units_per_em: u16,
 
-    /// Number of size variants.
+    /// Number of size variants in `records`.
     pub fn len(self: MathVariants) usize {
         return self.records.len / 4;
     }
 
-    /// The `i`th variant's glyph id. `i` must be < len().
+    /// The `i`th variant's glyph id, in the face this ladder came from.
+    /// `i` must be < `len()`; that bound is a debug assertion, so a release
+    /// build reads past the records instead of reporting it.
     pub fn glyph(self: MathVariants, i: usize) u32 {
         std.debug.assert(i < self.len());
         return readBeU16(self.records[4 * i ..]);
     }
 
     /// The `i`th variant's advance measurement along the extension axis,
-    /// in em units. `i` must be < len().
+    /// in em units. `i` must be < `len()`, on the same assertion as `glyph`.
     pub fn advanceEm(self: MathVariants, i: usize) f32 {
         std.debug.assert(i < self.len());
         return emValue(readBeU16(self.records[4 * i + 2 ..]), self.units_per_em);
@@ -314,8 +406,9 @@ pub const MathVariants = struct {
 };
 
 /// One part of a glyph assembly, in em units: a glyph plus the straight
-/// connector material at its ends. A renderer stacks parts bottom to top,
-/// skipping or repeating extenders, until the target height is reached.
+/// connector material at its ends. A renderer stacks parts along the
+/// extension axis, skipping or repeating extenders, until the target size is
+/// reached. `glyph` is an id in the face the assembly came from.
 pub const MathAssemblyPart = struct {
     /// The part's glyph id.
     glyph: u32,
@@ -332,8 +425,10 @@ pub const MathAssemblyPart = struct {
 
 /// How to build a stretched glyph: the parts to repeat along one extension
 /// axis (bottom to top for a fence, left to right for a wide bar), and the
-/// assembly's own italic correction. A view over the face's own font
-/// bytes — valid until the face is freed.
+/// assembly's own italic correction.
+///
+/// A borrowed view over the face's own font bytes: `parts` points into
+/// `FontFace.data` and both views are valid until that face is released.
 pub const MathAssembly = struct {
     /// Italic correction of the whole assembly, in em units.
     italic_correction: f32,
@@ -341,16 +436,18 @@ pub const MathAssembly = struct {
     /// advance, then the part flags, 10 bytes each — sliced from the
     /// MATH table.
     parts: []const u8,
+    /// The face's design units per em: the divisor `part` applies.
     units_per_em: u16,
 
-    /// Number of parts.
+    /// Number of parts in `parts`.
     pub fn partCount(self: MathAssembly) usize {
         return self.parts.len / 10;
     }
 
     /// The `i`th part, counting from the first end along the axis (the
     /// bottom for a vertical assembly, the left for a horizontal one).
-    /// `i` must be < partCount().
+    /// `i` must be < `partCount()`; that bound is a debug assertion, so a
+    /// release build reads past the records instead of reporting it.
     pub fn part(self: MathAssembly, i: usize) MathAssemblyPart {
         std.debug.assert(i < self.partCount());
         const rec = self.parts[10 * i ..];
@@ -543,27 +640,37 @@ const MathData = struct {
     /// when it has no construction or the construction lists no variants.
     fn verticalVariantsOf(self: *const MathData, gid: u32) ?MathVariants {
         const index = self.variants.vert orelse return null;
-        return self.ladderOf(index.constructionOffset(gid));
+        return self.ladderOf(index.constructionOffset(gid), gid, false);
     }
 
     /// `gid`'s horizontal size variants — the same ladder read along x.
     fn horizontalVariantsOf(self: *const MathData, gid: u32) ?MathVariants {
         const index = self.variants.horiz orelse return null;
-        return self.ladderOf(index.constructionOffset(gid));
+        return self.ladderOf(index.constructionOffset(gid), gid, true);
     }
 
-    /// The size-variant ladder at `at`: the construction's own records,
-    /// smallest first and excluding the base glyph.
-    fn ladderOf(self: *const MathData, at: ?usize) ?MathVariants {
+    /// Horizontal selection needs the base record's stretch measurement,
+    /// which can be positive even when the combining glyph's hmtx advance is zero.
+    fn ladderOf(
+        self: *const MathData,
+        at: ?usize,
+        gid: u32,
+        comptime include_base: bool,
+    ) ?MathVariants {
         const c = at orelse return null;
         const r: Reader = .{ .data = self.table };
-        // The construction's first record is the base glyph, so the
-        // ladder of size variants starts one record in.
         const count = r.readU16(c + 2) catch return null;
-        if (count < 2) return null;
-        const start = c + 8;
-        const bytes = 4 * (count - 1);
-        if (start + bytes > self.table.len) return null;
+        if (count == 0) return null;
+        const records_start = c + 4;
+        const records_bytes = 4 * @as(usize, count);
+        if (records_start + records_bytes > self.table.len) return null;
+        const skip: usize = if (!include_base and readBeU16(self.table[records_start..]) == gid)
+            1
+        else
+            0;
+        if (skip == count) return null;
+        const start = records_start + 4 * skip;
+        const bytes = records_bytes - 4 * skip;
         return .{
             .records = self.table[start..][0..bytes],
             .units_per_em = self.units_per_em,
@@ -603,29 +710,66 @@ const MathData = struct {
     }
 };
 
-/// A parsed font. Owns a private copy of the file bytes (via `fromBytes`)
-/// or is arena-managed by a `FontContext` (gpa == null, never deinit'd).
+/// One parsed font: its metrics, its codepoint-to-glyph mapping and its MATH
+/// data, decoded out of one sfnt file. Every table the face exposes is a view
+/// into `data`, so a lookup neither re-parses nor allocates.
+///
+/// Two ownership regimes, one type. A face from `fromBytes` owns its copy of
+/// the file bytes through `gpa` and releases them in exactly one `deinit`. A
+/// face a `FontContext` hands out is owned by that context's arena: `gpa` is
+/// `null`, its `deinit` releases nothing, and every slice and view it returns
+/// dies with the context. Copying a face copies the handle, not the bytes, so
+/// a copy is not a second owner and must not be deinited; note that
+/// `FontContext.metrics` keys its cache on the face's ADDRESS, so a copied
+/// face measures under its own row while reading the same data.
 pub const FontFace = struct {
-    /// Allocator that owns `data`; null when a FontContext's arena owns it.
+    /// Allocator that owns `data`, or null when a `FontContext`'s arena owns
+    /// it — which is exactly when `deinit` has nothing to release.
     gpa: ?std.mem.Allocator,
-    /// Owned copy of the whole font file (sfnt container).
+    /// The whole font file (sfnt container), including every table slice
+    /// below. Immutable after parsing; a caller may read it to reach a table
+    /// this module does not decode.
     data: []u8,
 
+    /// head.unitsPerEm: design units in one em. The divisor every em-unit
+    /// accessor here and every outline coordinate applies.
     units_per_em: u16,
+    /// maxp.numGlyphs: how many glyph ids this face has. A larger `gid` is
+    /// out of range for `glyphOutline`.
     num_glyphs: u16,
 
     // hhea
+    /// hhea.ascender in design units, negative when the font descends.
     hhea_ascender: i16,
+    /// hhea.descender in design units; `descenderEm` negates it, so the
+    /// reported descent is positive.
     hhea_descender: i16,
+    /// hhea.lineGap in design units.
     hhea_line_gap: i16,
+    /// hhea.numberOfHMetrics: how many long (advance, lsb) records `hmtx`
+    /// opens with. Glyphs past it share the last advance.
     num_h_metrics: u16,
 
     // OS/2 (optional table; zero when absent)
+    /// OS/2 sTypoAscender in design units, 0 when the table is absent or
+    /// truncated before it.
     os2_typo_ascender: i16,
+    /// OS/2 sTypoDescender in design units, 0 when absent.
     os2_typo_descender: i16,
+    /// OS/2 sTypoLineGap in design units, 0 when absent.
     os2_typo_line_gap: i16,
+    /// OS/2 usWinAscent in design units (clipping extent), 0 when absent.
     os2_win_ascent: u16,
+    /// OS/2 usWinDescent in design units (clipping extent), 0 when absent.
     os2_win_descent: u16,
+
+    /// True only for the embedded Latin Modern Math file, matched byte for
+    /// byte at parse time. That one font keeps four prime alternates off its
+    /// cmap for script-size runs, and those ids (`script_prime_gids`) name
+    /// glyphs only it has, so `smallPrimeGid` answers for a face that is
+    /// exactly this one and for no other: the length test comes first and the
+    /// byte comparison runs only on a match. Read-only after parsing.
+    has_script_prime_alternates: bool,
 
     /// hmtx table slice (into `data`); first num_h_metrics entries are
     /// (advanceWidth u16, lsb i16) pairs, later glyphs share the last advance.
@@ -656,15 +800,24 @@ pub const FontFace = struct {
     /// Parsed MATH table (views into `data`); null when the font has none.
     math: ?MathData,
 
-    /// Parse `data` into a face, duplicating the bytes into `gpa`.
-    /// The returned face owns its copy; free it with `deinit`.
-    pub fn fromBytes(gpa: std.mem.Allocator, data: []const u8) !FontFace {
+    /// Parse `data` into a face, keeping a private copy of it in `gpa`.
+    ///
+    /// `data` need not outlive the call — the face owns its bytes — and every
+    /// view the face returns points into that copy, not into `data`. On any
+    /// error the copy is released and nothing is returned, so the caller owns
+    /// nothing afterwards. The result is the caller's to release in one
+    /// `deinit`; nothing else releases it.
+    pub fn fromBytes(gpa: std.mem.Allocator, data: []const u8) ParseError!FontFace {
         const owned = try gpa.dupe(u8, data);
         errdefer gpa.free(owned);
         return parseOwned(owned, gpa);
     }
 
-    /// Release the owned byte copy. No-op for arena-managed faces (gpa null).
+    /// Releases the owned byte copy when the face owns one (a face from
+    /// `fromBytes`); an arena-owned face keeps its bytes, which its
+    /// `FontContext` releases. Either way the face is unusable after this
+    /// call, and calling it twice on an owning face frees the same bytes
+    /// again.
     pub fn deinit(self: *FontFace) void {
         if (self.gpa) |gpa| gpa.free(self.data);
         self.* = undefined;
@@ -725,6 +878,8 @@ pub const FontFace = struct {
 
     /// Map a Unicode codepoint to a glyph id via the best cmap subtable
     /// (format 12 first, then format 4). Null when the font has no glyph.
+    /// The id names a glyph of THIS face only — the same number in another
+    /// face is a different glyph or none at all.
     pub fn glyphIndex(self: *const FontFace, cp: u21) ?u32 {
         if (self.cmap12) |t| {
             if (cmap12Lookup(t, cp)) |gid| return gid;
@@ -743,6 +898,32 @@ pub const FontFace = struct {
     /// only emitted when the font actually carries the glyph.
     pub fn hasGlyph(self: *const FontFace, cp: u21) bool {
         return self.glyphIndex(cp) != null;
+    }
+
+    /// The unencoded script-size alternate this face carries for a prime
+    /// codepoint, or null for every other codepoint.
+    ///
+    /// Latin Modern Math — and only that font, identified at parse time by
+    /// its exact bytes — keeps four alternates off its cmap: the glyphs it
+    /// draws for a script-size run of one to four primes, on the same 0.3em
+    /// advance grid as the encoded composites but one step wider each time
+    /// (0.489/0.789/1.089/1.389em against 0.311/0.511/0.711/0.911em). The
+    /// ids are this font's own, so no other face can answer with them: every
+    /// face here, including a system font that maps U+2032 in its cmap, keeps
+    /// its own glyph at every size.
+    ///
+    /// `resolvedGlyphId` applies this at `small_prime_max_size` and below;
+    /// a caller that measures a glyph asks for the same resolution so the
+    /// width and the outline describe one glyph.
+    pub fn smallPrimeGid(self: *const FontFace, cp: u21) ?u32 {
+        if (!self.has_script_prime_alternates) return null;
+        return switch (cp) {
+            0x2032 => script_prime_gids[0],
+            0x2033 => script_prime_gids[1],
+            0x2034 => script_prime_gids[2],
+            0x2057 => script_prime_gids[3],
+            else => null,
+        };
     }
 
     /// The MATH table's font-wide constants, or null when the font carries
@@ -788,11 +969,10 @@ pub const FontFace = struct {
         return self.math.?.verticalVariantsOf(gid);
     }
 
-    /// The glyph's HORIZONTAL size variants: the rungs it grows along the x
-    /// axis, smallest first and excluding the base glyph — the widths the
-    /// face itself designed for a wide bar or an extensible arrow. A glyph
-    /// can have a horizontal ladder and no vertical one (and the reverse);
-    /// each half answers only for the axis it covers. `advanceEm` is the
+    /// The glyph's horizontal construction records, smallest first,
+    /// including the base glyph when the font declares its stretch measurement.
+    /// A glyph can grow along this axis without growing vertically.
+    /// `advanceEm` is the
     /// advance measurement along that axis. Null when the font has no MATH
     /// table, the glyph does not grow horizontally, or its construction
     /// lists no variants. A view into the face's own bytes, valid until
@@ -836,14 +1016,29 @@ pub const FontFace = struct {
         return @floatCast(adv_f / upem_f);
     }
 
-    /// Decode a glyph's quadratic outline. TrueType fonts read glyf/loca;
-    /// OpenType/CFF fonts execute the glyph's Type 2 charstring against the
-    /// Subr INDEXes and flatten the resulting cubics to quadratics. Empty
-    /// charstrings (e.g. space) return an Outline with zero curves. Errors:
-    /// MissingTable for fonts with neither glyf nor CFF, InvalidTable for
-    /// out-of-range glyph ids or malformed charstrings, UnsupportedFont for
-    /// CID-keyed CFF. Curves are in font units (em), Y-up.
-    pub fn glyphOutline(self: *FontFace, gpa: std.mem.Allocator, gid: u32) !Outline {
+    /// Decode one glyph's outline into curves allocated from `gpa`.
+    ///
+    /// TrueType faces read `loca`/`glyf`; OpenType/CFF faces execute the
+    /// glyph's Type 2 charstring against the Subr INDEXes and flatten the
+    /// cubics it produces to quadratics. A glyph with no contours — a space,
+    /// or a contour count the format does not define — returns an `Outline`
+    /// with zero curves, and composite glyphs recurse only as far as
+    /// `max_composite_depth`, so a malformed font is refused instead of
+    /// running away. Coordinates are raw font units, Y-up; the caller scales
+    /// by `size_pt ÷ unitsPerEm`.
+    ///
+    /// `error.MissingTable` for a face with neither `glyf`/`loca` nor a
+    /// `CFF ` table, `error.UnsupportedFont` for a CID-keyed CFF,
+    /// `error.InvalidTable` for a `gid` past the last glyph or malformed
+    /// outline data, and `error.OutOfMemory` from `gpa`. On any error the
+    /// partially built outline is released and nothing is returned, so the
+    /// caller owns nothing on that path. On success the caller owns the
+    /// `Outline` and releases it with `deinit`.
+    pub fn glyphOutline(
+        self: *const FontFace,
+        gpa: std.mem.Allocator,
+        gid: u32,
+    ) OutlineError!Outline {
         var out: Outline = .{ .gpa = gpa };
         errdefer out.deinit();
         if (self.is_cff) {
@@ -954,6 +1149,7 @@ fn parseOwned(data: []u8, gpa: ?std.mem.Allocator) FontError!FontFace {
         .os2_typo_line_gap = 0,
         .os2_win_ascent = 0,
         .os2_win_descent = 0,
+        .has_script_prime_alternates = isBundledMathFace(data),
         .hmtx = data[hmtx.offset..][0..hmtx.length],
         .cmap4 = null,
         .cmap12 = null,
@@ -989,6 +1185,18 @@ fn parseOwned(data: []u8, gpa: ?std.mem.Allocator) FontError!FontFace {
     try selectCmap(&face, data[cmap.offset..][0..cmap.length]);
     if (math) |m| face.math = try parseMath(data[m.offset..][0..m.length], units_per_em);
     return face;
+}
+
+/// True when `data` is the embedded Latin Modern Math file itself, which is
+/// the only face that carries the unencoded script-size prime alternates
+/// `script_prime_gids` names. Any font of another length is answered without
+/// touching its bytes, and a same-length font still has to match every byte:
+/// an id is only meaningful in the face that defines it, so a font that
+/// merely resembles LM Math (or is a re-save of it) keeps its own glyphs for
+/// a prime. Run once per parse, never on a lookup.
+fn isBundledMathFace(data: []const u8) bool {
+    const bundled = lmmath.lmmath_otf[0..];
+    return data.len == bundled.len and std.mem.eql(u8, data, bundled);
 }
 
 /// MathValueRecords in a MathConstants table, in spec order.
@@ -1242,11 +1450,6 @@ fn coverageTable(table: []const u8, off: usize) error{InvalidTable}![]const u8 {
 /// Composite recursion cap; malformed component cycles error out instead of
 /// recursing forever.
 const max_composite_depth = 4;
-
-/// Outline-decoding errors: OOM, a malformed/truncated table, or a font
-/// without glyf data (CFF). Explicit so loadGlyph ↔ loadComposite (mutual
-/// recursion) do not form an inferred-error-set cycle.
-const OutlineError = error{ OutOfMemory, InvalidTable, MissingTable };
 
 /// A decoded point of a simple glyph (font units, Y-up).
 const GlyphPoint = struct {
@@ -2390,10 +2593,55 @@ const CffInterp = struct {
     }
 };
 
-/// (face, cp) key for the per-glyph metrics cache.
+/// The drawn size in points at and below which a prime composite in Latin
+/// Modern Math resolves to the font's own unencoded alternate: LM Math's
+/// cmap composites are laid out for the text-size design, and its
+/// script-size alternates are the ones a script of an 8pt base (5.6pt)
+/// draws. Above it the encoded composite is the only glyph: an 8.4pt script
+/// (a 12pt base) and every larger size keep the glyph they always had. The
+/// gate is the drawn size of the prime run alone, in points; a face that
+/// carries no alternate (see `FontFace.smallPrimeGid`) ignores it.
+pub const small_prime_max_size: f32 = 6.0;
+
+/// The four glyph ids Latin Modern Math keeps OFF its cmap for a script-size
+/// prime run, indexed by the codepoint order `FontFace.smallPrimeGid` uses:
+/// U+2032, U+2033, U+2034, U+2057. They are the composites LM Math draws for
+/// such a run, on the same 0.3em advance grid as the encoded ones and one step
+/// wider each time (489/789/1089/1389 of 1000 em against 0.311/0.511/0.711/
+/// 0.911em). They belong to that one font: nothing else here, not even a
+/// system font whose cmap maps the same codepoints, has a glyph at these ids.
+const script_prime_gids = [4]u32{ 2988, 2990, 2992, 2994 };
+
+/// The glyph id a run paints and advances for `cp` at `size_pt`, or null when
+/// the face has no glyph for it at all.
+///
+/// Everything a codepoint draws is the face's own cmap entry, except a prime
+/// composite at or below `small_prime_max_size` in a face that carries the
+/// unencoded alternate — `FontFace.smallPrimeGid` decides that, so a face
+/// other than Latin Modern Math always keeps its own glyph, whatever its cmap
+/// maps. This is the one rule both back ends and the metric hook resolve
+/// through, so an outline, its advance and the ink box around it always name
+/// the same glyph. `size_pt` is the drawn size of the run in points and only
+/// selects that tier; a negative or NaN size is at or below the gate.
+pub fn resolvedGlyphId(face: *const FontFace, cp: u21, size_pt: f32) ?u32 {
+    const gid = face.glyphIndex(cp) orelse return null;
+    if (size_pt > small_prime_max_size) return gid;
+    return face.smallPrimeGid(cp) orelse gid;
+}
+
+/// (face, cp, tier) key for the per-glyph metrics cache. The tier is the
+/// prime swap the size that cached this row made, and it exists only for a
+/// face that carries the unencoded alternate (`FontFace.smallPrimeGid`): a
+/// composite measured at script size is that alternate, one measured above
+/// the gate is the cmap's own composite, and the two never share a row. Every
+/// other codepoint is one row however many sizes ask for it, so the common
+/// lookup stays the hash it always was — no cmap search to learn the glyph on
+/// a cache hit. `face` is compared by address, so a copied face measures
+/// under its own row.
 const CacheKey = struct {
     face: *const FontFace,
     cp: u21,
+    alternate: bool,
 };
 
 /// Roots probed first by `findFont`, before user dirs and the nix store.
@@ -2410,30 +2658,46 @@ const max_search_depth = 6;
 /// Max bytes accepted for a font file read.
 const max_font_bytes = 64 * 1024 * 1024;
 
-/// "Init once, render many": owns the embedded fallback faces, caches
-/// disk-loaded faces and per-glyph metrics, and memoizes disk discovery.
+/// "Init once, render many": the embedded Latin Modern fallback faces, the
+/// faces loaded from disk, and the per-glyph metric cache, all in one arena.
 ///
-/// Every long-lived allocation lives in `arena` (faces, paths, cache
-/// entries); `deinit` releases everything at once. `metrics` is infallible:
-/// on an allocation failure it recomputes instead of caching.
+/// Ownership: every long-lived allocation — the five embedded faces, every
+/// disk-loaded face, every discovered path, every cache row — lives in
+/// `arena`, so one `deinit` releases all of it. `gpa` is borrowed and never
+/// released here. A face this context hands out is arena-owned: its
+/// `FontFace.gpa` is `null`, the caller must not `deinit` it, and every slice
+/// or view reached through it dies with this context. A standalone face from
+/// `FontFace.fromBytes` is untouched by `deinit` — it owns its own memory.
+///
+/// I/O: none is stored here. `loadFromFile` and `findFont` take the `std.Io`
+/// they do their disk work through, so the caller picks the provider, and the
+/// in-memory half — `init`, `faceForStyle`, `faceForCodepoint`, `metrics` —
+/// never touches the file system.
+///
+/// Concurrency: a context is not internally synchronized. `metrics`,
+/// `loadFromFile` and `findFont` write their tables, so one context serves one
+/// thread at a time unless the caller serializes those calls. The embedded
+/// faces and every read-only accessor are safe to share.
 pub const FontContext = struct {
-    /// Caller's allocator; backs the arena.
+    /// Caller's allocator, borrowed to back `arena`; `deinit` never releases
+    /// it and it must outlive the context.
     gpa: std.mem.Allocator,
-    /// Single arena owns every face, cached path, and cache entry.
+    /// The one arena that owns every face, path and cache row below.
     arena: std.heap.ArenaAllocator,
-    /// I/O backend for file reads and directory scans. Uses the std
-    /// single-threaded instance (file ops need no concurrency here).
-    io: std.Io,
 
-    /// Path (arena-owned) → parsed face; dedupes `loadFromFile`.
+    /// Path (arena-owned copy of the caller's) → arena-owned face; dedupes
+    /// `loadFromFile` by the exact path string, so two spellings of one file
+    /// are two entries.
     faces: std.StringHashMapUnmanaged(*FontFace),
-    /// Font name → arena-owned discovered path; empty slice records a miss.
+    /// Font name → arena-owned discovered path; an empty slice records a
+    /// miss, and that record is as permanent as a hit (see `findFont`).
     found: std.StringHashMapUnmanaged([]const u8),
-    /// (face, cp) → em metrics at 1pt, MATH values included (the caller
-    /// scales every field by size_pt).
+    /// (face, cp, prime tier) → em metrics at 1pt, MATH values included; the
+    /// caller scales every field by the size it asked for.
     metrics_cache: std.AutoHashMapUnmanaged(CacheKey, GlyphMetrics),
 
-    /// Embedded Latin Modern Math — default face for math glyphs.
+    /// Embedded Latin Modern Math — default face for math glyphs. Arena-owned
+    /// like every face here, and valid until `deinit`.
     math: *FontFace,
     /// Embedded Latin Modern Roman regular — for \text/\mathrm.
     roman: *FontFace,
@@ -2444,9 +2708,20 @@ pub const FontContext = struct {
     /// Embedded Latin Modern Roman bold italic — for `\textit{\textbf{}}`.
     bold_italic: *FontFace,
 
-    /// Create a context preloaded with the embedded fallback faces: LM Math
-    /// (math) plus LM Roman regular, italic, bold and bold italic (text).
-    pub fn init(gpa: std.mem.Allocator) !FontContext {
+    /// Create a context preloaded with the five embedded fallback faces: LM
+    /// Math (math) plus LM Roman regular, italic, bold and bold italic (text).
+    ///
+    /// Purely in-memory: no `std.Io` and no file system, so this is the only
+    /// construction embedded rendering needs. On error the arena is released
+    /// and nothing is returned, so the caller owns nothing afterwards. The
+    /// result is the caller's to release in exactly one `deinit`; copying the
+    /// struct copies that one owner, so a copy must not be deinited.
+    ///
+    /// The context holds no pointer to itself, so it may live wherever the
+    /// caller puts it — but a caller that publishes a pointer to it (the
+    /// `ztex.layout` font hook carries one) must keep that address stable for
+    /// as long as the pointer is used.
+    pub fn init(gpa: std.mem.Allocator) ParseError!FontContext {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -2458,7 +2733,6 @@ pub const FontContext = struct {
         return .{
             .gpa = gpa,
             .arena = arena,
-            .io = std.Io.Threaded.global_single_threaded.io(),
             .faces = .empty,
             .found = .empty,
             .metrics_cache = .empty,
@@ -2470,9 +2744,11 @@ pub const FontContext = struct {
         };
     }
 
-    /// Release everything the context owns. Faces loaded via `loadFromFile`
-    /// are invalidated; standalone faces created via `FontFace.fromBytes`
-    /// are unaffected (they own their own memory).
+    /// Releases the arena and with it every embedded face, disk-loaded face,
+    /// discovered path and cache row this context owns. The allocator given
+    /// to `init` is not released. Every `*FontFace` this context handed out,
+    /// and every view reached through one, is invalid afterwards; a second
+    /// `deinit` releases the same arena twice.
     pub fn deinit(self: *FontContext) void {
         self.arena.deinit();
         self.* = undefined;
@@ -2487,6 +2763,11 @@ pub const FontContext = struct {
     /// would draw the wrong letterform. Both the metric hook and the
     /// rasterizer resolve their face here, so a style can never measure
     /// from one face and be drawn from another.
+    ///
+    /// The face is arena-owned: it stays valid until `deinit` and the caller
+    /// must not `deinit` it. The style does not change which face is used —
+    /// it only picks among five faces fixed at `init` — so the result is the
+    /// same pointer on every call with the same style.
     pub fn faceForStyle(self: *const FontContext, style: atom.CharStyle) *FontFace {
         return switch (style) {
             .roman => self.roman,
@@ -2497,12 +2778,50 @@ pub const FontContext = struct {
         };
     }
 
-    /// Parse a font file and cache the face by path. Repeated calls with the
-    /// same path return the cached face. The face is arena-owned: it lives
-    /// until `deinit`. `gpa` is used for the transient read buffer.
-    pub fn loadFromFile(self: *FontContext, gpa: std.mem.Allocator, path: []const u8) !*FontFace {
+    /// Preserve the requested text face when it maps the codepoint. A missing
+    /// text glyph may use the genuine Math glyph, never a system-font
+    /// substitute, so a font the caller did not ask for is never substituted.
+    /// Arena-owned, like every face from `faceForStyle`.
+    pub fn faceForCodepoint(self: *const FontContext, cp: u21, style: atom.CharStyle) *FontFace {
+        const requested = self.faceForStyle(style);
+        if (requested.glyphIndex(cp) != null) return requested;
+        if (requested != self.math and self.math.glyphIndex(cp) != null) return self.math;
+        return requested;
+    }
+
+    /// Parse the font file at `path` and cache the face under that path.
+    ///
+    /// `path` is resolved against the process working directory (`.cwd()`),
+    /// so a relative path means what it means to the caller's process. The
+    /// face holds a copy of the file's bytes inside the arena, so the file
+    /// may change or disappear afterwards without affecting it. A second call
+    /// with the same path string returns the same face without touching the
+    /// file system again.
+    ///
+    /// `io` performs every disk operation and is not retained: it must stay
+    /// valid for the call, and this context keeps no reference to it. `gpa`
+    /// backs the transient read buffer only and is not retained either — the
+    /// face is allocated from the context's arena. A file at or over 64 MiB
+    /// fails with `error.StreamTooLong`; every `LoadError` leaves `faces`
+    /// unchanged, so nothing is cached and a later call with a readable file
+    /// can still succeed.
+    ///
+    /// The face is arena-owned: it lives until `deinit`, needs no `deinit` of
+    /// its own, and every view reached through it dies with the context.
+    pub fn loadFromFile(
+        self: *FontContext,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        path: []const u8,
+    ) LoadError!*FontFace {
         if (self.faces.get(path)) |face| return face;
-        const bytes = try std.Io.Dir.readFileAlloc(.cwd(), self.io, path, gpa, .limited(max_font_bytes));
+        const bytes = try std.Io.Dir.readFileAlloc(
+            .cwd(),
+            io,
+            path,
+            gpa,
+            .limited(max_font_bytes),
+        );
         defer gpa.free(bytes);
         const face = try createFace(self.arena.allocator(), bytes);
         const key = try self.arena.allocator().dupe(u8, path);
@@ -2510,17 +2829,43 @@ pub const FontContext = struct {
         return face;
     }
 
-    /// Discover a font file on disk by name (basename, case-insensitive, or
-    /// prefix of it). Search order: explicit well-known roots, user font
-    /// dirs ($XDG_DATA_HOME/fonts, $HOME/.local/share/fonts), the nix store
-    /// (/nix/store scan of LM/font packages), then `fc-list` output.
-    /// Results (and misses) are memoized per name; the returned path is
-    /// arena-owned and valid until `deinit`.
-    pub fn findFont(self: *FontContext, name: []const u8) ?[]const u8 {
+    /// Discover a font file on disk by name, or null when this search finds
+    /// none. A `name` matches a file whose basename equals it, case
+    /// insensitively, or begins with it — `latinmodern-math` matches
+    /// `latinmodern-math.otf`.
+    ///
+    /// Search order, first hit wins: the well-known roots (`search_roots`),
+    /// then `$XDG_DATA_HOME/fonts` and `$HOME/.local/share/fonts`, then the
+    /// `/nix/store` entries whose name mentions `lm` or `font`, then the
+    /// paths `fc-list` prints that also pass an existence check. Every step is
+    /// best-effort: a directory that will not open, an environment variable
+    /// that is unset, a missing `fc-list` and a process that fails to run all
+    /// read as "nothing found here" and the search moves on. Null therefore
+    /// means this search found nothing, not that no font of that name exists.
+    /// This call blocks. I/O errors, including cancellation, are not
+    /// propagated: an interrupted candidate is treated as absent. If the
+    /// remaining best-effort search finds no hit, that miss is memoized too.
+    ///
+    /// Answers are memoized per `name`, misses included and permanently: a
+    /// name that missed once is not searched again, so a font installed
+    /// afterwards stays invisible to this context until it is destroyed and
+    /// recreated. Both the hit and the miss are recorded in the arena, and
+    /// the returned path is that arena-owned copy — valid until `deinit`, and
+    /// the same slice on every later hit for the same name.
+    ///
+    /// A path built from `$XDG_DATA_HOME` or `$HOME` is only as absolute as
+    /// that variable's value, so hand it straight to `loadFromFile`, which
+    /// resolves a relative path against the working directory.
+    ///
+    /// `io` performs every disk operation, the `/proc/self/environ` read and
+    /// the `fc-list` run, and is not retained: it must stay valid for the
+    /// call only. This call writes `found`, so one context serves one thread
+    /// at a time unless the caller serializes it.
+    pub fn findFont(self: *FontContext, io: std.Io, name: []const u8) ?[]const u8 {
         if (self.found.get(name)) |cached| {
             return if (cached.len == 0) null else cached;
         }
-        const path = self.findFontUncached(name);
+        const path = self.findFontUncached(io, name);
         const a = self.arena.allocator();
         const cached_path = a.dupe(u8, path orelse "") catch return path;
         const cached_name = a.dupe(u8, name) catch return path;
@@ -2528,21 +2873,41 @@ pub const FontContext = struct {
         return path;
     }
 
-    /// Per-glyph metrics at `size_pt` points, cached per (face, cp) in em
-    /// units and scaled linearly. Height/depth/line_gap are the face's OWN
-    /// nominal extents (hhea) — real font data, never a hard-coded table —
-    /// and bound every glyph. The MATH values are the face's own per-glyph
-    /// corrections, read from its MATH table on the cache miss only; every
-    /// later request scales the stored em values with the same factor as
-    /// the width, never re-searching the table. Unmapped codepoints get a
-    /// 0.5em advance with the same nominal extents and no MATH value (the
-    /// caller decides how to draw them).
+    /// Per-glyph metrics for `cp` at `size_pt` points, scaled linearly from
+    /// em-unit values cached per (face, cp, prime tier). Infallible: an
+    /// allocation failure recomputes the row instead of caching it, and the
+    /// caller sees the same numbers either way.
+    ///
+    /// The glyph measured is the one this size resolves to: at or below
+    /// `small_prime_max_size` a prime composite in a face that carries the
+    /// unencoded alternate (`FontFace.smallPrimeGid`) is that alternate, and
+    /// above the gate it is the cmap's own composite, so the width and the
+    /// MATH values always describe the glyph the back end paints at that size
+    /// and never the other tier's. `face` need not be one of the context's
+    /// own faces — any face the caller holds measures correctly — and is
+    /// keyed by address, so a standalone face caches under its own pointer.
+    /// An external face must remain alive, unchanged, and at that address
+    /// until this context is disposed; its cache rows are not invalidated
+    /// when the face is replaced or disposed.
+    ///
+    /// `height`, `depth` and `line_gap` are the face's OWN nominal extents
+    /// (hhea) — real font data, never a hard-coded table — and bound every
+    /// glyph. The MATH values are the face's own per-glyph corrections, read
+    /// from its MATH table on the cache miss only; every later request scales
+    /// the stored em values with the same factor as the width. An unmapped
+    /// codepoint gets a 0.5em advance with the same nominal extents and no
+    /// MATH value; the caller decides how to draw it. `size_pt` is the drawn
+    /// size in points and may be any value, including zero.
     pub fn metrics(self: *FontContext, face: *const FontFace, cp: u21, size_pt: f32) GlyphMetrics {
-        const key: CacheKey = .{ .face = face, .cp = cp };
+        const key: CacheKey = .{
+            .face = face,
+            .cp = cp,
+            .alternate = size_pt <= small_prime_max_size and face.smallPrimeGid(cp) != null,
+        };
         const em: GlyphMetrics = if (self.metrics_cache.get(key)) |cached|
             cached
         else blk: {
-            const computed = computeEmMetrics(face, cp);
+            const computed = computeEmMetrics(face, cp, key.alternate);
             // metrics() is infallible; a failed insert (OOM) just recomputes.
             self.metrics_cache.put(self.arena.allocator(), key, computed) catch |err| switch (err) {
                 error.OutOfMemory => {},
@@ -2559,39 +2924,51 @@ pub const FontContext = struct {
         };
     }
 
-    fn createFace(a: std.mem.Allocator, bytes: []const u8) !*FontFace {
+    /// Copy `bytes` into `a` and parse them into a face owned by `a`. The
+    /// caller frees nothing: the face and its bytes belong to the allocator.
+    fn createFace(a: std.mem.Allocator, bytes: []const u8) ParseError!*FontFace {
         const owned = try a.dupe(u8, bytes);
         const face = try a.create(FontFace);
         face.* = try parseOwned(owned, null);
         return face;
     }
 
-    fn findFontUncached(self: *FontContext, name: []const u8) ?[]const u8 {
+    /// One uncached pass of the `findFont` search order. Every path it
+    /// returns is arena-owned and outlives only the context.
+    fn findFontUncached(self: *FontContext, io: std.Io, name: []const u8) ?[]const u8 {
         for (search_roots) |root| {
-            if (self.findInTree(root, name, 0)) |p| return p;
+            if (self.findInTree(io, root, name, 0)) |p| return p;
         }
-        if (self.envGet("XDG_DATA_HOME")) |xdg| {
+        if (self.envGet(io, "XDG_DATA_HOME")) |xdg| {
             if (self.joinAlloc(&.{ xdg, "fonts" })) |dir| {
-                if (self.findInTree(dir, name, 0)) |p| return p;
+                if (self.findInTree(io, dir, name, 0)) |p| return p;
             }
         }
-        if (self.envGet("HOME")) |home| {
+        if (self.envGet(io, "HOME")) |home| {
             if (self.joinAlloc(&.{ home, ".local", "share", "fonts" })) |dir| {
-                if (self.findInTree(dir, name, 0)) |p| return p;
+                if (self.findInTree(io, dir, name, 0)) |p| return p;
             }
         }
-        if (self.findInNixStore(name)) |p| return p;
-        if (self.findViaFcList(name)) |p| return p;
+        if (self.findInNixStore(io, name)) |p| return p;
+        if (self.findViaFcList(io, name)) |p| return p;
         return null;
     }
 
-    /// Recursive, depth-limited directory walk looking for `name`.
-    fn findInTree(self: *FontContext, root: []const u8, name: []const u8, depth: u32) ?[]const u8 {
+    /// Recursive, depth-limited directory walk looking for `name`. Null at
+    /// any failure to open, read or descend, so an unreadable subtree only
+    /// costs the walk.
+    fn findInTree(
+        self: *FontContext,
+        io: std.Io,
+        root: []const u8,
+        name: []const u8,
+        depth: u32,
+    ) ?[]const u8 {
         if (depth > max_search_depth) return null;
-        var dir = std.Io.Dir.openDir(.cwd(), self.io, root, .{ .iterate = true }) catch return null;
-        defer dir.close(self.io);
+        var dir = std.Io.Dir.openDir(.cwd(), io, root, .{ .iterate = true }) catch return null;
+        defer dir.close(io);
         var it = dir.iterate();
-        while (it.next(self.io) catch return null) |entry| {
+        while (it.next(io) catch return null) |entry| {
             switch (entry.kind) {
                 .file => {
                     if (basenameMatches(entry.name, name)) {
@@ -2600,7 +2977,7 @@ pub const FontContext = struct {
                 },
                 .directory, .sym_link => {
                     const sub = self.joinAlloc(&.{ root, entry.name }) orelse continue;
-                    if (self.findInTree(sub, name, depth + 1)) |p| return p;
+                    if (self.findInTree(io, sub, name, depth + 1)) |p| return p;
                 },
                 else => {},
             }
@@ -2611,22 +2988,28 @@ pub const FontContext = struct {
     /// Scan /nix/store outputs whose name hints at Latin Modern / fonts and
     /// search their share/fonts trees. Store hashes vary per machine, so a
     /// name-filtered walk beats hard-coding them.
-    fn findInNixStore(self: *FontContext, name: []const u8) ?[]const u8 {
-        var store = std.Io.Dir.openDir(.cwd(), self.io, "/nix/store", .{ .iterate = true }) catch return null;
-        defer store.close(self.io);
+    fn findInNixStore(self: *FontContext, io: std.Io, name: []const u8) ?[]const u8 {
+        var store = std.Io.Dir.openDir(.cwd(), io, "/nix/store", .{
+            .iterate = true,
+        }) catch return null;
+        defer store.close(io);
         var it = store.iterate();
-        while (it.next(self.io) catch return null) |entry| {
+        while (it.next(io) catch return null) |entry| {
             if (entry.kind != .directory and entry.kind != .sym_link) continue;
             if (!containsIgnoreCase(entry.name, "lm") and !containsIgnoreCase(entry.name, "font")) continue;
             const share = self.joinAlloc(&.{ "/nix/store", entry.name, "share", "fonts" }) orelse continue;
-            if (self.findInTree(share, name, 0)) |p| return p;
+            if (self.findInTree(io, share, name, 0)) |p| return p;
         }
         return null;
     }
 
-    /// Query fontconfig (`fc-list`) for a file path matching `name`.
-    fn findViaFcList(self: *FontContext, name: []const u8) ?[]const u8 {
-        const result = std.process.run(self.arena.allocator(), self.io, .{
+    /// Query fontconfig (`fc-list`) for a file path matching `name`. A
+    /// process that cannot be run, exits non-zero or prints nothing usable
+    /// reads as "no answer here"; every candidate is checked for existence
+    /// before it is returned, so a stale fontconfig cache cannot hand back a
+    /// path that is not there.
+    fn findViaFcList(self: *FontContext, io: std.Io, name: []const u8) ?[]const u8 {
+        const result = std.process.run(self.arena.allocator(), io, .{
             .argv = &.{"fc-list"},
             .stdout_limit = .limited(8 << 20),
             .stderr_limit = .limited(1 << 20),
@@ -2637,19 +3020,23 @@ pub const FontContext = struct {
             const path = std.mem.trim(u8, line[0..colon], " \t");
             if (path.len == 0) continue;
             if (!basenameMatches(path, name)) continue;
-            std.Io.Dir.access(.cwd(), self.io, path, .{}) catch continue;
+            std.Io.Dir.access(.cwd(), io, path, .{}) catch continue;
             return self.arena.allocator().dupe(u8, path) catch null;
         }
         return null;
     }
 
     /// Best-effort environment lookup. Linux reads /proc/self/environ
-    /// (dependency-free, no libc); other platforms return null.
-    fn envGet(self: *FontContext, key: []const u8) ?[]const u8 {
+    /// (dependency-free, no libc); other platforms return null. Null also
+    /// covers an unreadable `/proc`, an out-of-memory read and a variable
+    /// that is not set. The returned slice points into that arena-owned read,
+    /// so it lives exactly as long as the context and must be copied before
+    /// it is kept anywhere else.
+    fn envGet(self: *FontContext, io: std.Io, key: []const u8) ?[]const u8 {
         if (builtin.os.tag != .linux) return null;
         const data = std.Io.Dir.readFileAlloc(
             .cwd(),
-            self.io,
+            io,
             "/proc/self/environ",
             self.arena.allocator(),
             .limited(1 << 20),
@@ -2662,26 +3049,31 @@ pub const FontContext = struct {
         return null;
     }
 
+    /// `parts` joined with the platform separator into one arena-owned path,
+    /// or null when the join cannot be allocated.
     fn joinAlloc(self: *FontContext, parts: []const []const u8) ?[]const u8 {
         return std.fs.path.join(self.arena.allocator(), parts) catch null;
     }
 };
 
-/// Em metrics for a codepoint: real advance from hmtx when the glyph exists,
-/// nominal extents (hhea) for height/depth/line_gap always; 0.5em advance
-/// when the font has no glyph for the codepoint. An uncovered MATH glyph has
+/// Em metrics for a codepoint at one prime tier: the real advance from hmtx
+/// for the glyph that tier resolves to — the unencoded alternate when
+/// `alternate` and the face carries one, the face's own cmap glyph otherwise
+/// — nominal extents (hhea) for height/depth/line_gap always, and 0.5em when
+/// the face has no glyph for the codepoint at all. An uncovered MATH glyph has
 /// zero italic correction; an absent MATH table leaves it unknown.
-fn computeEmMetrics(face: *const FontFace, cp: u21) GlyphMetrics {
+fn computeEmMetrics(face: *const FontFace, cp: u21, alternate: bool) GlyphMetrics {
     const nominal: GlyphMetrics = .{
         .width = 0.5,
         .height = face.ascenderEm(),
         .depth = face.descenderEm(),
         .line_gap = face.lineGapEm(),
     };
-    const gid = face.glyphIndex(cp) orelse return nominal;
-    const math = face.mathValues(gid);
+    const mapped = face.glyphIndex(cp) orelse return nominal;
+    const id = if (alternate) (face.smallPrimeGid(cp) orelse mapped) else mapped;
+    const math = face.mathValues(id);
     return .{
-        .width = face.advanceEm(gid),
+        .width = face.advanceEm(id),
         .height = nominal.height,
         .depth = nominal.depth,
         .line_gap = nominal.line_gap,
@@ -2705,6 +3097,8 @@ fn basenameMatches(candidate: []const u8, name: []const u8) bool {
     return false;
 }
 
+/// ASCII case-insensitive substring test, used to skip store entries whose
+/// name does not hint at fonts. An empty `needle` matches nothing.
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     if (needle.len == 0 or needle.len > haystack.len) return false;
     var i: usize = 0;
@@ -2897,15 +3291,16 @@ test "font: metrics for an unmapped codepoint use nominal extents" {
 test "font: loadFromFile parses a cached face from disk" {
     var ctx = try FontContext.init(testing.allocator);
     defer ctx.deinit();
-    const path = ctx.findFont("latinmodern-math.otf") orelse return error.TestUnexpectedResult;
-    const face = try ctx.loadFromFile(testing.allocator, path);
+    const path = ctx.findFont(testing.io, "latinmodern-math.otf") orelse
+        return error.TestUnexpectedResult;
+    const face = try ctx.loadFromFile(testing.allocator, testing.io, path);
     try testing.expectApproxEqAbs(
         @as(f32, 0.528),
         face.advanceEm(face.glyphIndex('x').?),
         0.001,
     );
     // second load with the same path returns the cached face
-    try testing.expect(face == try ctx.loadFromFile(testing.allocator, path));
+    try testing.expect(face == try ctx.loadFromFile(testing.allocator, testing.io, path));
 }
 
 test "font: findFont discovers the embedded fonts on disk" {
@@ -2917,14 +3312,15 @@ test "font: findFont discovers the embedded fonts on disk" {
         "lmroman10-italic.otf",
     };
     for (names) |name| {
-        const path = ctx.findFont(name) orelse return error.TestUnexpectedResult;
+        const path = ctx.findFont(testing.io, name) orelse return error.TestUnexpectedResult;
         try testing.expect(std.mem.endsWith(u8, path, name));
-        std.Io.Dir.access(.cwd(), ctx.io, path, .{}) catch return error.TestUnexpectedResult;
+        std.Io.Dir.access(.cwd(), testing.io, path, .{}) catch
+            return error.TestUnexpectedResult;
     }
     // memoized miss: unknown names are remembered as not-found, and a
     // repeated call stays null (no rescan).
-    try testing.expect(ctx.findFont("no-such-font-xyz.otf") == null);
-    try testing.expect(ctx.findFont("no-such-font-xyz.otf") == null);
+    try testing.expect(ctx.findFont(testing.io, "no-such-font-xyz.otf") == null);
+    try testing.expect(ctx.findFont(testing.io, "no-such-font-xyz.otf") == null);
 }
 
 // ── outline tests ─────────────────────────────
@@ -3104,7 +3500,11 @@ fn circlePoints(
 
 /// Assemble a complete sfnt: head/hhea/hmtx/maxp/cmap (format 4) +
 /// long-format loca + glyf. Glyphs: 0 space, 1 'x', 2 'o', 3 'á'
-/// (composite), 4 accent, 5 lone point, 6 two-point line.
+/// (composite), 4 accent, 5 lone point, 6 two-point line. Glyph 1 is also
+/// the face's own U+2032 prime, so the face maps a prime codepoint without
+/// carrying any unencoded alternate for it; glyph 6 carries a 0.25em
+/// advance, distinct from every other glyph's 0.5em, so a glyph id that
+/// only exists as the hmtx last-entry clamp shows up in a measured width.
 fn buildTestTtf(gpa: std.mem.Allocator) ![]u8 {
     var circle_outer: std.ArrayList(TPoint) = .empty;
     defer circle_outer.deinit(gpa);
@@ -3223,8 +3623,8 @@ fn buildTestTtf(gpa: std.mem.Allocator) ![]u8 {
 
     var hmtx: std.ArrayList(u8) = .empty;
     defer hmtx.deinit(gpa);
-    for (0..7) |_| {
-        try putU16(gpa, &hmtx, 500);
+    for (0..7) |i| {
+        try putU16(gpa, &hmtx, if (i == 6) 250 else 500);
         try putI16(gpa, &hmtx, 0);
     }
 
@@ -3243,15 +3643,16 @@ fn buildTestTtf(gpa: std.mem.Allocator) ![]u8 {
     try putU16(gpa, &cmap, 4); // format
     try putU16(gpa, &cmap, 0); // length (patched below)
     try putU16(gpa, &cmap, 0); // language
-    try putU16(gpa, &cmap, 10); // segCountX2 (5 segments)
+    try putU16(gpa, &cmap, 12); // segCountX2 (6 segments)
     try putU16(gpa, &cmap, 8); // searchRange
     try putU16(gpa, &cmap, 2); // entrySelector
-    try putU16(gpa, &cmap, 0); // rangeShift
+    try putU16(gpa, &cmap, 4); // rangeShift
     const segs = [_][3]u16{
         .{ 0x20, 0x20, 0 }, // space → 0
         .{ 0x6F, 0x6F, 2 }, // 'o' → 2
         .{ 0x78, 0x78, 1 }, // 'x' → 1
         .{ 0xE1, 0xE1, 3 }, // 'á' → 3
+        .{ 0x2032, 0x2032, 1 }, // ′ → the same glyph as 'x'
         .{ 0xFFFF, 0xFFFF, 0 }, // sentinel
     };
     for (segs) |s| try putU16(gpa, &cmap, s[1]); // endCode
@@ -3643,65 +4044,25 @@ test "font: MATH radical has four size variants and a three-part assembly" {
     try testing.expectApproxEqAbs(@as(f32, 0.32), top.start_connector_length, 0.001);
 }
 
-test "font: MATH grows a wide hat along x — horizontal ladder, not vertical" {
+test "font: a zero-advance accent retains its horizontal stretch measurement" {
     var face = try FontFace.fromBytes(testing.allocator, lmmath.lmmath_otf[0..]);
     defer face.deinit();
-    // The combining circumflex (U+0302) grows along x only: seven designed
-    // widths for \widehat over a long run, and no vertical ladder at all.
-    // The two halves answer independently, so a renderer picks the right one.
-    const hat = face.glyphIndex(0x0302) orelse return error.TestUnexpectedResult;
-    try testing.expect(face.variants(hat) == null);
-    try testing.expect(face.assembly(hat) == null);
-    const h = face.horizontalVariants(hat) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 7), h.len());
-    try testing.expectEqual(@as(u32, 2280), h.glyph(0));
-    try testing.expectEqual(@as(u32, 2340), h.glyph(6));
-    try testing.expectApproxEqAbs(@as(f32, 0.645), h.advanceEm(0), 0.001);
-    try testing.expectApproxEqAbs(@as(f32, 1.897), h.advanceEm(6), 0.001);
-    for (1..h.len()) |i| {
-        try testing.expect(h.advanceEm(i) > h.advanceEm(i - 1));
+    const cases = [_]struct { cp: u21, measurement: f32 }{
+        .{ .cp = 0x0302, .measurement = 0.365 },
+        .{ .cp = 0x0303, .measurement = 0.371 },
+    };
+    for (cases) |c| {
+        const base = face.glyphIndex(c.cp) orelse return error.TestUnexpectedResult;
+        const ladder = face.horizontalVariants(base) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(base, ladder.glyph(0));
+        try testing.expectApproxEqAbs(@as(f32, 0), face.advanceEm(ladder.glyph(0)), 0.0001);
+        try testing.expectApproxEqAbs(c.measurement, ladder.advanceEm(0), 0.0001);
+        for (1..ladder.len()) |i| {
+            try testing.expect(ladder.advanceEm(i) > ladder.advanceEm(i - 1));
+        }
+        try testing.expect(face.variants(base) == null);
+        try testing.expect(face.horizontalAssembly(base) == null);
     }
-    try testing.expect(face.horizontalAssembly(hat) == null);
-
-    // The combining tilde (U+0303) has its own ladder: same shape family,
-    // the face's own widths, never the hat's.
-    const tilde = face.glyphIndex(0x0303) orelse return error.TestUnexpectedResult;
-    const t = face.horizontalVariants(tilde) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 7), t.len());
-    try testing.expectEqual(@as(u32, 2282), t.glyph(0));
-    try testing.expectApproxEqAbs(@as(f32, 1.916), t.advanceEm(6), 0.001);
-    try testing.expect(t.glyph(0) != h.glyph(0));
-
-    // A spacing overline (U+0305) is both: one exact variant, then caps and
-    // a repeatable extender to reach any wider width.
-    const over = face.glyphIndex(0x0305) orelse return error.TestUnexpectedResult;
-    try testing.expect(face.assembly(over) == null);
-    const ov = face.horizontalVariants(over) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 1), ov.len());
-    try testing.expectEqual(@as(u32, 2256), ov.glyph(0));
-    try testing.expectApproxEqAbs(@as(f32, 0.569), ov.advanceEm(0), 0.001);
-    const a = face.horizontalAssembly(over) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 3), a.partCount());
-    const left = a.part(0);
-    try testing.expectEqual(@as(u32, 2257), left.glyph);
-    try testing.expect(!left.extender);
-    try testing.expectApproxEqAbs(@as(f32, 0.189), left.full_advance, 0.001);
-    const extender = a.part(1);
-    try testing.expectEqual(@as(u32, 2258), extender.glyph);
-    try testing.expect(extender.extender);
-    try testing.expectApproxEqAbs(@as(f32, 0.19), extender.full_advance, 0.001);
-    const right = a.part(2);
-    try testing.expectEqual(@as(u32, 2259), right.glyph);
-    try testing.expect(!right.extender);
-    try testing.expectApproxEqAbs(@as(f32, 0.189), right.full_advance, 0.001);
-
-    // The equals sign carries no horizontal variant — only the assembly —
-    // so a renderer that wants an exact width stacks parts instead.
-    const eq = face.glyphIndex('=') orelse return error.TestUnexpectedResult;
-    try testing.expect(face.horizontalVariants(eq) == null);
-    const eqa = face.horizontalAssembly(eq) orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(usize, 3), eqa.partCount());
-    try testing.expect(eqa.part(1).extender);
 }
 
 test "font: MATH delimiter carries a stretch ladder and an extensible assembly" {
@@ -3853,4 +4214,199 @@ test "font: a populated MathVariants half without coverage is invalid" {
     storeU16(bytes, variants + math_variants_horiz_cov_off, cov_off);
     storeU16(bytes, variants + math_variants_horiz_count_off, count + 1);
     try testing.expectError(error.InvalidTable, FontFace.fromBytes(testing.allocator, bytes));
+}
+
+test "font: a script-size prime composite resolves to the face's own alternate" {
+    var face = try FontFace.fromBytes(testing.allocator, lmmath.lmmath_otf[0..]);
+    defer face.deinit();
+    // LM Math's cmap composites are the text-size design — ′ 0.311em, ″
+    // 0.511em, ‴ 0.711em, ⁗ 0.911em, read from the face's own hmtx. The four
+    // ids below are the alternates it keeps OFF the cmap for a script-size
+    // prime run, on the same 0.3em grid one step wider each time.
+    // The alternates belong to this exact file: the flag is set by byte
+    // identity with the embedded face, never by a name or a glyph count.
+    try testing.expect(face.has_script_prime_alternates);
+
+    const cases = [_]struct { cp: u21, gid: u32, em: f32, encoded: f32 }{
+        .{ .cp = 0x2032, .gid = 2988, .em = 0.489, .encoded = 0.311 },
+        .{ .cp = 0x2033, .gid = 2990, .em = 0.789, .encoded = 0.511 },
+        .{ .cp = 0x2034, .gid = 2992, .em = 1.089, .encoded = 0.711 },
+        .{ .cp = 0x2057, .gid = 2994, .em = 1.389, .encoded = 0.911 },
+    };
+    for (cases) |c| {
+        try testing.expectEqual(
+            c.gid,
+            face.smallPrimeGid(c.cp) orelse return error.TestUnexpectedResult,
+        );
+        // The alternate really carries that advance: a wrong id would measure
+        // and draw some other glyph of the face.
+        try testing.expectApproxEqAbs(c.em, face.advanceEm(c.gid), 0.0001);
+        // The encoded composite is what every size above the gate keeps, and
+        // the two are never the same glyph.
+        const encoded = face.glyphIndex(c.cp) orelse return error.TestUnexpectedResult;
+        try testing.expect(encoded != c.gid);
+        try testing.expectApproxEqAbs(c.encoded, face.advanceEm(encoded), 0.0001);
+        const small = resolvedGlyphId(&face, c.cp, 5.6) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(c.gid, small);
+        const large = resolvedGlyphId(&face, c.cp, 8.4) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(encoded, large);
+    }
+    // Nothing else moves: the modifier primes LM Math also encodes, and a
+    // letter, resolve to the face's own glyph at every size.
+    try testing.expect(face.smallPrimeGid(0x2035) == null);
+    try testing.expect(face.smallPrimeGid('x') == null);
+    const x_gid = face.glyphIndex('x') orelse return error.TestUnexpectedResult;
+    const x_small = resolvedGlyphId(&face, 'x', 5.6) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(x_gid, x_small);
+    const x_large = resolvedGlyphId(&face, 'x', 60.0) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(x_gid, x_large);
+}
+
+test "font: a face that maps a prime keeps its own glyph at script size" {
+    // This fixture is not Latin Modern Math and it does map U+2032, to its
+    // own glyph: nothing in it is an unencoded script-size alternate, so
+    // the prime keeps the face's own glyph at every drawn size. Another
+    // font's alternate id names a glyph this face does not have — the back
+    // end cannot draw it at all — and measures the hmtx last-entry clamp
+    // (0.25em) instead of the prime's own advance (0.5em).
+    const ttf = try buildTestTtf(testing.allocator);
+    defer testing.allocator.free(ttf);
+    var face = try FontFace.fromBytes(testing.allocator, ttf);
+    defer face.deinit();
+    const own = face.glyphIndex(0x2032) orelse return error.TestUnexpectedResult;
+
+    // The gate is the face, not the codepoint: this face carries no
+    // unencoded alternate at all, so it has no alternate to swap in.
+    try testing.expect(!face.has_script_prime_alternates);
+    try testing.expect(face.smallPrimeGid(0x2032) == null);
+
+    const small = resolvedGlyphId(&face, 0x2032, 5.6) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(own, small);
+    const large = resolvedGlyphId(&face, 0x2032, 8.4) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(own, large);
+
+    // The glyph a back end paints at script size is one this face carries:
+    // 'x', five curves, rather than a failure on an id past the last glyph.
+    var outline = try face.glyphOutline(testing.allocator, small);
+    defer outline.deinit();
+    try testing.expectEqual(@as(usize, 5), outline.curves.items.len);
+
+    // Metrics name that same glyph at both tiers, from one cached row: a
+    // face with no alternate has no second tier to keep apart.
+    var ctx = try FontContext.init(testing.allocator);
+    defer ctx.deinit();
+    try testing.expectApproxEqAbs(
+        face.advanceEm(own) * 5.6,
+        ctx.metrics(&face, 0x2032, 5.6).width,
+        0.0001,
+    );
+    try testing.expectApproxEqAbs(
+        face.advanceEm(own) * 8.4,
+        ctx.metrics(&face, 0x2032, 8.4).width,
+        0.0001,
+    );
+    try testing.expectEqual(@as(usize, 1), ctx.metrics_cache.count());
+}
+
+test "font: the prime grid follows the drawn size, not the codepoint" {
+    var f = try FontContext.init(testing.allocator);
+    defer f.deinit();
+    const face = f.math;
+    // An 8pt base sets its script at 5.6pt and every prime in it is the
+    // face's unencoded alternate: 0.489/0.789/1.089/1.389em. A 12pt base sets
+    // its script at 8.4pt — past the gate — so the same four codepoints are
+    // the encoded composites again, at the widths they always had.
+    const cases = [_]struct { cp: u21, script_pt: f32, gate_pt: f32 }{
+        .{ .cp = 0x2032, .script_pt = 2.7384, .gate_pt = 2.6124 },
+        .{ .cp = 0x2033, .script_pt = 4.4184, .gate_pt = 4.2924 },
+        .{ .cp = 0x2034, .script_pt = 6.0984, .gate_pt = 5.9724 },
+        .{ .cp = 0x2057, .script_pt = 7.7784, .gate_pt = 7.6524 },
+    };
+    for (cases) |c| {
+        try testing.expectApproxEqAbs(c.script_pt, f.metrics(face, c.cp, 5.6).width, 0.0001);
+        try testing.expectApproxEqAbs(c.gate_pt, f.metrics(face, c.cp, 8.4).width, 0.0001);
+        // The gate is the drawn size alone: the scripts of a 12.06pt, a 20pt
+        // and a 60pt base are all past it, so all three keep the encoded
+        // measure and land on the SAME cached row.
+        const encoded = face.glyphIndex(c.cp) orelse return error.TestUnexpectedResult;
+        for ([_]f32{ 8.442, 14.0, 42.0 }) |size| {
+            try testing.expectApproxEqAbs(
+                face.advanceEm(encoded) * size,
+                f.metrics(face, c.cp, size).width,
+                0.0001,
+            );
+        }
+    }
+    // One row per tier and per glyph, never one row both tiers scale: two
+    // rows per prime (the alternate and the composite), and every size above
+    // the gate shares the composite's.
+    try testing.expectEqual(@as(usize, 2 * cases.len), f.metrics_cache.count());
+}
+
+test "font: the triple-prime alternate is one outline of three marks" {
+    var face = try FontFace.fromBytes(testing.allocator, lmmath.lmmath_otf[0..]);
+    defer face.deinit();
+    const gid = face.smallPrimeGid(0x2034) orelse return error.TestUnexpectedResult;
+    var outline = try face.glyphOutline(testing.allocator, gid);
+    defer outline.deinit();
+    // Contours are the maximal runs whose endpoint meets the next curve's
+    // start point — the boundary svg.zig's serializer writes an `M` at and
+    // the rasterizer sweeps over, so a consumer sees one path carrying three
+    // marks. Each box is the CONTROL hull of the mark, which is the box the
+    // back ends frame against.
+    const curves = outline.curves.items;
+    try testing.expect(curves.len > 2);
+    var boxes: [4][4]f32 = undefined;
+    var marks: usize = 0;
+    var left: f32 = std.math.inf(f32);
+    var right: f32 = -std.math.inf(f32);
+    var lo: f32 = std.math.inf(f32);
+    var hi: f32 = -std.math.inf(f32);
+    var i: usize = 0;
+    while (i < curves.len) : (i += 1) {
+        for ([_][2]f32{ curves[i].p0, curves[i].p1, curves[i].p2 }) |p| {
+            left = @min(left, p[0]);
+            right = @max(right, p[0]);
+            lo = @min(lo, p[1]);
+            hi = @max(hi, p[1]);
+        }
+        const last = i + 1 == curves.len;
+        if (!last and curves[i].p2[0] == curves[i + 1].p0[0] and
+            curves[i].p2[1] == curves[i + 1].p0[1]) continue;
+        if (marks == boxes.len) return error.TestUnexpectedResult;
+        boxes[marks] = .{ left, right, lo, hi };
+        marks += 1;
+        left = std.math.inf(f32);
+        right = -std.math.inf(f32);
+        lo = std.math.inf(f32);
+        hi = -std.math.inf(f32);
+    }
+    try testing.expectEqual(@as(usize, 3), marks);
+    // One mark repeated: the same box three times, stepped along x by the
+    // hmoveto between the draws. The step is a hair NARROWER than a mark:
+    // the slashes overlap by 0.025em — exactly the overlapping slashes the
+    // 8pt reference draws (its inter-prime gap is -0.0251em of the script
+    // size, and the old "shoulder to shoulder" premise failed as width 325
+    // vs pitch 300 in font units).
+    const width = boxes[0][1] - boxes[0][0];
+    const pitch = boxes[1][0] - boxes[0][0];
+    var k: usize = 1;
+    while (k < marks) : (k += 1) {
+        const step = @as(f32, @floatFromInt(k)) * pitch;
+        try testing.expectApproxEqAbs(boxes[0][0] + step, boxes[k][0], 0.0001);
+        try testing.expectApproxEqAbs(boxes[0][1] + step, boxes[k][1], 0.0001);
+        try testing.expectApproxEqAbs(boxes[0][2], boxes[k][2], 0.0001);
+        try testing.expectApproxEqAbs(boxes[0][3], boxes[k][3], 0.0001);
+    }
+    // Curves are font units; the face is 1000 upem, so this is em below.
+    const upem: f32 = @floatFromInt(face.unitsPerEm());
+    try testing.expectApproxEqAbs((width - pitch) / upem, 0.025, 0.005);
+    // The marks are the big alternates (0.53em tall), not the 0.318em
+    // encoded ones — the "smaller" half of the reported regression.
+    try testing.expect((boxes[0][3] - boxes[0][2]) / upem > 0.45);
+    // The composite is drawn above its own origin and stays inside the em.
+    try testing.expect(boxes[0][2] / upem > 0);
+    try testing.expect(boxes[0][3] / upem < 1.0);
 }

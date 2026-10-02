@@ -7,11 +7,10 @@ selects that environment.
 
 ## Architecture
 
-- `build.zig` defines the `ztex.atom`, `ztex.parse`, `ztex.layout`, `ztex.svg`,
-  and `ztex` modules, plus `ztex.tests` (integration and regression) and
-  `ztex.c` (the C ABI root). It also wires the CLI, the benchmark, the golden
-  generator, the docs step, and the `static-lib` step. Only the CLI and the
-  benchmark are in the default install; `static-lib` and `docs` are opt-in.
+- `build.zig` publishes `ztex.atom`, `ztex.parse`, `ztex.layout`, `ztex.font`,
+  `ztex.glyph`, `ztex.svg`, `ztex`, and `ztex.c`; the integration-test root is
+  private. It wires the CLI, benchmark, per-module docs, `static-lib`, and
+  real-header C/C++ consumer checks. Only CLI and benchmark install by default.
 - `src/root.zig` is the facade. `ztex.render` measures from the bundled static
   tables; `ztex.Context` measures from the embedded Latin Modern faces. Both
   call one `renderPipeline`, so the two differ only in metric source. That
@@ -21,9 +20,10 @@ selects that environment.
   The facade re-exports `font` and `raster` alongside the modules.
 - `src/parse/` lexes and parses to the atom tree. `src/atom.zig` is the
   parser/layout contract. `src/layout/` builds metrics, boxes, and drawables.
-  `src/svg.zig` emits SVG with baseline offset and escaping. `src/coverage.zig`
-  is the standalone bezier scanline rasterizer. `src/raster.zig` rasterizes a
-  draw list to PPM/PGM and resolves every stretchy glyph through the font.
+  `src/svg.zig` emits real outlines for every available glyph and uses text
+  only for unavailable-glyph fallback. `src/mathglyph.zig` resolves MATH
+  forms and streams assemblies for both SVG and CPU. `src/coverage.zig` is
+  the bezier scanline rasterizer; `src/raster.zig` paints draw lists to PPM/PGM.
 - `src/font.zig` parses OpenType/CFF and TrueType/glyf plus the OpenType MATH
   table: constants, per-glyph values, horizontal AND vertical variant ladders,
   and glyph assemblies. `FontFace` exposes them as `mathConstants`,
@@ -73,10 +73,9 @@ selects that environment.
   unitless `viewBox`, and every inner coordinate, `font-size` and
   `stroke-width` is unitless. Putting `pt` on an inner coordinate scales it
   twice (96/72 × pt) and visibly clips the content.
-- Math-italic runs declare `font-style="normal"`: the LM Math glyphs are
-  already italic, so a declared slant makes a browser synthesize a second one.
-  `font-style="italic"` belongs to the text-italic and bold-italic styles,
-  which are the upright family needing a real slant.
+- SVG glyph paths carry absolute geometry. Fallback math text declares
+  `font-style="normal"` because LM Math glyphs are already italic.
+  `font-style="italic"` belongs to text-italic and bold-italic fallback.
 - Do not preserve dead code for backward compatibility.
 
 ## Commands
@@ -92,18 +91,15 @@ Run from the repository root:
   math). Raster output is selected by `--ppm`/`--pgm` or by an output path
   ending in `.ppm`, `.pnm`, or `.pgm`; there is no PNG encoder, so everything
   else is SVG.
-- `zig build test` runs unit, integration, and regression tests across modules.
-  `zig build test --summary all` prints per-module counts. Seven test roots run
-  in one step — atom, parse, layout, svg, ztex, tests, c. Per-root counts move
-  with the tree; read them from `--summary all` rather than from this file. A
-  root pulls the tests of every file it imports BY PATH; a module import
-  carries none, which is why the ztex root runs root, font, raster, coverage
-  and context but no parse or layout tests.
+- `zig build test` runs nine native test roots, the real-header ABI check, and
+  real C89/C++ consumers. `--summary all` prints counts; read them from the command.
+  `zig build test-layout -Dtest-filter='substring'` selects one root and matching tests.
+  Roots include tests of path imports; named imports do not bring tests with them.
+  `test-c-header` checks ABI parity; `test-c-consumers` runs both real hosts.
 - `zig build bench` runs the ReleaseFast parse/layout/flatten benchmark.
   Override with `-Dbench-optimize=<Mode>`. `zig build bench -Dcpu=native`
   enables native vector features.
-- `zig build gen-goldens` prints ready-to-paste golden tables after an intended
-  rendering change. `zig build docs` emits the API docs to `zig-out/docs`.
+- `zig build docs` emits separate published-module roots to `zig-out/docs/<name>`.
 - `zig build static-lib` builds `zig-out/lib/libztex.a` and installs
   `include/ztex.h` to `zig-out/include/ztex.h`. A C host links it with libm.
   GNU ld consumers also need `-Wl,-z,noexecstack`: the Zig 0.16 archive lacks

@@ -10,10 +10,10 @@ This file is the host-facing contract. For internal architecture see
 
 ## Version contract
 
-- **Zig 0.16.0 exactly.** `build.zig.zon` pins `minimum_zig_version = "0.16.0"`.
-  This code uses 0.16 APIs that do not exist in earlier or later point releases
-  (`std.Io` threading, unmanaged containers, the `std.Build` module API). A
-  different 0.16.x may build; an earlier or later minor will not.
+- **Zig 0.16.0 is the tested toolchain.** The manifest requires at least
+  `0.16.0`; that is a floor, not an exact-version gate. The code uses its
+  `std.Io`, unmanaged-container, and `std.Build` APIs. Other compiler versions
+  are not covered by this contract.
 - **`zg` v0.16.2**, fetched from codeberg.org and content-hashed in
   `build.zig.zon`. The fetch needs network on a cold cache; `zig-pkg/` holds the
   unpacked package and is gitignored.
@@ -22,16 +22,26 @@ The package ships a C ABI alongside the Zig modules; see **C ABI** below.
 
 ## Modules
 
-| Module | Root | Pulls the embedded fonts? |
+| Module | Root | Role |
 | --- | --- | --- |
-| `ztex.atom` | `src/atom.zig` | no |
-| `ztex.parse` | `src/parse/root.zig` | no |
-| `ztex.layout` | `src/layout/root.zig` | no |
-| `ztex.svg` | `src/svg.zig` | no |
-| `ztex` (facade) | `src/root.zig` | **yes** |
+| `ztex.atom` | `src/atom.zig` | Flat AST and provenance contract |
+| `ztex.parse` | `src/parse/root.zig` | UTF-8 source to AST |
+| `ztex.layout` | `src/layout/root.zig` | Metrics, boxes, and draw lists |
+| `ztex.font` | `src/font.zig` | OpenType decoding and owned font context |
+| `ztex.glyph` | `src/mathglyph.zig` | Face-specific glyph forms and streaming assemblies |
+| `ztex.svg` | `src/svg.zig` | Outline-backed SVG serialization |
+| `ztex` | `src/root.zig` | Facade, reusable `Context`, and `raster` |
+| `ztex.c` | `src/ztex_c.zig` | C ABI types/statuses; link the archive for exported functions |
 
-Importing `ztex` links five embedded Latin Modern faces, 1,193,544 bytes
-(1.14 MiB) in total, because `Context` measures and rasterizes from them:
+The integration-test root is private to the build. `renderPipeline` is an
+internal cross-file helper, not supported host API. Low-level boxes have the
+named route `@import("ztex.layout").box`; raster types have the route
+`@import("ztex").raster`.
+
+The five bundled Latin Modern faces total 1,193,544 bytes (1.14 MiB).
+Zig analyzes declarations lazily: importing the facade does not itself prove
+that a binary links every face. Embedded-context and outline-rendering paths
+reach these payloads:
 
 | Face | Bytes | Reached by |
 | --- | --- | --- |
@@ -49,29 +59,27 @@ example is never counted. `scripts/embed_font.py`'s `read_embedded` is that
 reader; it also cross-checks a face against the byte count its module header
 declares, wherever the header carries one, so a truncated initializer fails
 the count instead of shipping. The generated metric tables
-(`src/layout/roman_style_metrics.zig`, `src/layout/ink_metrics.zig`) read the
-faces through it, so a table can never describe a font other than the one
-ztex embeds.
+(`src/layout/roman_style_metrics.zig`, `src/layout/math_style_metrics.zig`,
+`src/layout/ink_metrics.zig`) read the faces through it, so a table can never
+describe a font other than the one ztex embeds.
 
 `ztex.parse` and `ztex.layout` reach real fonts through an opaque
-`metrics.FontHook` and never import `font.zig`, so a host that only wants
-the static metric tables links none of those bytes. The facade also
-re-exports `font` and `raster`, and `src/raster.zig` imports `font.zig`, so
-the payload rides along with `ztex` either way.
+`metrics.FontHook` and never import `font.zig`; their static-table paths do
+not need the bundled font payload. The facade re-exports `font` and `raster`,
+but which declarations a consumer uses determines its analyzed dependencies.
 
 ## Fonts and metrics
 
 `ztex.render` and `Context.render` are one pipeline; they differ only in
 where a glyph's numbers come from.
 
-- **Static tables** — `ztex.render` measures from `layout.metrics.default`,
-  compiled-in numbers: the Computer Modern rows for the math face, GENERATED
-  rows for the three LM Roman faces those tables do not describe (italic,
-  bold and bold italic — the faces' own advances and their real ink bounds
-  across ASCII, Latin-1 Supplement and Latin Extended-A/B), and GENERATED
-  sparse ink-edge rows for all five faces, so a glyph is framed by the same
-  outline it is drawn from. It touches no font file and holds no mutable
-  state, so it is shareable across threads.
+- **Static tables** — `ztex.render` measures from `layout.metrics.default`:
+  generated advances and ink bounds for all four LM Roman faces, the math
+  alphabets, horizontal MATH accents/braces and vertical MATH fences, plus
+  Computer Modern fallback rows for the remaining math repertoire. The
+  Roman rows cover ASCII and Latin Extended-A/B at every size; there is no
+  optical-size switch to an unbundled face. Layout needs no font parser or
+  mutable state. SVG and pixel output still resolve real glyph outlines.
 - **Real fonts** — `Context.render` measures from the embedded face the
   rasterizer will later draw the run from, served from a per-(face,
   codepoint) metric cache that the first render fills and every later render
@@ -84,7 +92,8 @@ measure from one face and be drawn from another.
 to LM Roman bold italic, and every other style to LM Math — whose
 math-italic, double-struck, script, fraktur, sans and mono glyphs are
 already styled, so routing those to a Roman face would draw the wrong
-letterform. The layout metric hook and the rasterizer both call it.
+letterform. `faceForCodepoint` uses that face when it carries the glyph,
+otherwise LM Math when it does. Metrics and both backends share this routing.
 
 **Fallback.** A codepoint nothing resolves falls through in order: the real
 face's metric, then the generated text row, then the Computer Modern table
@@ -103,9 +112,9 @@ it. Per-glyph values follow three rules:
   correction for reports an **effective correction of zero**, so script
   placement still follows the face. The cached metric carries that resolved
   value.
-- A face with **no** MATH table at all — every LM Roman text face, and any
-  font a host loads itself — leaves the correction unknown, and layout keeps
-  the static row's value. Absence stays absence; nothing is invented.
+- A face with **no** MATH table — including every embedded LM Roman text
+  face — leaves the correction unknown, and layout keeps the static row's
+  value. A host-loaded font can have a MATH table; absence stays absence.
 - Top accent attachment is forwarded only when the face records one.
 
 Italic correction and top accent attachment therefore follow the glyph that
@@ -114,13 +123,15 @@ is actually drawn: in LM Math `𝑓` carries a 0.09em correction and `𝑥` a
 `mathValues` stay nullable — the resolution above happens in the cached
 metric, not in the font's answer.
 
-**Rasterization always needs a `Context`.** `raster.rasterize` resolves the
-face from it for every run and every primitive it paints, including the
-MATH size variants behind a display big operator, a stretchy `√`, and a
-`\left`/`\right` fence. A face whose variant ladder is absent or too short
-for the request degrades to the unstretched base glyph — legible, never
-wrong-shaped from a foreign font's glyph numbering, and never a failed
-render, because the raster API has no per-glyph error channel.
+**Rasterization needs a `Context`.** `raster.rasterize` resolves each run's
+face through it. `ztex.glyph` resolves MATH forms for both SVG and CPU:
+display big operators, radicals, fixed and stretchy fences, horizontal
+accents and braces. Assemblies stream every required part, with the font's
+connector overlap constraints; they have no fixed part-count ceiling.
+A face without a construction uses its base glyph. An unavailable glyph
+stays external text in SVG and paints no glyph in the CPU output.
+Rules use the exact rectangle/pixel intersection area at partial-pixel edges.
+RGBA and alpha masks apply the foreground alpha to that coverage once.
 
 ## C ABI
 
@@ -151,33 +162,32 @@ Six exported symbols, all prefixed `ztex_`:
 
 **Allocator.** `ztex_allocator` is `{ alloc, dealloc, user }`.
 `ztex_context_create` copies the struct, so it may be a temporary, but
-`user`, `alloc` and `dealloc` must stay valid until `ztex_context_destroy`.
+`user`, `alloc`, and `dealloc` must stay valid until context destruction.
 `alloc` returns memory aligned for `max_align_t`, or NULL when it cannot;
-`dealloc` receives the exact `len` its matching `alloc` was given. It is the
-library's only source of memory: the parse, layout, SVG and pixel working set
-of every render comes from it too, and is released before that render
-returns. Growth is allocate, copy, free, so an arena works and a
-size-tracking free list stays exact. A NULL from `alloc` is an ordinary
-allocation failure and reports `ZTEX_OUT_OF_MEMORY`.
+`dealloc` receives the exact `len` its matching `alloc` was given. All library
+allocations use these callbacks. Render scratch is released before return;
+valid font/cache allocations can persist until context destruction. Growth
+is allocate, copy, free; a size-tracking free list stays exact. A NULL return
+reports `ZTEX_OUT_OF_MEMORY`. Callbacks run on the calling thread and must
+not reenter the same context.
 
-**Size query.** Both render entry points always write the payload size to
-`out_length`, so `out = NULL, out_capacity = 0` is the size query. A buffer
-that cannot hold the whole payload comes back UNWRITTEN with
-`ZTEX_BUFFER_TOO_SMALL` — never half filled. The payload needs
-`out_capacity >= size + 1`: the library always terminates it with a NUL, and
-that NUL is the one byte `out_length` does not count.
-`ztex_render_raster` also writes `out_width` and `out_height` whenever the
-render itself succeeded, including on the size query; a failed render leaves
-them alone. Its payload is `width * height * 4` bytes in `ZTEX_PIXEL_RGBA32`
-and `width * height` in `ZTEX_PIXEL_ALPHA8`.
+**Size query.** Both render entry points write `out_length` only on
+`ZTEX_OK` or `ZTEX_BUFFER_TOO_SMALL`; `out = NULL, out_capacity = 0` queries
+the fully rendered payload size. A short buffer remains UNWRITTEN — never
+half filled. It needs `out_capacity >= size + 1`: a trailing NUL is written
+on success and is excluded from `out_length`, including for raster bytes.
+Raster width/height are committed on those same two outcomes. Every other
+status leaves the payload and all output metadata unchanged.
+Raster payloads have `width * height * 4` bytes in `ZTEX_PIXEL_RGBA32` and
+`width * height` in `ZTEX_PIXEL_ALPHA8`.
 
 **SVG options.** `ztex_svg_options` is `ztex_render_svg`'s own knob struct and
 may be NULL for the default rendering: `padding` in points on every side,
 `background` as a packed `0xRRGGBBAA` (`ZTEX_COLOR_NONE` for none), and two
-NUL-terminated CSS font-family lists — `math_font_family` for the math runs,
-`upright_font_family` for `\text`, `\mathrm`, `\mathbf`. NULL on either keeps
-ztex's own stack. Both are escaped on the way out, so a quote in one cannot
-break out of the attribute.
+NUL-terminated CSS font-family lists for unavailable-glyph text fallback:
+`math_font_family` for math and `upright_font_family` for upright text.
+Known glyphs are outlines, so these lists do not replace their faces. NULL
+keeps ztex's own stack. Both lists are XML-escaped.
 
 **Styles.** `style` is `ZTEX_STYLE_DISPLAY` (0), `ZTEX_STYLE_TEXT` (1),
 `ZTEX_STYLE_SCRIPT` (2) or `ZTEX_STYLE_SCRIPT_SCRIPT` (3); any other code is
@@ -187,11 +197,13 @@ whole formula.
 
 **Raster options.** `ztex_raster_options` takes `dpi`, `scale`, a pixel
 `padding`, a `ZTEX_PIXEL_*` format, and `fg`/`bg` as packed `0xRRGGBBAA`
-colors (`ZTEX_COLOR_NONE` for no background). A NULL pointer means the
-defaults — 96 dpi, 1x scale, RGBA — but a ZEROED struct is
-`ZTEX_INVALID_ARGUMENT`, because dpi 0 is not a resolution. `fg` is the ink
-color of every primitive no color scope covers; a primitive an explicit
-`\color` or `\textcolor` scope covers paints its own color instead, and the
+colors (`ZTEX_COLOR_NONE` for no background). A NULL pointer means
+96 DPI, 1x scale, zero padding, RGBA, opaque black foreground, and no
+background. A non-NULL struct supplies every field: zero foreground means
+transparent ink, not an omitted default. A ZEROED struct is
+`ZTEX_INVALID_ARGUMENT` because DPI 0 is not a resolution.
+`fg` is the ink color of every primitive no color scope covers; an explicit
+`\color` or `\textcolor` scope supplies its own color instead. The
 SCOPE decides rather than the value — so an explicit black, or a transparent
 `\color{transparent}`, beats a light `fg` instead of being read as "no color
 given". In `ZTEX_PIXEL_ALPHA8` a mask byte is coverage times the ALPHA byte
@@ -225,20 +237,23 @@ formula, and is only valid with `latex_length` 0. Every other string is
 NUL-terminated: both font-family options you pass in, and everything the
 library hands back. Lengths and capacities are 32-bit, so a payload above
 4 GiB - 2 bytes fails with `ZTEX_OUTPUT_TOO_LARGE` instead of truncating.
+For raster this total-payload limit is checked before pixel allocation;
+earlier parse/layout/font working-set allocations are not prohibited.
 
 **Who frees what.** Every byte the library takes comes from your allocator:
 the context block, and the five embedded Latin Modern faces plus the glyph
 metric cache it owns, which `ztex_context_destroy` gives back through the same
-`dealloc`; plus each render's working set, which is released before that
-render returns. Rendered output is never handed back as a pointer — it is
+`dealloc`; plus render scratch, released before return, and cached metrics,
+retained until context destruction. Rendered output is never handed back as a pointer — it is
 copied into a buffer you own, and you free that. The string
 `ztex_status_name` returns lives as long as the process; never free it.
 
 **Threads.** A `ztex_context` is NOT thread-safe — the first render fills a
 glyph metric cache. Use one context per thread, or serialize access.
 
-The header is plain C89 and self-contained, so a C++ host includes it from
-inside its own `extern "C"` block.
+The header is self-contained C89 and wraps its declarations in `extern "C"`
+automatically for C++ consumers. The real header is checked against the Zig
+ABI types and exercised by C and C++ consumers in `zig build test`.
 
 ## Using it
 
@@ -291,10 +306,49 @@ colour scope, a frame, a ruled array, a wide accent and an equation number:
 \tag{1}
 ```
 
-`ztex.svg.writeFile` takes an explicit `std.Io.Dir` so a host picks the
-directory. The render path touches no directory at all; the only `cwd()` uses
-left are `font.zig`'s own font-file loading, which a host reaches only by
-driving a `FontContext` itself.
+`ztex.svg.writeFile(gpa, io, dir, path, dl, opts)` takes explicit I/O and a
+directory. Rendering itself performs no file I/O. File writes are not atomic:
+rendering fails before creation, but a create/write error or cancellation
+may leave the destination empty or partially written.
+
+Embedded `FontContext.init(gpa)` needs no I/O. Explicit disk/discovery calls
+are `fonts.loadFromFile(gpa, io, path)` and `fonts.findFont(io, name)`.
+The latter searches ambient font paths and may run `fc-list`; a `null` result
+is a memoized best-effort miss, not a detailed discovery error. Relative
+paths are cwd-relative. I/O capabilities are borrowed per call, not stored.
+Discovery is blocking and suppresses I/O failures, including cancellation.
+If no later candidate succeeds, the resulting miss is cached until context
+destruction. Use explicit `loadFromFile` when the caller needs an I/O error.
+
+### API migration
+
+- `glyph.requestFor(bytes, .{ .bigop_variant = ..., .delim_req = ... })`
+  replaces the positional boolean/form/length argument sequence. All options
+  are named, and precedence/units are documented on `RequestOptions`.
+- `face.smallPrimeGid(cp)` replaces the free `font.smallPrimeGid(cp)`.
+  Unencoded bundled-font IDs are exposed only for an exact bundled LM Math
+  face; another font keeps its own cmap prime at script sizes.
+- `FontContext.loadFromFile` and `findFont` take per-call `std.Io`;
+  `FontContext` no longer captures a global I/O capability.
+- `raster.Options.max_bytes` is the native pixel-payload cap. It adds no
+  change to dimensions/stride or the C header's fixed-width fields.
+- `ztex.tests` is not a published dependency module. Use supported native
+  modules or the C header/archive, not the library's integration-test root.
+
+### Build and verification
+
+`zig build` installs the CLI and benchmark. `zig build static-lib` installs
+the C archive/header. `zig build docs` emits published-module roots under
+`zig-out/docs/{atom,parse,layout,svg,ztex,c,font,glyph}`.
+
+`zig build test` includes native unit/integration/regression roots, actual
+header ABI comparison, and linked C89/C++ consumers. `--summary all` prints
+counts; `-Doptimize=ReleaseSafe` retains safety checks in optimized code.
+Use `zig build test-layout -Dtest-filter='substring'` for a focused native
+root, `test-c-header` for the compile-time object check, or `test-c-consumers`
+for the real hosts. The object root reaches the actual private C export
+types; it is not a zero-test runner. New C exports must also be entered in
+the private source type list used by that check.
 
 ## Output back ends
 
@@ -316,16 +370,21 @@ attributes is what pins the rendered size; carrying it inside as well would
 scale every coordinate twice. A non-finite coordinate is rejected
 (`error.NonFiniteCoordinate`) rather than emitted.
 
-**Variants in SVG are hints, not geometry.** A display big operator, a
-stretchy `√`, and a `\left`/`\right` fence taller than its base glyph come
-from the MATH variant ladder, which no SVG renderer applies on its own: the
-run is emitted at its declared `font-size` with the base cmap glyph. The
-document therefore carries a marker the rasterizer and the comparison
-verifier read and resolve — `data-op="v1"`, `data-radical="vN"`,
-`data-fixed-req`, `data-delim-form="vN"`, `data-delim-req` — so a consumer
-that understands them reproduces the layout's choice. A plain browser shows
-the unstretched base glyph. This is a real difference between the two back
-ends, not a rounding error: only the raster path resolves the variants.
+**SVG paints real outlines.** Every glyph present in the resolved face is
+an absolute filled `<path>`, including ordinary text, the selected MATH
+variant, and every part of an assembly. The geometry is the same font
+outline the CPU paints; no browser font substitution, synthetic slant or
+text-baseline rounding changes it. Assemblies and connected radical vincula
+use one path so translucent ink is composited once across their joins.
+Thin decoration bands are filled paths too, avoiding browser hairline-stroke rounding.
+
+Known glyphs need no installed font, but are not selectable browser text.
+The `data-text`, `data-x`, `data-y` and `font-size` attributes identify each
+outlined run; they do not control its geometry. A missing glyph leaves an
+escaped `<text>` fallback. A known prefix is still outlined, and the
+unresolved tail starts at that prefix's advance. Family options affect only
+this fallback. `svg.Options.fonts` borrows a caller's `FontContext`; without
+one, SVG lazily opens the bundled faces once per document.
 
 **Raster.** `raster.rasterize` (or `ztex.renderPixels` /
 `Context.renderPixels`) paints the same content into a `PixelBuffer` from the
@@ -333,13 +392,22 @@ same ink bounds: pt → px is `(dpi / 72) * scale`, `padding` is added in
 PIXELS on both axes, and one extra pixel column and row is left past the ink
 so edge antialiasing is never clamped at the last row. Glyph outlines are
 filled by analytic quadratic-Bézier scanline coverage; rules are exact
-rectangle fills; a `line` is a butt-capped band around the segment at
-constant width, matching svg.zig's `<line>`, which declares no cap — a round
-cap would paint past the ink the frame stops at. `PixelBuffer.pixels` is
-`width * height * 4` for `.rgba32` and `width * height` for `.alpha8`, with
-`stride` carrying the row pitch. The CFF cubic-to-quadratic fit preserves
-coordinate extrema and stays inside the original ink bounds, so approximation
-cannot add ink outside the frame.
+rectangle fills; a `line` is a butt-capped band at constant width, matching
+SVG's filled quadrilateral. A round cap would paint beyond its ink bounds.
+Glyph clipping and scanline coverage use margin-free coordinates. Padding
+shifts pixel indices only, so it cannot change glyph antialiasing.
+`PixelBuffer.pixels` has `height * stride` bytes; dimensions and stride are
+`u32`, but row offsets and total native payload length are `usize`.
+`raster.Options.max_bytes` bounds the pixel block before its allocation and
+defaults to `maxInt(usize)`. It does not bound scratch or context caches.
+The C boundary uses the stricter 32-bit length/NUL limit described above.
+The CFF cubic-to-quadratic fit preserves coordinate extrema and stays inside
+the original ink bounds, so approximation cannot add ink outside the frame.
+
+RGBA stores straight alpha. PPM cannot carry alpha, so its encoder mattes
+RGBA over white; it does not discard the alpha byte. PGM stores coverage.
+The CPU unions connected MATH assembly and radical-vinculum coverage before
+applying ink alpha, without rounding connector joins to whole pixels.
 
 ## Math style
 
@@ -362,6 +430,11 @@ the formula, and the override carries the whole size ladder with it — a
 formula's body. The CLI exposes the two ordinary ones as
 `--style display|text`.
 
+Script sizes follow the MATH scale-down percentages continuously: LM Math
+uses 70% and 50%. LaTeX's document class can choose discrete sizes instead
+(for example, a 6pt script at an 8pt base instead of 5.6pt). Such references
+do not have the same size contract.
+
 ## Commands
 
 `ztex.parse.supported_commands` is the union of the four dispatch tables,
@@ -372,8 +445,21 @@ grouped the way a formula reaches for them:
 - **Scripts over and under a base** — `\overset{top}{base}`,
   `\underset{bot}{base}`, `\stackrel{top}{base}`. Each is a `\mathop` with
   forced limits, so the script sits centred over or under the base.
+  Spacing uses the font's MATH upper/lower limit gaps and baseline floors;
+  outer operator padding is not added between the base and annotation.
 - **Braces** — `\underbrace{x}` and `\overbrace{x}`, each taking an optional
   `_` / `^` annotation, as in `\underbrace{x}_{n}`.
+  Native horizontal variants take the largest rung that fits the nucleus;
+  a narrower nucleus keeps the base brace, and requests past the ladder
+  use its glyph assembly.
+  The underbrace starts at the nucleus's depth. The overbrace baseline is
+  `AccentBaseHeight` below its top; the glyph's tips remain above the body.
+- **Radicals** — display style uses the larger radical clearance gap.
+  Text, script and scriptscript styles use the compact gap, including
+  text-style cells in `cases` and arrays.
+  The index reserves its net degree-kern width before the surd. Tall
+  assemblies distribute legal connector overlap without adding height steps.
+  The glyph's connecting cap remains framed for empty and narrow nuclei.
 - **Invisible boxes** — `\phantom{x}` reserves the argument's width, height
   and depth, `\hphantom` its width only, `\vphantom` its height and depth
   only; none of the three paints anything.
@@ -383,16 +469,14 @@ grouped the way a formula reaches for them:
   `\smash[b]{x}` the depth, and bare `\smash{x}` is `[tb]` — both, which
   leaves `\hphantom`'s geometry with the glyphs still drawn. An argument
   that is not `t`, `b` or `tb` is a parse error at the option text.
-- **Text faces** — `\textit{…}`, `\textbf{…}` and `\text{…}`. The argument
-  is ONE raw byte run in ONE face, so nesting is found inside it rather than
-  split into separate runs: `\textit{\textbf{ab}}` is one run in bold
-  italic, and so is the partial nest `\textbf{a\textit{b}c}`. Nesting
-  COMBINES rather than overwrites, so `\textit{\textbf{ab}}` and
-  `\textbf{\textit{ab}}` are the same face; a run nested deeper than 500
-  levels fails with `error.NestingTooDeep` instead of overflowing the
-  layout's face-scope stack. The bytes stay verbatim — no Unicode math
-  remapping, because these are the LM Roman text faces, not the MATH italic
-  one.
+- **Text faces** — `\textit{…}`, `\textbf{…}` and `\text{…}` preserve raw
+  text without Unicode math remapping. Nested face commands combine and
+  restore their surrounding scope: `\textbf{a\textit{b}c}` paints `a` and `c`
+  bold and `b` bold italic. Nesting either face order gives bold italic;
+  more than 500 levels fails with `error.NestingTooDeep`. Only the supported
+  raw-text escapes and scope commands are accepted. An unsupported command
+  such as `\text{\sqrt{x}}` is `error.UnknownCommand` at its source span,
+  not silently dropped text.
 - **Color** — `\color{<spec>}` is a DECLARATION: it applies to the rest of
   the row and ends where the row, group, cell or environment body does. It
   is class-transparent, so a colored relation keeps its relation glue.
@@ -415,7 +499,10 @@ grouped the way a formula reaches for them:
   which is BETWEEN rows: leading, interior and trailing positions are all
   legal, and anywhere else — a row body, a cell, a group, outside an
   environment — it is `error.MisplacedHline` rather than a fabricated empty
-  row. `\arraystretch{n}` is a group-local assignment: it scales the row
+  row. Adjacent double rules keep the 2pt separation; ordinary matrix fences
+  retain the 5pt outer column spacing. Empty rows and nested cells do not
+  invent or inherit another environment's rules.
+  `\arraystretch{n}` is a group-local assignment: it scales the row
   strut (0.7em above and 0.3em below the baseline) of subsequent environments.
   A first-row cell can also set the current environment's factor; the last
   such assignment wins. The assignment ends with that cell, so later cells,
@@ -428,22 +515,22 @@ grouped the way a formula reaches for them:
   parentheses, centred on the axis after the formula with a `\mintagsep`
   gap. The digits alias their real source bytes, so each drawn glyph keeps
   its span inside `\tag{…}`.
-- **Wide accents** — `\widehat{x}` and `\widetilde{x}` take a mandatory
-  braced group. A ONE-character argument lays out exactly as `\hat` and
-  `\tilde` do — the real combining mark, on the base's top-accent
-  attachment — while every multi-character argument gets the extensible form
-  however short it is: `\widehat{xy}` is about 1em wide and still carries a
-  hat over both letters. That form is ONE connected stroke spanning the
-  argument, a hat with a single apex or a wave with one crest and one
-  trough, never a run of repeated marks, which reads as a sawtooth row of
-  little hats rather than an accent. It is `rule_thickness` wide — the font's
-  own rule weight, the same one the fraction bar and an `\hline` use — floats
-  inside the narrow mark's own ink band so its feet never reach down through
-  the argument, and is fitted edge to edge: the ink starts on the base's left
-  edge and ends on its right.
+- **Wide accents** — `\widehat{…}` and `\widetilde{…}` choose the largest
+  native horizontal MATH rung whose advance fits the nucleus plus italic
+  correction. This also applies to a wide single glyph such as `M`; a
+  narrow `\hat` or `\tilde` always keeps the base combining mark. The native
+  hat preserves the face's curve and stroke weight, not a scaled chevron.
+  Past LM Math's finite tilde ceiling, a multi-character `\widetilde`
+  retains ztex's extensible convention: one connected wave spanning the
+  argument, with one crest and one trough. Braces use native horizontal
+  MATH variants and assemblies, not square line approximations.
 - **Spacing** — `\hspace{<dim>}`, `\kern<dim>`, `\mkern<dim>`, plus `\:` (the
   medium math space) and `\ ` (the interword space). The unit in the
   dimension decides how layout scales the skip.
+  `\colon` is an ordinary atom with amsmath's explicit 2mu before and 6mu
+  after; it is not a relation. Prime runs use single, double, triple and
+  quadruple-prime glyphs greedily, and an explicit exponent continues the
+  same superscript field.
 - **Fraction variants** — `\dbinom{n}{k}` and `\tbinom{n}{k}` are `\binom`
   with the style forced to display and text, so both the parts and the
   amsmath fixed parens size that way even inside a script.
@@ -456,13 +543,14 @@ grouped the way a formula reaches for them:
   use `\mathbin` to force that class — and its medium glue — onto a symbol
   the tables would class otherwise. The class is recorded, not the glyph:
   the forced row draws the same character and only the spacing changes.
-- **Colon relations** — `\coloneqq` (with `\coloneqqs`, `\Coloneqq`,
-  `\Coloneqqs`, `\coloneq`), `\Colon` and `\ratio`.
+- **Colon relations** — `\coloneqq`, `\coloneqqs` and `\coloneq` draw `:=`.
+  `\Coloneqq` and `\Coloneqqs` draw `::=` from native glyph parts because
+  LM Math has no U+2A74 glyph. `\Colon` draws `::`, and `\ratio` draws `:`.
 
 ## Ownership and lifetime
 
-Every type that owns memory says so on the type, and none may be copied by
-value:
+Owning values have one disposal obligation. Moving a value is allowed;
+copying it shares the allocations and does not create another owner:
 
 - **`Ast`** — `init`/`deinit` paired 1:1. `ast.src` aliases the caller's slice
   and is never copied.
@@ -470,7 +558,8 @@ value:
   synthesized glyphs (`∑`, stretchy variants) that have no source bytes.
   `Text.bytes` is source-aliased when `Text.synthetic` is false and
   arena-owned when true; read the flag before retaining a slice.
-- **`BoxList`** — same rule.
+- **`BoxList`** — owns its pools; release it once. Node/box indices remain
+  stable across appends, but pointers into growable pools do not.
 - **`Context`** — same rule, plus more than it frees. It heap-allocates its
   `FontContext` (a self-pointer into it must outlive `init`'s frame), which
   owns one arena holding all five embedded faces and every per-(face,
@@ -478,52 +567,68 @@ value:
   `Context.fm.font.math_constants` is the LM Math face's own decoded MATH
   block, and `fonts` is the heap block `deinit` destroys. Copying a `Context`
   by value shares the `FontContext`, so two `deinit` calls free it twice.
-- **`PixelBuffer`** — caller frees.
+- **`PixelBuffer`** — owns pixels independently of source and context.
+- **`FontFace`** — a standalone `fromBytes` face owns its copy; a face
+  borrowed from `FontContext` must not be disposed by its borrower.
+  If a standalone face is passed to `FontContext.metrics`, it must stay
+  alive, unchanged, and at its address until that context is disposed:
+  metric rows are cached by face address and have no separate invalidation.
+- **`Outline`** — owns raw-font-unit contours; release with its recorded
+  allocator once. Borrowed MATH-table views instead die with their face.
 
-In every case, `deinit` must be called exactly once. A copy of one of these
-types deinitializes the same allocations twice.
+Call `deinit` exactly once per owner. All aliases into its storage become
+invalid. In particular, disposing both an owner and its copy is a double free.
+An AST's borrowed source must stay alive and unchanged while used; a draw
+list can outlive the AST but still borrows the original source.
 
 ## Allocators
 
-Every entry point takes an explicit allocator and returns an error union; no
-allocation is hidden. Returned byte slices are owned by the caller and must be
-freed with the allocator that produced them. `DrawList` internally builds its
-arena on the allocator you pass.
+Allocators are explicit per operation or retained by an initialized owner.
+Keep a retained allocator's backing state and identity valid through the
+owner's disposal and any independently owned results it produced. Do not
+replace an owning value's allocator field while allocations remain live.
+Free returned byte slices with the allocator that produced them. Rendering
+with a persistent `Context` reuses its font/cache owner; one-shot pixel
+rendering builds and disposes a temporary context.
 
 ## Thread safety
 
-- **`ztex.render` / `ztex.svg.render` are shareable.** They measure from
-  immutable static tables and hold no mutable state.
-- **`Context` is NOT shareable**, and neither is `raster.rasterize`, which
-  takes a `*Context`: the first render lazily fills the font metric cache and
-  the arena, and rasterization reads those faces and the cache. Two threads
-  through one Context race on that state. Use one Context per thread, or
-  guard a shared one with an external mutex.
+- **Static-table `ztex.render` is independent per call.** Use a thread-safe
+  allocator and keep shared source/metric inputs immutable.
+- **`svg.render` is independent with its own temporary faces.** Passing
+  `Options.fonts` shares mutable font/cache state and requires serialization.
+- **`Context` / `FontContext` are not concurrently shareable without a lock.**
+  Cache mutations and disposal must not overlap any use. `raster.rasterize`
+  borrows a context under the same rule. Use one context per thread or an
+  external mutex; reentrancy is not an implicit synchronization mechanism.
 
 ## Errors
 
 Error sets are closed and never `anyerror`. The parse, layout, SVG and raster
 sets are explicit:
 
-- `ztex.parse.Error` — lexer and parser failures, all carrying a position. The
-  CLI renders these with a caret under the offending span.
-- `layout.render` returns `error{ OutOfMemory, InvalidAst }`. `InvalidAst`
-  means the tree was malformed; it is detected by a single validation walk at
-  the layout boundary, so a hand-built AST fails cleanly instead of panicking
-  deep in layout.
-- `ztex.svg.render` returns `error{ OutOfMemory, InvalidArgument,
-  NonFiniteCoordinate }`. Padding must be finite and non-negative; a negative
-  margin is rejected rather than emitted as a negative frame.
-- `raster.rasterize` returns `error{ OutOfMemory, InvalidArgument,
-  OutputTooLarge, NonFiniteCoordinate } || font.FontError`. It rejects
-  non-positive or non-finite DPI/scale with `InvalidArgument`, non-finite ink
-  bounds with `NonFiniteCoordinate`, and unrepresentable dimensions, stride
-  or payload with `OutputTooLarge`, before allocating pixels. A missing glyph
-  or empty outline draws nothing; a stretchy item without a usable variant
-  degrades to the base glyph.
+- `ztex.parse.Error` — syntax/source-limit failures and `OutOfMemory`.
+  Only the former carry a filled diagnostic; the CLI prints their caret span.
+- `layout.Error` — `OutOfMemory`, `InvalidAst`, `InvalidArgument`, plus
+  `metrics.StretchError` for font-backed stretch decoding. `layout.render`
+  validates reachable token runs, source spans, payloads, child links, and
+  depth before recursive layout. Hand-built malformed trees fail cleanly.
+  Low-level `layout.layout` and `draw.flatten` require validated structures;
+  they do not repeat the boundary check.
+- All native render entry points require finite, positive `size_pt` and
+  return `InvalidArgument` before parsing/allocating when it is invalid.
+- `svg.Error` — `OutOfMemory`, `InvalidArgument`, `NonFiniteCoordinate`,
+  plus `font.FontError`. Padding must be finite and non-negative.
+  `svg.WriteError` adds file creation/writing errors, including cancellation.
+- `raster.Error` — `OutOfMemory`, `InvalidArgument`, `OutputTooLarge`,
+  `NonFiniteCoordinate`, plus `font.FontError`. Non-positive/non-finite
+  DPI/scale is invalid; non-finite ink bounds are a coordinate error.
+  Dimensions, stride, total length, and `max_bytes` are checked before pixels
+  are allocated. Missing glyphs/empty outlines paint nothing; unusable MATH
+  forms degrade to the base glyph.
 
-When you supply the `err_info` out-parameter, it is filled only on a parse
-failure, and is left untouched on success or any non-parse error.
+A supplied `err_info` is filled only on syntax/source-limit failure, not on
+`OutOfMemory`. Success and other failures leave its previous value unchanged.
 
 ## Input limits
 
@@ -542,6 +647,10 @@ deeply nested input fails rather than overflowing the stack; a `\text` /
 (also 500) fails the same way, because layout's face-scope stack has the same
 bound.
 
+Hand-built AST layout is capped at `atom.max_ast_depth` (2000 node levels),
+with `InvalidAst` beyond it. This is distinct from the parser's nesting
+counter and also bounds the subsequent recursive box/flatten path.
+
 ## Provenance
 
 Every drawable carries the byte span of the source it came from, so a glyph in
@@ -550,5 +659,5 @@ constructs that would otherwise break it: `\tag{1}`'s digits alias their own
 source bytes rather than a synthesized copy, `\boxed`'s four rules carry the
 span of the box they frame, an `\hline` carries the span of its own token, and
 a synthesized glyph (`∑` from `\sum`, a stretchy variant) carries the span of
-the construct that produced it even though no source bytes exist for it. The
-wide accent's stroke carries the span of the whole `\widehat{…}` it spans.
+the construct that produced it even though no source bytes exist for it.
+An accent glyph or long-tilde band carries its whole accent command's span.

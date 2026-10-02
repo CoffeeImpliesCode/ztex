@@ -28,8 +28,8 @@
 //!
 //! Font selection still follows MicroTeX's "mathnormal" style mapping
 //! (tex_param.res.cpp): digits/operators/punctuation → cmr10, Latin letters
-//! → cmmi10, roman style (\text, \mathrm) Latin letters → cmr10
-//! (table_roman/7/5 — TeX family 0), uppercase Greek → cmr10 (base.def.cpp
+//! → cmmi10, roman style (\text, \mathrm) is drawn from the embedded LM
+//! Roman face (`roman_style_metrics.roman`), uppercase Greek → cmr10 (base.def.cpp
 //! symbols, TeX slots
 //! 161-171; Α/Β are \mathrm A/B → cmmi10 slots 65/66), lowercase Greek →
 //! cmmi10 (TeX slots 174-195 of cmmi10_unchanged, which MicroTeX's symbol
@@ -42,15 +42,26 @@
 //! composed box width, noted per row. The WIDTH of every row is now the
 //! Latin-Modern-Math advance regardless of which CM font the row maps to;
 //! codepoints LM Math does not cover (Ϝ ▹ ◃ ⤒ ⧫, AMS-only, drawn by a
-//! fallback font) keep their measured CM width, noted per row. Roman style
-//! at size ≥ 15pt uses the real LMRoman17 optical advances (`table_roman17`:
-//! XeTeX's roman TEXT font optically swaps to the 17pt design there, while
-//! LM Math — the math font — has no optical sizes).
+//! fallback font) keep their measured CM width, noted per row. Every text
+//! style (\text, \mathrm, \textbf, \textit) answers from its OWN generated
+//! face row instead — a roman letter is LM Roman's real advance, height and
+//! depth, not the math face's row for the same codepoint — and there are no
+//! optical roman bands: the four embedded faces are the only roman designs.
+//!
+//! A THIRD generated table, `math_style_metrics.zig`, carries what those two
+//! do not: the metrics of the codepoints the style mapping REMAPS to (the
+//! math sans-serif / monospace alphabets `\mathsf` and `\mathtt` ask about
+//! the mapped codepoint, and the native triple / quadruple prime composite),
+//! and the HORIZONTAL MATH size ladders and glyph assemblies of the four
+//! forms a horizontal request names. Both come from the same LM Math bytes
+//! the renderer draws, so a remapped glyph is measured by the design it is
+//! painted from.
 
 const std = @import("std");
 const atom = @import("ztex.atom");
 const roman_style_metrics = @import("roman_style_metrics.zig");
 const ink_metrics = @import("ink_metrics.zig");
+const math_style_metrics = @import("math_style_metrics.zig");
 
 /// Per-glyph metrics, in points at the base font size (10pt).
 pub const Glyph = struct {
@@ -97,6 +108,39 @@ pub const GlyphInk = struct {
     left: f32 = 0,
     right_edge: f32 = 0,
     bottom: f32 = 0,
+};
+
+/// Horizontal advance and painted ink of a selected MATH form, in em.
+/// A vertical construction reserves its parts' maximum hmtx advance; a
+/// horizontal construction reserves the selected rung or assembled width.
+/// The ink is the real outline union, never an estimate from the base glyph.
+pub const StretchGeometry = struct {
+    advance_em: f32,
+    ink: GlyphInk,
+    /// The width past which this form has NO design left: the last
+    /// AdvanceMeasurement of a horizontal ladder that declares no glyph
+    /// assembly. `req_em > finite_ceiling_em` is the only honest test for "the
+    /// request outgrew the font" — a form that merely FITS under the request,
+    /// a hat or a brace narrower than its nucleus, is answered from inside the
+    /// ladder and is not short of anything. Null with no ladder, and null whenever an
+    /// assembly exists: an assembly reaches any width, so it has no ceiling.
+    finite_ceiling_em: ?f32 = null,
+};
+
+/// What resolving a horizontal stretch can fail with. A wired font decodes
+/// outlines to answer, so its failures — an allocation, a table this font
+/// does not carry — stay errors instead of decaying into the bundled static
+/// geometry: `FontHook.horizontal_glyph` propagates them, `horizontalGlyph`
+/// returns them, and a caller that cannot resolve keeps its own fallback.
+/// The static branch is generated measurements with no font behind it, so it
+/// cannot fail and never raises one of these.
+pub const StretchError = error{
+    OutOfMemory,
+    InvalidSfnt,
+    MissingTable,
+    InvalidTable,
+    UnsupportedCmap,
+    UnsupportedFont,
 };
 
 /// TeX layout parameters, in points at the base size (10pt). Values are
@@ -151,17 +195,71 @@ pub const StaticTables = struct {};
 /// lookup returns null for codepoints the face does not map, so
 /// `glyph`/`glyphAt` fall through to the static tables and finally to
 /// glyphEstimate.
+///
+/// WHAT THE CALLBACKS ARE: every field below is called SYNCHRONOUSLY, on
+/// the thread that called `layout.render`, from inside that call and before
+/// it returns. `ctx` is handed back unchanged and is valid only for the
+/// duration of that call — a callback must not retain it, the codepoint, or
+/// anything it returns except by value. `math_constants` is borrowed for as
+/// long as the hook is installed and must outlive it.
+///
+/// THREADS AND REENTRY: `ctx` is mutable because measuring fills a
+/// per-(face, codepoint) cache in it, and nothing in that cache is locked —
+/// so ONE context must not be driven from two threads at once, while
+/// separate contexts are independent and may be driven concurrently. A
+/// callback may reenter layout (nothing is held across a lookup: the cache
+/// hands back a value, not a borrow), and the `FontMetrics` it was handed is
+/// borrowed const for the whole call, so it must not be written through.
+///
+/// ON AN ERROR: a `StretchError` aborts the layout call that raised it. The
+/// caller keeps nothing — the box pool and any partially built draw list are
+/// released before `render` returns — so the residue is whatever the
+/// callback itself left behind in `ctx`, which is that context's cache.
 pub const FontHook = struct {
-    /// `*font.FontContext`: the embedded LM fonts + per-(face, cp) metric
-    /// cache (the pointer is non-const — `FontContext.metrics` mutates the
-    /// cache while measuring).
+    /// `*font.FontContext`: the embedded LM fonts + the per-(face,
+    /// codepoint) metric cache, handed to every callback below unchanged. It
+    /// is mutable because measuring fills that cache, which is why one
+    /// context serves one thread at a time. The caller that installed the
+    /// hook owns it and it must outlive the hook.
     ctx: *anyopaque,
-    /// Font-backed glyph lookup for `ctx` at the 10pt base.
-    glyph: *const fn (ctx: *anyopaque, cp: u21, style: atom.CharStyle) ?Glyph,
+    /// Font-backed glyph lookup for `ctx` at the 10pt base. `size_pt` is the
+    /// size the glyph is DRAWN at: every per-glyph answer is the 10pt base the
+    /// caller scales, so the size enters only as the prime tier (see
+    /// `small_prime_max_size`). It cannot fail: null means the face maps no
+    /// glyph for this codepoint in this style, and the caller falls through
+    /// to the bundled tables and then to `glyphEstimate`.
+    glyph: *const fn (ctx: *anyopaque, cp: u21, style: atom.CharStyle, size_pt: f32) ?Glyph,
     /// The owned math face's MATH constants, borrowed for the context's
     /// lifetime; null for a hook built without a MATH table, which leaves
     /// every parameter on its static row.
     math_constants: ?*const atom.MathConstants = null,
+    /// Horizontal stretch resolver for `ctx`: the SMALLEST MATH horizontal
+    /// size variant of `cp` whose AdvanceMeasurement covers `req_em`, else
+    /// the balanced horizontal GlyphAssembly of the same glyph, measured
+    /// from the real outlines it will draw. Its null is a real answer — the
+    /// face has no such glyph or construction — and the caller keeps its own
+    /// fallback; the bundled geometry is NOT substituted for it. A hook
+    /// built without this field (null) is not a claim about the face and
+    /// falls through to the generated static ladders.
+    horizontal_glyph: ?*const fn (
+        ctx: *anyopaque,
+        cp: u21,
+        req_em: f32,
+    ) StretchError!?StretchGeometry = null,
+    /// Geometry of the exact vertical form a draw item requests. `form` is the
+    /// MATH variant index the layout already selected (0 = the base glyph),
+    /// and `assembly_req`/`fixed_req` are EM: the ink height a balanced
+    /// assembly must reach, and the amsmath FIXED-rule requirement (0 for
+    /// either when the request does not ask). A missing callback keeps the
+    /// static backend; a callback's null is final — the face has no such
+    /// construction and the caller keeps the geometry it measured itself.
+    vertical_glyph: ?*const fn (
+        ctx: *anyopaque,
+        cp: u21,
+        form: u8,
+        assembly_req: f32,
+        fixed_req: f32,
+    ) StretchError!?StretchGeometry = null,
 };
 
 /// Closed metric source for the layout: either the bundled static tables or
@@ -700,70 +798,6 @@ const table_bb = [_]Entry{
     .{ .cp = 0x1D7E1, .w = 5.60, .h = 6.70, .d = 0.20, .ic = 0 }, // bb 9
 };
 
-/// Roman-style metrics for Latin letters A-Z a-z, used when `style`
-/// is `.roman` (`\text`, `\mathrm`). TeX typesets roman text in family 0 =
-/// cmr10; the main `table` stores the math-italic rows for the same
-/// codepoints, so roman style must look here instead. Widths are the
-/// Latin-Modern-Math advance (same convention as `table`; LM Math has one
-/// upright/italic shape, so roman and math share the advance). Transcribed
-/// from cmr10 TFM originally (em × 10), sorted by `cp` (binary-search
-/// invariant). Glyphs in other styles/roles stay in `table` (digits, ops,
-/// punct and uppercase Greek are already cmr10 there).
-const table_roman = [_]Entry{
-    .{ .cp = 0x0041, .w = 7.5, .h = 6.83332, .d = 0, .ic = 0 }, // A
-    .{ .cp = 0x0042, .w = 7.08, .h = 6.83332, .d = 0, .ic = 0 }, // B
-    .{ .cp = 0x0043, .w = 7.22, .h = 6.83332, .d = 0, .ic = 0 }, // C
-    .{ .cp = 0x0044, .w = 7.64, .h = 6.83332, .d = 0, .ic = 0 }, // D
-    .{ .cp = 0x0045, .w = 6.81, .h = 6.83332, .d = 0, .ic = 0 }, // E
-    .{ .cp = 0x0046, .w = 6.53, .h = 6.83332, .d = 0, .ic = 0 }, // F
-    .{ .cp = 0x0047, .w = 7.85, .h = 6.83332, .d = 0, .ic = 0 }, // G
-    .{ .cp = 0x0048, .w = 7.5, .h = 6.83332, .d = 0, .ic = 0 }, // H
-    .{ .cp = 0x0049, .w = 3.61, .h = 6.83332, .d = 0, .ic = 0 }, // I
-    .{ .cp = 0x004A, .w = 5.14, .h = 6.83332, .d = 0, .ic = 0 }, // J
-    .{ .cp = 0x004B, .w = 7.78, .h = 6.83332, .d = 0, .ic = 0 }, // K
-    .{ .cp = 0x004C, .w = 6.25, .h = 6.83332, .d = 0, .ic = 0 }, // L
-    .{ .cp = 0x004D, .w = 9.17, .h = 6.83332, .d = 0, .ic = 0 }, // M
-    .{ .cp = 0x004E, .w = 7.5, .h = 6.83332, .d = 0, .ic = 0 }, // N
-    .{ .cp = 0x004F, .w = 7.78, .h = 6.83332, .d = 0, .ic = 0 }, // O
-    .{ .cp = 0x0050, .w = 6.81, .h = 6.83332, .d = 0, .ic = 0 }, // P
-    .{ .cp = 0x0051, .w = 7.78, .h = 6.83332, .d = 1.94445, .ic = 0 }, // Q
-    .{ .cp = 0x0052, .w = 7.36, .h = 6.83332, .d = 0, .ic = 0.24 }, // R
-    .{ .cp = 0x0053, .w = 5.56, .h = 6.83332, .d = 0, .ic = 0 }, // S
-    .{ .cp = 0x0054, .w = 7.22, .h = 6.83332, .d = 0, .ic = 0 }, // T
-    .{ .cp = 0x0055, .w = 7.5, .h = 6.83332, .d = 0, .ic = 0 }, // U
-    .{ .cp = 0x0056, .w = 7.5, .h = 6.83332, .d = 0, .ic = 0.08 }, // V
-    .{ .cp = 0x0057, .w = 10.28, .h = 6.83332, .d = 0, .ic = 0.09 }, // W
-    .{ .cp = 0x0058, .w = 7.5, .h = 6.83332, .d = 0, .ic = 0.04 }, // X
-    .{ .cp = 0x0059, .w = 7.5, .h = 6.83332, .d = 0, .ic = 0.16 }, // Y
-    .{ .cp = 0x005A, .w = 6.11, .h = 6.83332, .d = 0, .ic = 0 }, // Z
-    .{ .cp = 0x0061, .w = 5, .h = 4.30555, .d = 0, .ic = 0.11 }, // a
-    .{ .cp = 0x0062, .w = 5.56, .h = 6.94445, .d = 0, .ic = 0 }, // b
-    .{ .cp = 0x0063, .w = 4.44, .h = 4.30555, .d = 0, .ic = 0 }, // c
-    .{ .cp = 0x0064, .w = 5.56, .h = 6.94445, .d = 0, .ic = 0 }, // d
-    .{ .cp = 0x0065, .w = 4.44, .h = 4.30555, .d = 0, .ic = 0 }, // e
-    .{ .cp = 0x0066, .w = 3.06, .h = 6.94445, .d = 0, .ic = 0.79 }, // f
-    .{ .cp = 0x0067, .w = 5, .h = 4.30555, .d = 1.94445, .ic = 0.13 }, // g
-    .{ .cp = 0x0068, .w = 5.56, .h = 6.94445, .d = 0, .ic = 0.07 }, // h
-    .{ .cp = 0x0069, .w = 2.78, .h = 6.67859, .d = 0, .ic = 0 }, // i
-    .{ .cp = 0x006A, .w = 3.06, .h = 6.67859, .d = 1.94445, .ic = 0 }, // j
-    .{ .cp = 0x006B, .w = 5.28, .h = 6.94445, .d = 0, .ic = 0.11 }, // k
-    .{ .cp = 0x006C, .w = 2.78, .h = 6.94445, .d = 0, .ic = 0.05 }, // l
-    .{ .cp = 0x006D, .w = 8.33, .h = 4.30555, .d = 0, .ic = 0.08 }, // m
-    .{ .cp = 0x006E, .w = 5.56, .h = 4.30555, .d = 0, .ic = 0.07 }, // n
-    .{ .cp = 0x006F, .w = 5, .h = 4.30555, .d = 0, .ic = 0 }, // o
-    .{ .cp = 0x0070, .w = 5.56, .h = 4.30555, .d = 1.94445, .ic = 0 }, // p
-    .{ .cp = 0x0071, .w = 5.28, .h = 4.30555, .d = 1.94445, .ic = 0.27 }, // q
-    .{ .cp = 0x0072, .w = 3.92, .h = 4.30555, .d = 0, .ic = 0 }, // r
-    .{ .cp = 0x0073, .w = 3.94, .h = 4.30555, .d = 0, .ic = 0 }, // s
-    .{ .cp = 0x0074, .w = 3.89, .h = 6.1508, .d = 0, .ic = 0 }, // t
-    .{ .cp = 0x0075, .w = 5.56, .h = 4.30555, .d = 0, .ic = 0.07 }, // u
-    .{ .cp = 0x0076, .w = 5.28, .h = 4.30555, .d = 0, .ic = 0.08 }, // v
-    .{ .cp = 0x0077, .w = 7.22, .h = 4.30555, .d = 0, .ic = 0.09 }, // w
-    .{ .cp = 0x0078, .w = 5.28, .h = 4.30555, .d = 0, .ic = 0.16 }, // x
-    .{ .cp = 0x0079, .w = 5.28, .h = 4.30555, .d = 1.94445, .ic = 0.08 }, // y
-    .{ .cp = 0x007A, .w = 4.44, .h = 4.30555, .d = 0, .ic = 0 }, // z
-};
-
 /// Script-size metric table (design size 7pt), same convention as `table`:
 /// TFM em-relative values x 10, so the layout's `size_pt/10` scaling yields
 /// the real 7pt points. LM Math is a single 10pt-design OTF with no optical
@@ -1028,64 +1062,6 @@ const table7 = [_]Entry{
     .{ .cp = 0x1D715, .w = 5.31, .h = 6.94445, .d = 0, .ic = 0.61508 }, // 𝜕
 };
 
-/// Roman-style letters for script size, the roman partner of `table_roman`
-/// at the 7pt band (glyphAt picks it when style is `.roman`): LM Math
-/// advances (em × 10), scaled linearly at 7pt by the layout.
-const table_roman7 = [_]Entry{
-    .{ .cp = 0x0041, .w = 7.5, .h = 6.83334, .d = 0, .ic = 0 }, // A
-    .{ .cp = 0x0042, .w = 7.08, .h = 6.83334, .d = 0, .ic = 0 }, // B
-    .{ .cp = 0x0043, .w = 7.22, .h = 6.83334, .d = 0, .ic = 0 }, // C
-    .{ .cp = 0x0044, .w = 7.64, .h = 6.83334, .d = 0, .ic = 0 }, // D
-    .{ .cp = 0x0045, .w = 6.81, .h = 6.83334, .d = 0, .ic = 0 }, // E
-    .{ .cp = 0x0046, .w = 6.53, .h = 6.83334, .d = 0, .ic = 0 }, // F
-    .{ .cp = 0x0047, .w = 7.85, .h = 6.83334, .d = 0, .ic = 0 }, // G
-    .{ .cp = 0x0048, .w = 7.5, .h = 6.83334, .d = 0, .ic = 0 }, // H
-    .{ .cp = 0x0049, .w = 3.61, .h = 6.83334, .d = 0, .ic = 0 }, // I
-    .{ .cp = 0x004A, .w = 5.14, .h = 6.83334, .d = 0, .ic = 0 }, // J
-    .{ .cp = 0x004B, .w = 7.78, .h = 6.83334, .d = 0, .ic = 0 }, // K
-    .{ .cp = 0x004C, .w = 6.25, .h = 6.83334, .d = 0, .ic = 0 }, // L
-    .{ .cp = 0x004D, .w = 9.17, .h = 6.83334, .d = 0, .ic = 0 }, // M
-    .{ .cp = 0x004E, .w = 7.5, .h = 6.83334, .d = 0, .ic = 0 }, // N
-    .{ .cp = 0x004F, .w = 7.78, .h = 6.83334, .d = 0, .ic = 0 }, // O
-    .{ .cp = 0x0050, .w = 6.81, .h = 6.83334, .d = 0, .ic = 0 }, // P
-    .{ .cp = 0x0051, .w = 7.78, .h = 6.83334, .d = 1.94445, .ic = 0 }, // Q
-    .{ .cp = 0x0052, .w = 7.36, .h = 6.83334, .d = 0, .ic = 0.24 }, // R
-    .{ .cp = 0x0053, .w = 5.56, .h = 6.83334, .d = 0, .ic = 0 }, // S
-    .{ .cp = 0x0054, .w = 7.22, .h = 6.83334, .d = 0, .ic = 0 }, // T
-    .{ .cp = 0x0055, .w = 7.5, .h = 6.83334, .d = 0, .ic = 0 }, // U
-    .{ .cp = 0x0056, .w = 7.5, .h = 6.83334, .d = 0, .ic = 0.08 }, // V
-    .{ .cp = 0x0057, .w = 10.28, .h = 6.83334, .d = 0, .ic = 0.09 }, // W
-    .{ .cp = 0x0058, .w = 7.5, .h = 6.83334, .d = 0, .ic = 0.04 }, // X
-    .{ .cp = 0x0059, .w = 7.5, .h = 6.83334, .d = 0, .ic = 0.16 }, // Y
-    .{ .cp = 0x005A, .w = 6.11, .h = 6.83334, .d = 0, .ic = 0 }, // Z
-    .{ .cp = 0x0061, .w = 5, .h = 4.30555, .d = 0, .ic = 0.11 }, // a
-    .{ .cp = 0x0062, .w = 5.56, .h = 6.94445, .d = 0, .ic = 0 }, // b
-    .{ .cp = 0x0063, .w = 4.44, .h = 4.30555, .d = 0, .ic = 0 }, // c
-    .{ .cp = 0x0064, .w = 5.56, .h = 6.94445, .d = 0, .ic = 0 }, // d
-    .{ .cp = 0x0065, .w = 4.44, .h = 4.30555, .d = 0, .ic = 0 }, // e
-    .{ .cp = 0x0066, .w = 3.06, .h = 6.94445, .d = 0, .ic = 0.79 }, // f
-    .{ .cp = 0x0067, .w = 5, .h = 4.30555, .d = 1.94445, .ic = 0.13 }, // g
-    .{ .cp = 0x0068, .w = 5.56, .h = 6.94445, .d = 0, .ic = 0.07 }, // h
-    .{ .cp = 0x0069, .w = 2.78, .h = 6.72621, .d = 0, .ic = 0 }, // i
-    .{ .cp = 0x006A, .w = 3.06, .h = 6.72621, .d = 1.94445, .ic = 0 }, // j
-    .{ .cp = 0x006B, .w = 5.28, .h = 6.94445, .d = 0, .ic = 0.11 }, // k
-    .{ .cp = 0x006C, .w = 2.78, .h = 6.94445, .d = 0, .ic = 0.05 }, // l
-    .{ .cp = 0x006D, .w = 8.33, .h = 4.30555, .d = 0, .ic = 0.08 }, // m
-    .{ .cp = 0x006E, .w = 5.56, .h = 4.30555, .d = 0, .ic = 0.07 }, // n
-    .{ .cp = 0x006F, .w = 5, .h = 4.30555, .d = 0, .ic = 0 }, // o
-    .{ .cp = 0x0070, .w = 5.56, .h = 4.30555, .d = 1.94445, .ic = 0 }, // p
-    .{ .cp = 0x0071, .w = 5.28, .h = 4.30555, .d = 1.94445, .ic = 0.27 }, // q
-    .{ .cp = 0x0072, .w = 3.92, .h = 4.30555, .d = 0, .ic = 0 }, // r
-    .{ .cp = 0x0073, .w = 3.94, .h = 4.30555, .d = 0, .ic = 0 }, // s
-    .{ .cp = 0x0074, .w = 3.89, .h = 6.1508, .d = 0, .ic = 0 }, // t
-    .{ .cp = 0x0075, .w = 5.56, .h = 4.30555, .d = 0, .ic = 0.07 }, // u
-    .{ .cp = 0x0076, .w = 5.28, .h = 4.30555, .d = 0, .ic = 0.08 }, // v
-    .{ .cp = 0x0077, .w = 7.22, .h = 4.30555, .d = 0, .ic = 0.09 }, // w
-    .{ .cp = 0x0078, .w = 5.28, .h = 4.30555, .d = 0, .ic = 0.16 }, // x
-    .{ .cp = 0x0079, .w = 5.28, .h = 4.30555, .d = 1.94445, .ic = 0.08 }, // y
-    .{ .cp = 0x007A, .w = 4.44, .h = 4.30555, .d = 0, .ic = 0 }, // z
-};
-
 /// Scriptscript-size metric table (design size 5pt), same convention as
 /// `table` (em × 10): LM Math has no optical 5pt variant either, so these
 /// rows carry the LM Math advance and the size_pt/10 factor yields LM
@@ -1347,175 +1323,8 @@ const table5 = [_]Entry{
     .{ .cp = 0x1D715, .w = 5.31, .h = 6.94446, .d = 0, .ic = 0.69446 }, // 𝜕
 };
 
-/// Roman-style letters for scriptscript size, the roman partner of
-/// `table_roman` at the 5pt band (glyphAt picks it when style is `.roman`):
-/// LM Math advances (em × 10), scaled linearly at 5pt by the layout.
-const table_roman5 = [_]Entry{
-    .{ .cp = 0x0041, .w = 7.5, .h = 6.79761, .d = 0, .ic = 0 }, // A
-    .{ .cp = 0x0042, .w = 7.08, .h = 6.79761, .d = 0, .ic = 0 }, // B
-    .{ .cp = 0x0043, .w = 7.22, .h = 6.79761, .d = 0, .ic = 0 }, // C
-    .{ .cp = 0x0044, .w = 7.64, .h = 6.79761, .d = 0, .ic = 0 }, // D
-    .{ .cp = 0x0045, .w = 6.81, .h = 6.79761, .d = 0, .ic = 0 }, // E
-    .{ .cp = 0x0046, .w = 6.53, .h = 6.79761, .d = 0, .ic = 0 }, // F
-    .{ .cp = 0x0047, .w = 7.85, .h = 6.79761, .d = 0, .ic = 0 }, // G
-    .{ .cp = 0x0048, .w = 7.5, .h = 6.79761, .d = 0, .ic = 0 }, // H
-    .{ .cp = 0x0049, .w = 3.61, .h = 6.79761, .d = 0, .ic = 0 }, // I
-    .{ .cp = 0x004A, .w = 5.14, .h = 6.79761, .d = 0, .ic = 0 }, // J
-    .{ .cp = 0x004B, .w = 7.78, .h = 6.79761, .d = 0, .ic = 0 }, // K
-    .{ .cp = 0x004C, .w = 6.25, .h = 6.79761, .d = 0, .ic = 0 }, // L
-    .{ .cp = 0x004D, .w = 9.17, .h = 6.79761, .d = 0, .ic = 0 }, // M
-    .{ .cp = 0x004E, .w = 7.5, .h = 6.79761, .d = 0, .ic = 0 }, // N
-    .{ .cp = 0x004F, .w = 7.78, .h = 6.79761, .d = 0, .ic = 0 }, // O
-    .{ .cp = 0x0050, .w = 6.81, .h = 6.79761, .d = 0, .ic = 0 }, // P
-    .{ .cp = 0x0051, .w = 7.78, .h = 6.79761, .d = 1.94446, .ic = 0 }, // Q
-    .{ .cp = 0x0052, .w = 7.36, .h = 6.79761, .d = 0, .ic = 0.24 }, // R
-    .{ .cp = 0x0053, .w = 5.56, .h = 6.79761, .d = 0, .ic = 0 }, // S
-    .{ .cp = 0x0054, .w = 7.22, .h = 6.79761, .d = 0, .ic = 0 }, // T
-    .{ .cp = 0x0055, .w = 7.5, .h = 6.79761, .d = 0, .ic = 0 }, // U
-    .{ .cp = 0x0056, .w = 7.5, .h = 6.79761, .d = 0, .ic = 0.08 }, // V
-    .{ .cp = 0x0057, .w = 10.28, .h = 6.79761, .d = 0, .ic = 0.09 }, // W
-    .{ .cp = 0x0058, .w = 7.5, .h = 6.79761, .d = 0, .ic = 0.04 }, // X
-    .{ .cp = 0x0059, .w = 7.5, .h = 6.79761, .d = 0, .ic = 0.16 }, // Y
-    .{ .cp = 0x005A, .w = 6.11, .h = 6.79761, .d = 0, .ic = 0 }, // Z
-    .{ .cp = 0x0061, .w = 5, .h = 4.30554, .d = 0, .ic = 0.11 }, // a
-    .{ .cp = 0x0062, .w = 5.56, .h = 6.94446, .d = 0, .ic = 0 }, // b
-    .{ .cp = 0x0063, .w = 4.44, .h = 4.30554, .d = 0, .ic = 0 }, // c
-    .{ .cp = 0x0064, .w = 5.56, .h = 6.94446, .d = 0, .ic = 0 }, // d
-    .{ .cp = 0x0065, .w = 4.44, .h = 4.30554, .d = 0, .ic = 0 }, // e
-    .{ .cp = 0x0066, .w = 3.06, .h = 6.94446, .d = 0, .ic = 0.79 }, // f
-    .{ .cp = 0x0067, .w = 5, .h = 4.30554, .d = 1.94446, .ic = 0.13 }, // g
-    .{ .cp = 0x0068, .w = 5.56, .h = 6.94446, .d = 0, .ic = 0.07 }, // h
-    .{ .cp = 0x0069, .w = 2.78, .h = 6.79761, .d = 0, .ic = 0 }, // i
-    .{ .cp = 0x006A, .w = 3.06, .h = 6.79761, .d = 1.94446, .ic = 0 }, // j
-    .{ .cp = 0x006B, .w = 5.28, .h = 6.94446, .d = 0, .ic = 0.11 }, // k
-    .{ .cp = 0x006C, .w = 2.78, .h = 6.94446, .d = 0, .ic = 0.05 }, // l
-    .{ .cp = 0x006D, .w = 8.33, .h = 4.30554, .d = 0, .ic = 0.08 }, // m
-    .{ .cp = 0x006E, .w = 5.56, .h = 4.30554, .d = 0, .ic = 0.07 }, // n
-    .{ .cp = 0x006F, .w = 5, .h = 4.30554, .d = 0, .ic = 0 }, // o
-    .{ .cp = 0x0070, .w = 5.56, .h = 4.30554, .d = 1.94446, .ic = 0 }, // p
-    .{ .cp = 0x0071, .w = 5.28, .h = 4.30554, .d = 1.94446, .ic = 0.27 }, // q
-    .{ .cp = 0x0072, .w = 3.92, .h = 4.30554, .d = 0, .ic = 0 }, // r
-    .{ .cp = 0x0073, .w = 3.94, .h = 4.30554, .d = 0, .ic = 0 }, // s
-    .{ .cp = 0x0074, .w = 3.89, .h = 6.15079, .d = 0, .ic = 0 }, // t
-    .{ .cp = 0x0075, .w = 5.56, .h = 4.30554, .d = 0, .ic = 0.07 }, // u
-    .{ .cp = 0x0076, .w = 5.28, .h = 4.30554, .d = 0, .ic = 0.08 }, // v
-    .{ .cp = 0x0077, .w = 7.22, .h = 4.30554, .d = 0, .ic = 0.09 }, // w
-    .{ .cp = 0x0078, .w = 5.28, .h = 4.30554, .d = 0, .ic = 0.16 }, // x
-    .{ .cp = 0x0079, .w = 5.28, .h = 4.30554, .d = 1.94446, .ic = 0.08 }, // y
-    .{ .cp = 0x007A, .w = 4.44, .h = 4.30554, .d = 0, .ic = 0 }, // z
-};
-
-/// Roman-style metrics for the LMRoman17 optical band (design size 17.28pt),
-/// selected when `size_pt >= 15` (see `band17`). TeX's roman TEXT font —
-/// unlike LM Math — has real optical sizes: XeTeX/fontspec renders
-/// \mathrm/\text/\operatorname at large sizes with the 17pt Latin Modern
-/// Roman design (measured on the XeTeX reference: \mathrm{mx} at 14.9pt has
-/// m advance 0.816em — the 12pt design — and at 15.0pt 0.772em — the 17pt
-/// design). Advances (em × 10) are the REAL lmroman17-regular.otf hmtx
-/// values (fontTools; m 0.772, o 0.459, d 0.511 vs the 0.833/0.5/0.556 LM
-/// Math / cmr10 rows), covering the full ASCII printable range used by
-/// \mathrm/\operatorname/\text. Heights/depths are the glyph CFF bounds
-/// (clamped ≥ 0); italic corrections 0 (roman). Sorted by `cp`.
-const table_roman17 = [_]Entry{
-    .{ .cp = 0x0020, .w = 3.02000, .h = 0.00000, .d = 0.00000, .ic = 0 }, // space
-    .{ .cp = 0x0021, .w = 2.50000, .h = 7.10000, .d = 0.00000, .ic = 0 }, // !
-    .{ .cp = 0x0022, .w = 3.22000, .h = 6.99000, .d = 0.00000, .ic = 0 }, // "
-    .{ .cp = 0x0023, .w = 7.72000, .h = 6.94000, .d = 1.95000, .ic = 0 }, // #
-    .{ .cp = 0x0024, .w = 4.59000, .h = 7.49000, .d = 0.55000, .ic = 0 }, // $
-    .{ .cp = 0x0025, .w = 7.72000, .h = 7.49000, .d = 0.55000, .ic = 0 }, // %
-    .{ .cp = 0x0026, .w = 7.20000, .h = 7.10000, .d = 0.16000, .ic = 0 }, // &
-    .{ .cp = 0x0027, .w = 2.50000, .h = 6.99000, .d = 0.00000, .ic = 0 }, // '
-    .{ .cp = 0x0028, .w = 3.54000, .h = 7.49000, .d = 2.50000, .ic = 0 }, // (
-    .{ .cp = 0x0029, .w = 3.54000, .h = 7.49000, .d = 2.50000, .ic = 0 }, // )
-    .{ .cp = 0x002A, .w = 4.59000, .h = 7.49000, .d = 0.00000, .ic = 0 }, // *
-    .{ .cp = 0x002B, .w = 7.20000, .h = 5.63000, .d = 0.64000, .ic = 0 }, // +
-    .{ .cp = 0x002C, .w = 2.50000, .h = 0.82000, .d = 1.94000, .ic = 0 }, // ,
-    .{ .cp = 0x002D, .w = 3.02000, .h = 2.37000, .d = 0.00000, .ic = 0 }, // -
-    .{ .cp = 0x002E, .w = 2.50000, .h = 0.82000, .d = 0.00000, .ic = 0 }, // .
-    .{ .cp = 0x002F, .w = 4.59000, .h = 7.49000, .d = 2.49000, .ic = 0 }, // /
-    .{ .cp = 0x0030, .w = 4.59000, .h = 6.61000, .d = 0.16000, .ic = 0 }, // 0
-    .{ .cp = 0x0031, .w = 4.59000, .h = 6.61000, .d = 0.00000, .ic = 0 }, // 1
-    .{ .cp = 0x0032, .w = 4.59000, .h = 6.61000, .d = 0.00000, .ic = 0 }, // 2
-    .{ .cp = 0x0033, .w = 4.59000, .h = 6.61000, .d = 0.16000, .ic = 0 }, // 3
-    .{ .cp = 0x0034, .w = 4.59000, .h = 6.69000, .d = 0.00000, .ic = 0 }, // 4
-    .{ .cp = 0x0035, .w = 4.59000, .h = 6.60000, .d = 0.16000, .ic = 0 }, // 5
-    .{ .cp = 0x0036, .w = 4.59000, .h = 6.61000, .d = 0.16000, .ic = 0 }, // 6
-    .{ .cp = 0x0037, .w = 4.59000, .h = 6.77000, .d = 0.16000, .ic = 0 }, // 7
-    .{ .cp = 0x0038, .w = 4.59000, .h = 6.61000, .d = 0.16000, .ic = 0 }, // 8
-    .{ .cp = 0x0039, .w = 4.59000, .h = 6.61000, .d = 0.16000, .ic = 0 }, // 9
-    .{ .cp = 0x003A, .w = 2.50000, .h = 4.30000, .d = 0.00000, .ic = 0 }, // :
-    .{ .cp = 0x003B, .w = 2.50000, .h = 4.30000, .d = 1.94000, .ic = 0 }, // ;
-    .{ .cp = 0x003C, .w = 7.62000, .h = 5.27000, .d = 0.28000, .ic = 0 }, // <
-    .{ .cp = 0x003D, .w = 7.20000, .h = 3.56000, .d = 0.00000, .ic = 0 }, // =
-    .{ .cp = 0x003E, .w = 7.62000, .h = 5.27000, .d = 0.28000, .ic = 0 }, // >
-    .{ .cp = 0x003F, .w = 4.33000, .h = 7.02000, .d = 0.00000, .ic = 0 }, // ?
-    .{ .cp = 0x0040, .w = 7.20000, .h = 7.02000, .d = 0.08000, .ic = 0 }, // @
-    .{ .cp = 0x0041, .w = 6.93000, .h = 7.07000, .d = 0.00000, .ic = 0 }, // A
-    .{ .cp = 0x0042, .w = 6.54000, .h = 6.83000, .d = 0.00000, .ic = 0 }, // B
-    .{ .cp = 0x0043, .w = 6.68000, .h = 6.99000, .d = 0.16000, .ic = 0 }, // C
-    .{ .cp = 0x0044, .w = 7.07000, .h = 6.83000, .d = 0.00000, .ic = 0 }, // D
-    .{ .cp = 0x0045, .w = 6.28000, .h = 6.81000, .d = 0.00000, .ic = 0 }, // E
-    .{ .cp = 0x0046, .w = 6.02000, .h = 6.81000, .d = 0.00000, .ic = 0 }, // F
-    .{ .cp = 0x0047, .w = 7.26000, .h = 6.99000, .d = 0.16000, .ic = 0 }, // G
-    .{ .cp = 0x0048, .w = 6.93000, .h = 6.83000, .d = 0.00000, .ic = 0 }, // H
-    .{ .cp = 0x0049, .w = 3.28000, .h = 6.83000, .d = 0.00000, .ic = 0 }, // I
-    .{ .cp = 0x004A, .w = 4.71000, .h = 6.83000, .d = 0.16000, .ic = 0 }, // J
-    .{ .cp = 0x004B, .w = 7.19000, .h = 6.83000, .d = 0.00000, .ic = 0 }, // K
-    .{ .cp = 0x004C, .w = 5.76000, .h = 6.83000, .d = 0.00000, .ic = 0 }, // L
-    .{ .cp = 0x004D, .w = 8.50000, .h = 6.83000, .d = 0.00000, .ic = 0 }, // M
-    .{ .cp = 0x004E, .w = 6.93000, .h = 6.83000, .d = 0.00000, .ic = 0 }, // N
-    .{ .cp = 0x004F, .w = 7.20000, .h = 6.99000, .d = 0.16000, .ic = 0 }, // O
-    .{ .cp = 0x0050, .w = 6.28000, .h = 6.83000, .d = 0.00000, .ic = 0 }, // P
-    .{ .cp = 0x0051, .w = 7.20000, .h = 6.99000, .d = 1.95000, .ic = 0 }, // Q
-    .{ .cp = 0x0052, .w = 6.80000, .h = 6.83000, .d = 0.16000, .ic = 0 }, // R
-    .{ .cp = 0x0053, .w = 5.11000, .h = 6.99000, .d = 0.16000, .ic = 0 }, // S
-    .{ .cp = 0x0054, .w = 6.68000, .h = 6.80000, .d = 0.00000, .ic = 0 }, // T
-    .{ .cp = 0x0055, .w = 6.93000, .h = 6.83000, .d = 0.16000, .ic = 0 }, // U
-    .{ .cp = 0x0056, .w = 6.93000, .h = 6.83000, .d = 0.16000, .ic = 0 }, // V
-    .{ .cp = 0x0057, .w = 9.55000, .h = 6.83000, .d = 0.16000, .ic = 0 }, // W
-    .{ .cp = 0x0058, .w = 6.93000, .h = 6.83000, .d = 0.00000, .ic = 0 }, // X
-    .{ .cp = 0x0059, .w = 6.93000, .h = 6.83000, .d = 0.00000, .ic = 0 }, // Y
-    .{ .cp = 0x005A, .w = 5.63000, .h = 6.83000, .d = 0.00000, .ic = 0 }, // Z
-    .{ .cp = 0x005B, .w = 2.50000, .h = 7.49000, .d = 2.49000, .ic = 0 }, // [
-    .{ .cp = 0x005C, .w = 5.00000, .h = 7.50000, .d = 2.50000, .ic = 0 }, // \
-    .{ .cp = 0x005D, .w = 2.50000, .h = 7.49000, .d = 2.49000, .ic = 0 }, // ]
-    .{ .cp = 0x005E, .w = 5.56000, .h = 7.44000, .d = 0.00000, .ic = 0 }, // ^
-    .{ .cp = 0x005F, .w = 6.93000, .h = 0.00000, .d = 1.34000, .ic = 0 }, // _
-    .{ .cp = 0x0060, .w = 4.59000, .h = 6.96000, .d = 0.00000, .ic = 0 }, // `
-    .{ .cp = 0x0061, .w = 4.59000, .h = 4.42000, .d = 0.08000, .ic = 0 }, // a
-    .{ .cp = 0x0062, .w = 5.11000, .h = 6.94000, .d = 0.08000, .ic = 0 }, // b
-    .{ .cp = 0x0063, .w = 4.06000, .h = 4.42000, .d = 0.08000, .ic = 0 }, // c
-    .{ .cp = 0x0064, .w = 5.11000, .h = 6.94000, .d = 0.08000, .ic = 0 }, // d
-    .{ .cp = 0x0065, .w = 4.06000, .h = 4.42000, .d = 0.08000, .ic = 0 }, // e
-    .{ .cp = 0x0066, .w = 2.76000, .h = 7.02000, .d = 0.00000, .ic = 0 }, // f
-    .{ .cp = 0x0067, .w = 4.59000, .h = 4.46000, .d = 2.04000, .ic = 0 }, // g
-    .{ .cp = 0x0068, .w = 5.11000, .h = 6.94000, .d = 0.00000, .ic = 0 }, // h
-    .{ .cp = 0x0069, .w = 2.50000, .h = 6.45000, .d = 0.00000, .ic = 0 }, // i
-    .{ .cp = 0x006A, .w = 2.76000, .h = 6.45000, .d = 2.03000, .ic = 0 }, // j
-    .{ .cp = 0x006B, .w = 4.85000, .h = 6.94000, .d = 0.00000, .ic = 0 }, // k
-    .{ .cp = 0x006C, .w = 2.50000, .h = 6.94000, .d = 0.00000, .ic = 0 }, // l
-    .{ .cp = 0x006D, .w = 7.72000, .h = 4.38000, .d = 0.00000, .ic = 0 }, // m
-    .{ .cp = 0x006E, .w = 5.11000, .h = 4.38000, .d = 0.00000, .ic = 0 }, // n
-    .{ .cp = 0x006F, .w = 4.59000, .h = 4.42000, .d = 0.08000, .ic = 0 }, // o
-    .{ .cp = 0x0070, .w = 5.11000, .h = 4.38000, .d = 1.95000, .ic = 0 }, // p
-    .{ .cp = 0x0071, .w = 4.85000, .h = 4.38000, .d = 1.95000, .ic = 0 }, // q
-    .{ .cp = 0x0072, .w = 3.54000, .h = 4.38000, .d = 0.00000, .ic = 0 }, // r
-    .{ .cp = 0x0073, .w = 3.59000, .h = 4.42000, .d = 0.08000, .ic = 0 }, // s
-    .{ .cp = 0x0074, .w = 3.54000, .h = 6.15000, .d = 0.08000, .ic = 0 }, // t
-    .{ .cp = 0x0075, .w = 5.11000, .h = 4.38000, .d = 0.08000, .ic = 0 }, // u
-    .{ .cp = 0x0076, .w = 4.85000, .h = 4.30000, .d = 0.08000, .ic = 0 }, // v
-    .{ .cp = 0x0077, .w = 6.68000, .h = 4.30000, .d = 0.08000, .ic = 0 }, // w
-    .{ .cp = 0x0078, .w = 4.85000, .h = 4.30000, .d = 0.00000, .ic = 0 }, // x
-    .{ .cp = 0x0079, .w = 4.85000, .h = 4.30000, .d = 2.03000, .ic = 0 }, // y
-    .{ .cp = 0x007A, .w = 4.06000, .h = 4.30000, .d = 0.00000, .ic = 0 }, // z
-    .{ .cp = 0x007B, .w = 5.00000, .h = 7.50000, .d = 2.50000, .ic = 0 }, // {
-    .{ .cp = 0x007C, .w = 2.78000, .h = 7.50000, .d = 2.50000, .ic = 0 }, // |
-    .{ .cp = 0x007D, .w = 5.00000, .h = 7.50000, .d = 2.50000, .ic = 0 }, // }
-    .{ .cp = 0x007E, .w = 5.56000, .h = 3.07000, .d = 0.00000, .ic = 0 }, // ~
-};
-
 /// One row of the drawn-ink table: ascent / descent in em of the glyph
-/// font-size (drawn size = the size the layout passes to the SVG <text>).
+/// font-size (the nominal size layout passes to both draw backends).
 const InkEntry = struct {
     cp: u21,
     a: f32,
@@ -2295,34 +2104,17 @@ fn search(tbl: []const Entry, cp: u21) ?Entry {
     return null;
 }
 
-/// True for Latin letters A-Z / a-z — the only codepoints where roman style
-/// (`\text`, `\mathrm`) selects different metrics (cmr10 family) than math
-/// italic (cmmi10 family). Digits, operators, punctuation and uppercase
-/// Greek are already cmr10 in `table`, so style does not change them.
-fn isRomanLetter(cp: u21) bool {
-    return (cp >= 0x41 and cp <= 0x5A) or (cp >= 0x61 and cp <= 0x7A);
-}
-
-/// True for a TEXT face drawn from one of the embedded LM Roman faces:
-/// `\textit` (text italic), `\textbf` (upright bold) and their combination
-/// (bold italic). Plain `\mathrm` / `\text` is `.roman` and keeps the
-/// Computer-Modern roman rows plus the LMRoman17 optical band — a
-/// different face history with its own goldens.
+/// True for a style drawn from one of the four embedded LM Roman faces.
 pub fn isTextFace(style: atom.CharStyle) bool {
     return style == .roman or style == .bold or style == .text_italic or
         style == .bold_italic;
 }
 
-/// The generated LM Roman text-style row for `style`, or null when the style
-/// is not one of those faces (the caller then uses the Computer-Modern
-/// rows). The tables are measured from the EXACT bytes the renderer draws —
-/// `src/layout/roman_style_metrics.zig`, generated by
-/// scripts/embed_font.py — so the static path advances and boxes a bold or
-/// italic character by its own face's hmtx advance and real ink instead of
-/// an upright estimate. These are text faces: they carry no MATH table, so
-/// every row's italic correction is 0.
+/// Exact advance and ink of the embedded text face, in the 10pt-base convention.
+/// Text faces have no MATH table, so their italic correction is zero.
 pub fn textFaceGlyph(style: atom.CharStyle, cp: u21) ?Glyph {
     const tbl: []const roman_style_metrics.Entry = switch (style) {
+        .roman => roman_style_metrics.roman,
         .text_italic => roman_style_metrics.italic,
         .bold => roman_style_metrics.bold,
         .bold_italic => roman_style_metrics.bold_italic,
@@ -2337,72 +2129,129 @@ pub fn textFaceGlyph(style: atom.CharStyle, cp: u21) ?Glyph {
     };
 }
 
-/// True in the LMRoman17 optical band: XeTeX/fontspec's Latin Modern Roman
-/// Size feature starts the 17pt design at a REQUESTED size of 15pt, not at
-/// the 17.28 design size (measured on the XeTeX reference: \mathrm{mx} m
-/// advance 0.816em at 14.9pt — the 12pt design — and 0.772em at 15.0pt —
-/// the 17pt design). ztex renders sizes 12–15 with the 10pt design's linear
-/// scaling (a residual gap, out of scope); from 15pt up the roman metrics
-/// come from `table_roman17`.
-fn band17(size_pt: f32) bool {
-    return size_pt >= 15.0;
+/// Exact LM Math rows for a codepoint remapped into a mathematical alphabet.
+fn mappedRow(style: atom.CharStyle, cp: u21) ?math_style_metrics.Row {
+    const tbl: []const math_style_metrics.Row = switch (style) {
+        .sans => math_style_metrics.sans,
+        .mono => math_style_metrics.mono,
+        .bb, .cal, .frak => &math_style_metrics.alphabets,
+        else => return null,
+    };
+    return math_style_metrics.lookup(tbl, cp);
 }
 
-/// Metric table for `cp` in `style` at design size `size_pt` (optical band
-/// selection). Roman-style Latin letters use the cmr10/cmr7/cmr5 tables;
-/// every other codepoint uses the math tables (`table`/`table7`/`table5`).
-/// In the LMRoman17 band (≥15pt, see `band17`) roman style uses
-/// `table_roman17` for every cp it covers (letters, digits, punctuation —
-/// the full ASCII printable range), falling back to the normal tables for
-/// anything else. Values are in the same 10pt-base convention (em × 10), so
-/// callers keep using `s(v, size_pt)`.
-fn tableFor(cp: u21, style: atom.CharStyle, size_pt: f32) []const Entry {
+/// Metrics for a codepoint the layout REMAPPED, measured by the glyph that is
+/// actually drawn: the generated hmtx advance and MATH italic correction, and
+/// the height and depth from the ink row of the face those glyphs come from
+/// (`ink_metrics.math`, measured from the same bytes). Consulted before the
+/// ASCII fast path and before every optical band, which describe the upright
+/// ASCII design and never the math sans-serif / monospace one — without it a
+/// `\mathsf` or `\mathtt` run advances by the 0.5em estimate while the
+/// sans-serif or monospace glyph is what gets painted.
+///
+/// A prime composite is size-aware for the same reason: at script size the
+/// face draws its unencoded alternates — the hook measures them from the
+/// real face — and this table carries the same advances for a run measured
+/// without one.
+fn generatedGlyph(cp: u21, style: atom.CharStyle, size_pt: f32) ?Glyph {
+    if (smallPrimeGlyph(cp, style, size_pt)) |g| return g;
+    const row = mappedRow(style, cp) orelse
+        math_style_metrics.lookup(math_style_metrics.primes, cp) orelse return null;
+    // `.italic` names the math face — the face every generated row is drawn
+    // from, so the ink is that face's own outline for the same codepoint.
+    const ink = faceGlyphInk(cp, .italic) orelse fallbackInk(cp, style);
+    return .{
+        .width = row.adv * em,
+        .height = ink.asc * em,
+        .depth = ink.desc * em,
+        .italic_correction = (row.ic orelse 0) * em,
+    };
+}
+
+/// Drawn size in points at and below which the prime composites are the face's
+/// unencoded alternates instead of the cmap's own. Mirrors
+/// `font.small_prime_max_size`: the ztex.layout module cannot import
+/// ztex.font, so the one number both sides gate on is stated on both sides and
+/// pinned by a test on each.
+const small_prime_max_size: f32 = 6.0;
+
+/// The script-size prime composites in em: LM Math's unencoded alternates for a
+/// run of one to four primes, on its own 0.3em advance grid — the same hmtx
+/// advances the font hook reads from the face for a run measured with one.
+fn smallPrimeEm(cp: u21) ?f32 {
+    return switch (cp) {
+        0x2032 => 0.489,
+        0x2033 => 0.789,
+        0x2034 => 1.089,
+        0x2057 => 1.389,
+        else => null,
+    };
+}
+
+/// A prime composite drawn at script size: the alternate's advance, with the
+/// face's own ink row for its height and depth. Every other codepoint, and
+/// every size above the gate, keeps the row it always had.
+fn smallPrimeGlyph(cp: u21, style: atom.CharStyle, size_pt: f32) ?Glyph {
+    if (size_pt > small_prime_max_size) return null;
+    const adv = smallPrimeEm(cp) orelse return null;
+    const ink = faceGlyphInk(cp, .italic) orelse fallbackInk(cp, style);
+    return .{
+        .width = adv * em,
+        .height = ink.asc * em,
+        .depth = ink.desc * em,
+        .italic_correction = 0,
+    };
+}
+
+/// The MATH top-accent attachment of a remapped alphabet glyph, in em: the
+/// face records one for every math sans-serif and monospace letter and digit,
+/// so a hat over `\mathsf{A}` lands where the font says instead of centred on
+/// the box. The two series occupy disjoint codepoint ranges, so the style that
+/// produced the codepoint is implied by the codepoint itself.
+fn generatedTopAccent(cp: u21) ?f32 {
+    const row = math_style_metrics.lookup(math_style_metrics.sans, cp) orelse
+        math_style_metrics.lookup(math_style_metrics.mono, cp) orelse
+        math_style_metrics.lookup(&math_style_metrics.alphabets, cp) orelse return null;
+    return row.top;
+}
+
+/// Legacy fallback rows for glyphs absent from the generated face tables.
+/// Values use the same 10pt-base convention (em × 10). No text style reaches
+/// here: `textFaceGlyph` answers every codepoint its own face carries first.
+fn tableFor(style: atom.CharStyle, size_pt: f32) []const Entry {
     const band7 = size_pt > 6.4 and size_pt < 7.6;
     const band5 = size_pt > 4.5 and size_pt < 5.5;
-    if (isRomanLetter(cp) and style == .roman) {
-        return if (band7) &table_roman7 else if (band5) &table_roman5 else &table_roman;
-    }
     if (style == .bb) {
         return &table_bb;
     }
     return if (band7) &table7 else if (band5) &table5 else &table;
 }
 
-/// Size-aware glyph lookup: at script (7pt) / scriptscript (5pt) design sizes
-/// returns the real optical-scale metrics (cmr7/cmmi7/cmsy7, cmr5/...); at
-/// any other size the 10pt `table` (linearly scaled by the layout). Roman
-/// style (`\text`/`\mathrm`) letters resolve against the cmr10 family
-/// instead of the cmmi10 math-italic rows. Values are in the 10pt-base
-/// convention (em × 10), matching `glyph`/`lookupAscii`, so callers keep
-/// using `s(v, size_pt)`. Glyphs without a script-size font (ams fonts,
-/// cmex, composites) fall back to the 10pt table, i.e. linear scaling — the
-/// same behavior as before. A wired font answers first at every size, so the
-/// measured face is the one the rasterizer draws. Only the static arm uses
-/// `table_roman17` for roman text at `size_pt >= 15`; LM Math has no optical
-/// sizes and scales linearly.
+/// Size-aware lookup in the 10pt-base convention (em × 10).
+/// A borrowed font or generated face row answers before legacy optical bands.
 pub fn glyphAt(fm: *const FontMetrics, cp: u21, style: atom.CharStyle, size_pt: f32) ?Glyph {
-    if (fontGlyph(fm, cp, style)) |g| return g;
+    if (fontGlyph(fm, cp, style, size_pt)) |g| return g;
     // A generated text face is measured by its OWN face, and it answers
     // before every optical band and the ASCII fast path below: none of
-    // those tables describe LM Roman Italic / Bold / Bold Italic.
+    // those tables describe LM Roman Regular / Italic / Bold / Bold Italic.
     if (textFaceGlyph(style, cp)) |g| return g;
-    if (style == .roman and band17(size_pt)) {
-        if (search(&table_roman17, cp)) |e| {
-            return .{ .width = e.w, .height = e.h, .depth = e.d, .italic_correction = e.ic };
-        }
-    }
+    // A codepoint the layout REMAPPED (the math sans-serif / monospace
+    // alphabets, the native triple / quadruple prime) answers before every
+    // optical band and the ASCII fast path below: none of those tables
+    // describe the glyph that gets drawn for it.
+    if (generatedGlyph(cp, style, size_pt)) |g| return g;
     // O(1) ASCII fast path (lookupAscii, wired here so layoutChar actually
-    // takes it): the LUTs derive from the 10pt `table`/`table_roman`, so
-    // they are bit-identical to the slow path ONLY outside the 7pt/5pt
-    // optical bands — the script-size tables carry their own h/d/ic. Inside
-    // the bands — and for the `.font` arm / any fm != `&default` — it
-    // returns null and the slow path below runs.
+    // takes it): the LUTs derive from the 10pt `table` and from the generated
+    // LM Roman rows, so they are bit-identical to the slow path ONLY outside
+    // the 7pt/5pt optical bands — the script-size tables carry their own
+    // h/d/ic. Inside the bands — and for the `.font` arm / any
+    // fm != `&default` — it returns null and the slow path below runs.
     const band7 = size_pt > 6.4 and size_pt < 7.6;
     const band5 = size_pt > 4.5 and size_pt < 5.5;
     if (!band7 and !band5) {
         if (lookupAscii(fm, cp, style)) |g| return g;
     }
-    if (search(tableFor(cp, style, size_pt), cp)) |e| {
+    if (search(tableFor(style, size_pt), cp)) |e| {
         return .{ .width = e.w, .height = e.h, .depth = e.d, .italic_correction = e.ic };
     }
     if (style == .bb) {
@@ -2484,6 +2333,14 @@ fn inkEdges(style: atom.CharStyle) []const ink_metrics.Edge {
     };
 }
 
+/// The real ink `cp` has in the face `style` is DRAWN from, or null when
+/// that face's cmap carries no painted glyph for it — the query a caller
+/// asks before it commits to a face for that codepoint: one face's row
+/// means the face HAS the glyph, null means it does not.
+pub fn faceGlyphInk(cp: u21, style: atom.CharStyle) ?GlyphInk {
+    return faceInk(inkEdges(style), cp);
+}
+
 /// Ink extents for a codepoint the drawing face has NO row for: an AMS-only
 /// symbol, a CJK glyph, anything its cmap does not carry. Nothing is known
 /// about the painted outline then, so this is the pre-table behaviour — the
@@ -2513,10 +2370,19 @@ pub fn glyphInk(cp: u21) GlyphInk {
 /// wider — and boxing it by the upright LM Math ink clips it, so `inkEdges`
 /// picks the face `font.FontContext.faceForStyle` draws it from: a `\text{f}`
 /// is framed by the upright face it is drawn from, not by the math-italic `f`
-/// beside it. Only a codepoint that face does not carry falls back
+/// beside it.
+///
+/// A TEXT face carries no Greek, no AMS symbol, no CJK glyph — for those the
+/// Math face's own outline is what gets painted next, so that is the frame:
+/// `\mathrm{α}` is boxed by LM Math's α, not by a roman estimate that clips
+/// its ink. Only a codepoint no bundled face carries falls back
 /// (`fallbackInk`).
 pub fn glyphInkAt(cp: u21, style: atom.CharStyle) GlyphInk {
-    return faceInk(inkEdges(style), cp) orelse fallbackInk(cp, style);
+    if (faceGlyphInk(cp, style)) |ink| return ink;
+    if (isTextFace(style)) {
+        if (faceGlyphInk(cp, .italic)) |ink| return ink;
+    }
+    return fallbackInk(cp, style);
 }
 
 /// One MATH-table vertical size variant of a delimiter (and the base entry):
@@ -2792,75 +2658,390 @@ pub fn radicalVariant(req_em: f32) usize {
     return radical_variants.len - 1; // .v4 (tallest) if none covers
 }
 
-/// LM Math's radical GlyphAssembly pieces (MATH VertGlyphConstruction).
-/// Three parts stacked TOP → BOTTOM:
-///   top  (radical.tp, the curved hook — `cp=U+F300` PUA): ink y[0,0.620]em,
-///     advance=1.056em; bottom 0.320em of its ink is the connector for the
-///     extender above.
-///   ext  (radical.ex, the vertical bar — `cp=U+F301` PUA, repeatable): ink
-///     y[0,0.640]em, advance=1.056em; full 0.640em connector on both ends
-///     (extenders stack without overlap).
-///   bot  (uni23B7 = U+23B7, the foot + bar): ink y[0,1.820]em, advance=
-///     1.056em; top 0.320em of its ink is the connector for the extender
-///     above.
-/// Measured with fontTools on latinmodern-math.otf 2.005 (BoundsPen + hmtx +
-/// MathVariants VertGlyphConstruction records); connectors from the
-/// PartRecords (StartConnectorLength, EndConnectorLength, in 1/1000 em).
-/// XeTeX's make_radical reads this GlyphAssembly and stacks top + N*ext +
-/// bot, computing N from the required radical height — same as KaTeX and
-/// MathJax, both of which use the assembly pieces instead of the pre-built
-/// variants (radical.v1..v4). The pre-built variants give a different
-/// shape; the assembly produces XeTeX's constant-stroke vertical radical.
-pub const RadicalPiece = struct {
-    cp: u21,
-    /// ink height above baseline, in em (desc=0 for all radical pieces)
-    ink_asc: f32,
-    /// Ink available for overlap at the TOP of this piece (with the piece
-    /// above it), in em. For the top piece this is 0 (nothing above); for
-    /// the extender it is 0.640em (full); for the bottom piece 0.320em.
-    connector_top: f32,
-    /// Ink available for overlap at the BOTTOM of this piece (with the
-    /// piece below it), in em. For the top piece 0.320em (overlaps with
-    /// the extender); for the extender 0.640em; for the bottom piece 0
-    /// (nothing below).
-    connector_bot: f32,
-};
-pub const radical_top_piece: RadicalPiece = .{
-    .cp = 0xF300,
-    .ink_asc = 0.620,
-    .connector_top = 0.000,
-    .connector_bot = 0.320,
-};
-pub const radical_ext_piece: RadicalPiece = .{
-    .cp = 0xF301,
-    .ink_asc = 0.640,
-    .connector_top = 0.640,
-    .connector_bot = 0.640,
-};
-pub const radical_bot_piece: RadicalPiece = .{
-    .cp = 0x23B7,
-    .ink_asc = 1.820,
-    .connector_top = 0.320,
-    .connector_bot = 0.000,
-};
 /// Advance (width) of every radical piece in em — all three share the same
 /// hmtx 1056/1000em on LM Math (the vertical bar at x=702..742 is constant
 /// across the assembly; only the hook (right) and foot (left) extend
 /// beyond it, but the advance stays 1.056em).
 pub const radical_piece_adv: f32 = 1.056;
-/// Ink extent of an assembled radical with N extenders, in em.
-/// Overlap between adjacent pieces = min(upper.connector_bot,
-/// lower.connector_top); for the radical this is always 0.320em.
-/// Total = sum(ink_asc) − (N+1) × overlap + N × (ext.ink_asc − overlap)
-///       = top.asc + N×ext.asc + bot.asc − (N+1)×0.320.
-/// Returns 0 for negative N (defensive).
-pub fn radicalAssemblyHeight(extender_count: usize) f32 {
-    const overlap = 0.320;
-    var h: f32 = radical_top_piece.ink_asc + radical_bot_piece.ink_asc;
-    h += @as(f32, @floatFromInt(extender_count)) * radical_ext_piece.ink_asc;
-    h -= (@as(f32, @floatFromInt(extender_count)) + 1.0) * overlap;
-    return h;
+
+/// The ink of one horizontal size variant, in em.
+fn rungInk(rung: math_style_metrics.Rung) GlyphInk {
+    return .{
+        .asc = rung.asc,
+        .desc = rung.desc,
+        .left = rung.left,
+        .right_edge = rung.right_edge,
+        .bottom = rung.bottom,
+    };
 }
+/// The overlap ONE connection takes: the floor the font permits, opened by the
+/// uniform `open` every join takes and never past the ceiling — the connector
+/// ink both neighbouring parts offer at the join. OpenType defines the overlap
+/// as an INTERVAL, not a fixed value: "the overlap should not be less than the
+/// minConnectorOverlap value … and it should not exceed the specified
+/// connector length for that end of the glyph". `open` 0 is therefore the
+/// floor itself: the WIDEST legal stack, and the one a repeat count has to be
+/// judged against.
+fn joinOverlap(
+    before: math_style_metrics.Part,
+    part: math_style_metrics.Part,
+    min_overlap: f32,
+    open: f32,
+) f32 {
+    const ceiling = @min(before.end_connector, part.start_connector);
+    return @min(min_overlap + open, ceiling);
+}
+
+/// How far ONE connection may open: from the floor up to the ceiling its two
+/// parts' connector material allows. Never negative — a font that asks for
+/// more overlap than it drew leaves the join where it is.
+fn joinRoom(
+    before: math_style_metrics.Part,
+    part: math_style_metrics.Part,
+    min_overlap: f32,
+) f32 {
+    const ceiling = @min(before.end_connector, part.start_connector);
+    return @max(0, ceiling - min_overlap);
+}
+
+/// One walk of an assembly's parts: the frame it paints at this repeat count
+/// and this opening, and the room its connections still have.
+const Walk = struct {
+    geometry: StretchGeometry,
+    /// the largest opening any single connection still allows
+    max_open: f32,
+};
+
+/// Walk `ladder` at `repeats` and `open`: the parts in MATH order, each
+/// advancing the next by its FullAdvance less the overlap the two share. Every
+/// part paints once, except a repeat-flagged one, which contributes `repeats`
+/// copies — zero drops it entirely, and the join between the parts that DO
+/// paint is then measured straight across it. This is the walk the reference
+/// engines paint, so the frame is the ink they draw and not a sum of nominal
+/// advances.
+fn walkAssembly(
+    ladder: math_style_metrics.Ladder,
+    repeats: usize,
+    open: f32,
+) Walk {
+    var out: Walk = .{
+        .geometry = .{ .advance_em = 0, .ink = .{ .asc = 0, .desc = 0 } },
+        .max_open = 0,
+    };
+    var previous: ?math_style_metrics.Part = null;
+    var x: f32 = 0;
+    for (ladder.parts) |part| {
+        const copies: usize = if (part.repeat) repeats else 1;
+        var copy: usize = 0;
+        while (copy < copies) : (copy += 1) {
+            if (previous) |before| {
+                // Every connection counts once: the repeated copies of one
+                // extender share their own connectors, and a dropped one
+                // leaves no join of its own to measure.
+                out.max_open = @max(
+                    out.max_open,
+                    joinRoom(before, part, ladder.min_connector_overlap),
+                );
+                x -= joinOverlap(before, part, ladder.min_connector_overlap, open);
+            }
+            // A part's `left` is ink reaching left of the part's OWN origin,
+            // so the placed span runs from x − left to x + right_edge.
+            const lo = x - part.left;
+            const hi = x + part.right_edge;
+            if (previous == null) {
+                out.geometry.ink = .{
+                    .asc = part.asc,
+                    .desc = part.desc,
+                    .left = @max(0, -lo),
+                    .right_edge = @max(0, hi),
+                    .bottom = part.bottom,
+                };
+            } else {
+                const ink = &out.geometry.ink;
+                ink.asc = @max(ink.asc, part.asc);
+                ink.desc = @max(ink.desc, part.desc);
+                ink.bottom = @min(ink.bottom, part.bottom);
+                ink.left = @min(ink.left, @max(0, lo));
+                ink.right_edge = @max(ink.right_edge, @max(0, hi));
+            }
+            x += part.adv;
+            previous = part;
+        }
+    }
+    out.geometry.advance_em = x;
+    return out;
+}
+
+/// The largest uniform opening this stack's connections allow: the one that
+/// puts every join at its own ceiling, the NARROWEST legal stack. It does not
+/// depend on `open` itself, so the walk settles at the floor.
+fn maxOpen(ladder: math_style_metrics.Ladder, repeats: usize) f32 {
+    return walkAssembly(ladder, repeats, 0).max_open;
+}
+
+/// The framed geometry of `ladder` at `repeats` and `open`.
+fn assembledStretch(
+    ladder: math_style_metrics.Ladder,
+    repeats: usize,
+    open: f32,
+) StretchGeometry {
+    return walkAssembly(ladder, repeats, open).geometry;
+}
+
+/// The last AdvanceMeasurement of a horizontal ladder that declares NO glyph
+/// assembly — the width past which the face has no design left. Null with an
+/// assembly: it reaches any width, so there is no ceiling to report, and null
+/// with an empty ladder, which names no width at all.
+fn finiteCeiling(ladder: math_style_metrics.Ladder) ?f32 {
+    if (ladder.parts.len != 0) return null;
+    if (ladder.rungs.len == 0) return null;
+    return ladder.rungs[ladder.rungs.len - 1].req;
+}
+
+/// The generated horizontal geometry for `req_em` (em): the LARGEST MATH size
+/// variant whose AdvanceMeasurement still FITS the request, else the assembly
+/// of the glyph's own parts, else — when the form declares no assembly — that
+/// same last rung, kept at its own advance. Every horizontal form reads this
+/// one rule: a ladder is a finite set of real drawings and the item takes the
+/// widest one the thing it is set on holds. Measured on this exact Latin
+/// Modern Math, XeTeX + unicode-math sizes `\widehat` over `M` (0.970em) with
+/// the 0.920em hat (ink 18.24pt at 20pt) and over `abc` (1.391em) with the
+/// 1.321em one, and draws the brace half of `\underbrace{x}` — `x` is
+/// 0.574em — as the 0.492em rung, under `xx` (1.148em) as the 0.993em one,
+/// under `xxx` (1.722em) as the 1.494em one and under `xxxxxx` (3.445em) as
+/// the 3.000em one: the largest each nucleus still holds, never the smallest
+/// that spans it. A nucleus narrower than every rung keeps the base drawing,
+/// and a nucleus wider than every one of them is past the ladder, where the
+/// MATH spec builds the item itself: the SMALLEST repeat count whose WIDEST
+/// legal stack — the extenders dropped first, every connection at the
+/// MinConnectorOverlap floor — reaches the request, then every connection
+/// opened by the SAME amount, as little as that request allows. A request no
+/// legal stack reaches keeps the narrowest one instead: the joins are never
+/// torn to cover it. Only a codepoint with no size construction at all is null
+/// — there is no native form to fall back to.
+fn staticStretch(cp: u21, req_em: f32) ?StretchGeometry {
+    const ladder = math_style_metrics.ladder(cp) orelse return null;
+    if (ladder.rungs.len == 0) return null;
+    // The widest rung the request still holds: the one an item draws.
+    var chosen = ladder.rungs[0];
+    for (ladder.rungs) |rung| {
+        if (rung.req > req_em) break;
+        chosen = rung;
+    }
+    // The ladder answers the request itself when some rung is at least as wide
+    // as it; only a request WIDER than every rung is a width the face drew no
+    // variant for, and the only one that reaches the assembly. A form with no
+    // assembly at all answers from the ladder whatever it asks for.
+    if (req_em <= ladder.rungs[ladder.rungs.len - 1].req or ladder.parts.len == 0) {
+        return .{
+            .advance_em = chosen.adv,
+            .ink = rungInk(chosen),
+            .finite_ceiling_em = finiteCeiling(ladder),
+        };
+    }
+    var repeats: usize = 0;
+    var widest = assembledStretch(ladder, repeats, 0).advance_em;
+    while (widest < req_em) {
+        const grown = assembledStretch(ladder, repeats + 1, 0).advance_em;
+        // An extender that does not advance can never reach the request.
+        if (grown <= widest) break;
+        repeats += 1;
+        widest = grown;
+    }
+    return assembledStretch(
+        ladder,
+        repeats,
+        openFor(ladder, repeats, req_em) orelse maxOpen(ladder, repeats),
+    );
+}
+
+/// The largest uniform opening that makes the `repeats`-copy stack cover
+/// `req_em`, or null when no opening of it does — a request past the widest
+/// frame these parts can build. Opening a connection hands width back, so the
+/// stack's advance falls monotonically with the opening and the boundary is
+/// bisected; f32 carries a 24-bit significand, so 32 halvings of an em-scaled
+/// interval land below the resolution of the measurement.
+fn openFor(ladder: math_style_metrics.Ladder, repeats: usize, req_em: f32) ?f32 {
+    const most = maxOpen(ladder, repeats);
+    // Nothing opened is the floor: the widest this count of parts can be, and
+    // a request past it has no answer at this count.
+    if (assembledStretch(ladder, repeats, 0).advance_em < req_em) return null;
+    // A request even the narrowest frame covers takes the whole opening rather
+    // than tearing the joins past the material they were drawn with.
+    if (assembledStretch(ladder, repeats, most).advance_em >= req_em) return most;
+    var lo: f32 = 0;
+    var hi: f32 = most;
+    for (0..32) |_| {
+        const mid = (lo + hi) / 2;
+        if (assembledStretch(ladder, repeats, mid).advance_em >= req_em) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+/// The horizontal form of `cp` for a nucleus `req_em` wide (em) — a wide
+/// `\widehat`, a `\widetilde`, the half of an over/under brace — as the advance
+/// it reserves and the ink it paints. Every form is FITTED to the nucleus: the
+/// widest rung of its own horizontal ladder that the nucleus still holds, and
+/// only a request past that whole ladder assembles.
+/// A wired font answers through `FontHook.horizontal_glyph` first, so both
+/// branches frame the outline the renderer draws; that callback's null and its
+/// errors are final. With no callback, and on the static arm, the answer is the
+/// generated ladder and assembly of `math_style_metrics.zig`: measured tables,
+/// no font, no allocation, no failure.
+pub fn horizontalGlyph(
+    fm: *const FontMetrics,
+    cp: u21,
+    req_em: f32,
+) StretchError!?StretchGeometry {
+    switch (fm.*) {
+        .font => |hook| {
+            if (hook.horizontal_glyph) |resolve| {
+                return try resolve(hook.ctx, cp, req_em);
+            }
+        },
+        .static => {},
+    }
+    return staticStretch(cp, req_em);
+}
+
+const VerticalWalk = struct {
+    extent_em: f32 = 0,
+    opened: f32 = 0,
+    max_open: f32 = 0,
+    geometry: StretchGeometry = .{
+        .advance_em = 0,
+        .ink = .{ .asc = 0, .desc = 0 },
+    },
+};
+
+fn walkVertical(
+    ladder: math_style_metrics.VerticalLadder,
+    repeats: usize,
+    open: f32,
+) VerticalWalk {
+    var out: VerticalWalk = .{};
+    var previous: ?math_style_metrics.VerticalPart = null;
+    var rise: f32 = 0;
+    var low = std.math.inf(f32);
+    var high = -std.math.inf(f32);
+    var first_bottom: ?f32 = null;
+    var last_top: f32 = 0;
+    var last_advance: f32 = 0;
+    for (ladder.parts) |part| {
+        const copies = if (part.repeat) repeats else 1;
+        for (0..copies) |_| {
+            if (previous) |before| {
+                const ceiling = @min(before.end, part.start);
+                const room = @max(0, ceiling - math_style_metrics.min_connector_overlap);
+                const overlap = @min(math_style_metrics.min_connector_overlap + open, ceiling);
+                out.extent_em -= overlap;
+                out.opened += @min(open, room);
+                out.max_open = @max(out.max_open, room);
+                rise -= overlap;
+            }
+            const bottom = if (part.desc > 0) -part.desc else part.bottom;
+            if (first_bottom == null) first_bottom = bottom;
+            low = @min(low, rise + bottom);
+            high = @max(high, rise + part.asc);
+            out.geometry.advance_em = @max(out.geometry.advance_em, part.width);
+            out.geometry.ink.left = @max(out.geometry.ink.left, part.left);
+            out.geometry.ink.right_edge = @max(out.geometry.ink.right_edge, part.right_edge);
+            last_top = part.asc;
+            last_advance = part.adv;
+            rise += part.adv;
+            previous = part;
+        }
+        out.extent_em += @as(f32, @floatFromInt(copies)) * part.adv;
+    }
+    if (first_bottom) |bottom| {
+        const last_rise = out.extent_em - last_advance;
+        const shift = math_style_metrics.axis_height - (bottom + last_rise + last_top) / 2;
+        out.geometry.ink.asc = @max(0, high + shift);
+        out.geometry.ink.desc = @max(0, -low - shift);
+        out.geometry.ink.bottom = @max(0, low + shift);
+    }
+    return out;
+}
+
+fn verticalOpening(
+    ladder: math_style_metrics.VerticalLadder,
+    repeats: usize,
+    excess: f32,
+) f32 {
+    const widest = walkVertical(ladder, repeats, 0);
+    if (excess <= 0 or widest.max_open <= 0) return 0;
+    if (walkVertical(ladder, repeats, widest.max_open).opened < excess) {
+        return widest.max_open;
+    }
+    var lo: f32 = 0;
+    var hi = widest.max_open;
+    for (0..32) |_| {
+        const mid = (lo + hi) / 2;
+        if (walkVertical(ladder, repeats, mid).opened < excess) lo = mid else hi = mid;
+    }
+    return hi;
+}
+
+fn staticVertical(
+    cp: u21,
+    form: u8,
+    assembly_req: f32,
+    fixed_req: f32,
+) ?StretchGeometry {
+    for (math_style_metrics.verticals) |ladder| {
+        if (ladder.cp != cp) continue;
+        if (assembly_req > 0 and ladder.parts.len > 0) {
+            var repeats: usize = 0;
+            var widest = walkVertical(ladder, repeats, 0);
+            while (widest.extent_em < assembly_req) {
+                const grown = walkVertical(ladder, repeats + 1, 0);
+                if (grown.extent_em <= widest.extent_em) break;
+                repeats += 1;
+                widest = grown;
+            }
+            return walkVertical(
+                ladder,
+                repeats,
+                verticalOpening(ladder, repeats, widest.extent_em - assembly_req),
+            ).geometry;
+        }
+        var rung = ladder.base;
+        if (form > 0 and form <= ladder.rungs.len) {
+            rung = ladder.rungs[form - 1];
+        } else if (form == 0 and fixed_req > 0) {
+            for (ladder.rungs) |candidate| {
+                rung = candidate;
+                if (rung.req >= fixed_req) break;
+            }
+        }
+        return .{ .advance_em = rung.adv, .ink = rungInk(rung) };
+    }
+    return null;
+}
+
+/// The bounds of the same vertical request the SVG and CPU backends resolve.
+pub fn verticalGlyph(
+    fm: *const FontMetrics,
+    cp: u21,
+    form: u8,
+    assembly_req: f32,
+    fixed_req: f32,
+) StretchError!?StretchGeometry {
+    switch (fm.*) {
+        .font => |hook| {
+            if (hook.vertical_glyph) |resolve| {
+                return try resolve(hook.ctx, cp, form, assembly_req, fixed_req);
+            }
+        },
+        .static => {},
+    }
+    return staticVertical(cp, form, assembly_req, fixed_req);
+}
+
 /// Horizontal position of a glyph's TOP-ACCENT ATTACHMENT point, in em
 /// right of the glyph origin — the MATH-table MathTopAccentAttachment
 /// (fontTools on latinmodern-math.otf 2.005). XeTeX+unicode-math places an
@@ -2928,6 +3109,20 @@ const accent_attach = [_]struct { cp: u21, a: f32 }{
     .{ .cp = 0x0078, .a = 0.258 }, // x
     .{ .cp = 0x0079, .a = 0.264 }, // y
     .{ .cp = 0x007A, .a = 0.226 }, // z
+    // The COMBINING MARKS' own TopAccentAttachment, from the same LM Math MATH
+    // table. A mark's attachment is where it wants the base's attachment to
+    // land, and it is NOT the ink centre: every mark has a zero advance with
+    // its whole ink left of the origin, so `right_edge` clamps to 0 and the
+    // ink centre (left/2) lands 0.041em off for U+0302. The font arm reads the
+    // real value; this is the face-less fallback the placement site shares.
+    .{ .cp = 0x0300, .a = -0.295 }, // combining grave
+    .{ .cp = 0x0301, .a = -0.233 }, // combining acute
+    .{ .cp = 0x0302, .a = -0.264 }, // combining circumflex (\hat)
+    .{ .cp = 0x0303, .a = -0.264 }, // combining tilde (\tilde, \widetilde)
+    .{ .cp = 0x0304, .a = -0.263 }, // combining macron (\bar)
+    .{ .cp = 0x0307, .a = -0.265 }, // combining dot above (\dot)
+    .{ .cp = 0x0308, .a = -0.261 }, // combining diaeresis (\ddot)
+    .{ .cp = 0x030C, .a = -0.264 }, // combining caron
     .{ .cp = 0x0131, .a = 0.139 }, // ı
     .{ .cp = 0x0237, .a = 0.153 }, // ȷ
     .{ .cp = 0x03B1, .a = 0.356 }, // α
@@ -3047,6 +3242,9 @@ const accent_attach = [_]struct { cp: u21, a: f32 }{
 
 /// The top-accent attachment of an accent base codepoint, in em (null when
 /// the codepoint has no row — the layout then centers the accent on the box).
+/// The hand-measured rows cover the upright and math-italic designs; the
+/// math sans-serif and monospace glyphs are drawn from the same face and
+/// carry their own recorded attachment, which the generated rows answer.
 pub fn accentAttach(cp: u21) ?f32 {
     var lo: usize = 0;
     var hi: usize = accent_attach.len;
@@ -3059,7 +3257,7 @@ pub fn accentAttach(cp: u21) ?f32 {
         }
     }
     if (lo < accent_attach.len and accent_attach[lo].cp == cp) return accent_attach[lo].a;
-    return null;
+    return generatedTopAccent(cp);
 }
 
 /// Em size at the base font size (10pt), used by `glyphEstimate`.
@@ -3067,11 +3265,12 @@ const em: f32 = 10.0;
 
 /// Font-arm dispatch for the `glyph`/`glyphAt` fallback chain: the `.font`
 /// arm answers from the real font via its hook, `.static` has no font path
-/// (the static tables answer there).
-fn fontGlyph(fm: *const FontMetrics, cp: u21, style: atom.CharStyle) ?Glyph {
+/// (the static tables answer there). `size_pt` is the drawn size the hook
+/// resolves its glyph against.
+fn fontGlyph(fm: *const FontMetrics, cp: u21, style: atom.CharStyle, size_pt: f32) ?Glyph {
     return switch (fm.*) {
         .static => null,
-        .font => |hook| hook.glyph(hook.ctx, cp, style),
+        .font => |hook| hook.glyph(hook.ctx, cp, style, size_pt),
     };
 }
 
@@ -3081,25 +3280,25 @@ fn fontGlyph(fm: *const FontMetrics, cp: u21, style: atom.CharStyle) ?Glyph {
 /// bundled tables — the fallback chain layout relies on: font → static
 /// table → glyphEstimate.
 fn glyphImpl(fm: *const FontMetrics, cp: u21, style: atom.CharStyle) ?Glyph {
-    if (fontGlyph(fm, cp, style)) |g| return g;
+    if (fontGlyph(fm, cp, style, em)) |g| return g;
     return staticGlyph(cp, style);
 }
 
-/// Static-table lookup at the 10pt base. Binary search over the table
-/// selected by `style` (see `tableFor`): roman-style letters come from
-/// `table_roman` (cmr10), everything else from `table` (cmmi10 letters,
-/// cmsy10/cmr10 symbols). Italic correction falls back to these rows only
-/// when the active face supplies no MATH value.
+/// Static-table lookup at the 10pt base. A text face answers from its OWN
+/// generated row first, then a remapped alphabet glyph, then the O(1) ASCII
+/// LUT, and only then the binary search over `tableFor`. Italic correction
+/// falls back to these rows only when the active face supplies no MATH value.
 pub fn staticGlyph(cp: u21, style: atom.CharStyle) ?Glyph {
     if (textFaceGlyph(style, cp)) |g| return g;
+    // A codepoint the layout REMAPPED (the math sans-serif / monospace
+    // alphabets, the native triple / quadruple prime) answers before the
+    // ASCII fast path and every optical band below: those describe the
+    // upright ASCII design, which is not the glyph this run draws.
+    if (generatedGlyph(cp, style, em)) |g| return g;
     if (cp < 128) {
-        if (isRomanLetter(cp) and style == .roman) {
-            if (roman_ascii_lut[cp]) |g| return g;
-        } else {
-            if (ascii_lut[cp]) |g| return g;
-        }
+        if (ascii_lut[cp]) |g| return g;
     }
-    const tbl = tableFor(cp, style, 0);
+    const tbl = tableFor(style, 0);
     var lo: usize = 0;
     var hi: usize = tbl.len;
     while (lo < hi) {
@@ -3133,7 +3332,7 @@ pub fn staticGlyph(cp: u21, style: atom.CharStyle) ?Glyph {
 pub fn hasGlyph(fm: *const FontMetrics, cp: u21, style: atom.CharStyle) bool {
     return switch (fm.*) {
         .static => staticGlyph(cp, style) != null,
-        .font => |hook| hook.glyph(hook.ctx, cp, style) != null,
+        .font => |hook| hook.glyph(hook.ctx, cp, style, em) != null,
     };
 }
 
@@ -3152,12 +3351,15 @@ const ascii_lut = blk: {
     break :blk lut;
 };
 
-/// Roman-style counterpart of `ascii_lut`, derived from `table_roman`
-/// (cmr10 letters). `lookupAscii` uses it when `style` is `.roman`.
+/// Roman-style counterpart of `ascii_lut`, derived from the generated LM
+/// Roman regular rows (`roman_style_metrics.roman`) — the face `.roman` is
+/// actually drawn from, so every entry is exactly what `textFaceGlyph` and
+/// `staticGlyph` return for that style. Slots the face does not carry stay
+/// null and the caller falls through to the legacy tables.
 const roman_ascii_lut = blk: {
     var lut: [128]?Glyph = undefined;
     for (&lut) |*slot| slot.* = null;
-    for (table_roman) |e| {
+    for (roman_style_metrics.roman) |e| {
         if (e.cp < 128) {
             lut[e.cp] = .{ .width = e.w, .height = e.h, .depth = e.d, .italic_correction = e.ic };
         }
@@ -3170,13 +3372,13 @@ const roman_ascii_lut = blk: {
 /// path outside the 7pt/5pt optical bands (where the script-size tables
 /// would answer). Returns null unless `fm` is exactly the bundled `default`
 /// and `cp < 128` (including ASCII codepoints absent from the table), so
-/// callers fall through to `glyph` otherwise. Roman-style letters resolve
-/// from `table_roman` (cmr10), everything else from `table`, matching
-/// `glyph`/`glyphAt`.
+/// callers fall through to `glyph` otherwise. The `.roman` style resolves
+/// from the generated LM Roman face row, everything else from `table`,
+/// matching `glyph`/`glyphAt`/`staticGlyph`.
 pub fn lookupAscii(fm: *const FontMetrics, cp: u21, style: atom.CharStyle) ?Glyph {
     if (fm != &default) return null;
     if (cp >= 128) return null;
-    if (isRomanLetter(cp) and style == .roman) return roman_ascii_lut[cp];
+    if (style == .roman) return roman_ascii_lut[cp];
     return ascii_lut[cp];
 }
 
@@ -3304,7 +3506,7 @@ pub fn fontItalicCorrection(fm: *const FontMetrics, cp: u21, style: atom.CharSty
         .static => return null,
         .font => |h| h,
     };
-    const g = hook.glyph(hook.ctx, cp, style) orelse return null;
+    const g = hook.glyph(hook.ctx, cp, style, em) orelse return null;
     return g.italic_correction;
 }
 
@@ -3319,7 +3521,7 @@ pub fn fontTopAccentAttachment(fm: *const FontMetrics, cp: u21, style: atom.Char
         .static => return null,
         .font => |h| h,
     };
-    const g = hook.glyph(hook.ctx, cp, style) orelse return null;
+    const g = hook.glyph(hook.ctx, cp, style, em) orelse return null;
     const attachment = g.top_accent_attachment orelse return null;
     return attachment / em;
 }
@@ -3456,53 +3658,6 @@ test "metrics: every roleOfCp math symbol resolves with real CM metrics" {
     }
 }
 
-test "metrics: corpus relation/bin widths are exact Latin-Modern-Math advances" {
-    // Widths (pt at 10pt = em x 10) are the hmtx advances of
-    // latinmodern-math.otf (fontTools, unitsPerEm 1000) - the font the SVG
-    // actually draws - so layout advance == rendered advance. The old CM
-    // widths (cmsy10/cmmi10 slots) differed by up to 0.39em (sum) and are
-    // preserved in git history.
-    const cases = [_]struct { cp: u21, w: f32 }{
-        .{ .cp = 0x2192, .w = 10 }, // -> LM 1em
-        .{ .cp = 0x2264, .w = 7.78 }, // <= LM 0.778em
-        .{ .cp = 0x2260, .w = 7.78 }, // != LM 0.778em
-        .{ .cp = 0x223C, .w = 7.73 }, // ~ LM 0.773em
-        .{ .cp = 0x2286, .w = 7.78 }, // subset= LM 0.778em
-        .{ .cp = 0x2248, .w = 7.73 }, // ~~ LM 0.773em
-        .{ .cp = 0x00B1, .w = 7.78 }, // +- LM 0.778em
-        .{ .cp = 0x00B7, .w = 2.78 }, // . LM 0.278em
-        .{ .cp = 0x22C5, .w = 2.78 }, // cdot LM 0.278em
-        .{ .cp = 0x2208, .w = 6.67 }, // in LM 0.667em
-        .{ .cp = 0x2209, .w = 6.67 }, // notin LM 0.667em
-        .{ .cp = 0x221E, .w = 10 }, // infty LM 1em
-        .{ .cp = 0x221D, .w = 7.78 }, // propto LM 0.778em
-        .{ .cp = 0x2220, .w = 7.78 }, // angle LM 0.778em
-        .{ .cp = 0x2207, .w = 8.33 }, // nabla LM 0.833em
-        .{ .cp = 0x2202, .w = 5.86 }, // partial LM 0.586em
-        .{ .cp = 0x221A, .w = 8.33 }, // surd LM 0.833em
-        .{ .cp = 0x2032, .w = 3.11 }, // prime LM 0.311em
-        .{ .cp = 0x2205, .w = 5 }, // emptyset LM 0.5em
-        .{ .cp = 0x2229, .w = 6.67 }, // cap LM 0.667em
-        .{ .cp = 0x222A, .w = 6.67 }, // cup LM 0.667em
-        .{ .cp = 0x2297, .w = 7.78 }, // otimes LM 0.778em
-        .{ .cp = 0x2299, .w = 7.78 }, // odot LM 0.778em
-        .{ .cp = 0x2282, .w = 7.78 }, // subset LM 0.778em
-        .{ .cp = 0x2283, .w = 7.78 }, // supset LM 0.778em
-        .{ .cp = 0x226A, .w = 10 }, // ll LM 1em
-        .{ .cp = 0x226B, .w = 10 }, // gg LM 1em
-        .{ .cp = 0x22EF, .w = 7.76 }, // cdots LM 0.776em
-        .{ .cp = 0x27E8, .w = 3.89 }, // langle LM 0.389em
-        .{ .cp = 0x27E9, .w = 3.89 }, // rangle LM 0.389em
-        .{ .cp = 0x21A6, .w = 9.77 }, // mapsto LM 0.977em
-        .{ .cp = 0x27F6, .w = 14.63 }, // longrightarrow LM 1.463em
-    };
-    for (cases) |c| {
-        const g = glyph(&default, c.cp, .roman) orelse
-            return error.TestUnexpectedResult;
-        try testing.expectApproxEqAbs(c.w, g.width, 0.001);
-    }
-}
-
 test "metrics: relation/bin symbols beat the glyphEstimate width" {
     // The glyphEstimate fallback width is 0.5em = 5.0pt at 10pt. The real
     // LM Math advances of the corpus's widest symbols are materially
@@ -3524,272 +3679,6 @@ test "metrics: relation/bin symbols beat the glyphEstimate width" {
     }
 }
 
-test "metrics: remaining glyphEstimate-fallback symbols resolve with real LM Math advances" {
-    // Previously missing common symbols that fell back to glyphEstimate's
-    // 0.5em = 5.0pt width. Each must now resolve from the table with its
-    // exact Latin-Modern-Math advance (em x 10, hmtx / unitsPerEm x 10).
-    const cases = [_]struct { cp: u21, w: f32 }{
-        .{ .cp = 0x23, .w = 8.33 }, // # LM 0.833em
-        .{ .cp = 0x24, .w = 5 }, // $ LM 0.5em
-        .{ .cp = 0x25, .w = 8.33 }, // % LM 0.833em
-        .{ .cp = 0x26, .w = 7.78 }, // & LM 0.778em
-        .{ .cp = 0x5F, .w = 3.33 }, // _ LM 0.333em
-        .{ .cp = 0x00AC, .w = 6.67 }, // neg LM 0.667em
-        .{ .cp = 0x2026, .w = 8.37 }, // ldots LM 0.837em
-        .{ .cp = 0x2111, .w = 5.54 }, // Im LM 0.554em
-        .{ .cp = 0x2113, .w = 4.17 }, // ell LM 0.417em
-        .{ .cp = 0x2118, .w = 6.36 }, // wp LM 0.636em
-        .{ .cp = 0x211C, .w = 8.28 }, // Re LM 0.828em
-        .{ .cp = 0x2135, .w = 6.11 }, // aleph LM 0.611em
-        .{ .cp = 0x2200, .w = 6.66 }, // forall LM 0.666em
-        .{ .cp = 0x2203, .w = 5.56 }, // exists LM 0.556em
-        .{ .cp = 0x22A4, .w = 7.78 }, // top LM 0.778em
-    };
-    for (cases) |c| {
-        const g = glyph(&default, c.cp, .roman) orelse
-            return error.TestUnexpectedResult;
-        try testing.expectApproxEqAbs(c.w, g.width, 0.001);
-        try testing.expect(g.height + g.depth > 0.0);
-    }
-    // The wide ones must beat the glyphEstimate 5.0pt width; the narrow
-    // ones (\ell 4.17, _ 3.33) are deliberately real, not estimated.
-    // ($ is exactly 0.5em = 5.0pt in LM Math, so it is not in this list.)
-    const wide = [_]u21{
-        0x23,   0x25,   0x26,   0x00AC, 0x2026, 0x2111, 0x2118,
-        0x211C, 0x2135, 0x2200, 0x2203, 0x22A4,
-    };
-    for (wide) |cp| {
-        const g = glyph(&default, cp, .roman) orelse
-            return error.TestUnexpectedResult;
-        try testing.expect(g.width > 5.0);
-    }
-}
-
-test "metrics: the 65 glyphEstimate-gap codepoints resolve with real LM Math advances" {
-    // The remaining glyphEstimate fallbacks. Each must resolve with its
-    // exact Latin-Modern-Math advance (em x 10 at 10pt,
-    // hmtx / unitsPerEm x 10, fontTools on latinmodern-math.otf - replacing
-    // the TFM-verified Computer-Modern widths; the codepoints LM Math does
-    // not cover - digamma, triangleright/left, baruparrow, blacklozenge -
-    // keep their CM widths so the fallback font's advance stays close).
-    const cases = [_]struct { cp: u21, w: f32 }{
-        .{ .cp = 0x03B6, .w = 5.3 }, // zeta LM 0.53em
-        .{ .cp = 0x03B7, .w = 5.3 }, // eta LM 0.53em
-        .{ .cp = 0x03B9, .w = 3.08 }, // iota LM 0.308em
-        .{ .cp = 0x03BA, .w = 5.3 }, // kappa LM 0.53em
-        .{ .cp = 0x03BD, .w = 5.02 }, // nu LM 0.502em
-        .{ .cp = 0x03BE, .w = 5.3 }, // xi LM 0.53em
-        .{ .cp = 0x03BF, .w = 5 }, // omicron LM 0.5em
-        .{ .cp = 0x03C1, .w = 4.88 }, // rho LM 0.488em
-        .{ .cp = 0x03C2, .w = 4.74 }, // varsigma LM 0.474em
-        .{ .cp = 0x03C4, .w = 5.3 }, // tau LM 0.53em
-        .{ .cp = 0x03C5, .w = 5.3 }, // upsilon LM 0.53em
-        .{ .cp = 0x03C7, .w = 6.41 }, // chi LM 0.641em
-        .{ .cp = 0x03C8, .w = 6.41 }, // psi LM 0.641em
-        .{ .cp = 0x03D1, .w = 5.3 }, // vartheta LM 0.53em
-        .{ .cp = 0x03D5, .w = 6.41 }, // varphi LM 0.641em
-        .{ .cp = 0x03D6, .w = 8.36 }, // varpi LM 0.836em
-        .{ .cp = 0x03F1, .w = 4.88 }, // varrho LM 0.488em
-        .{ .cp = 0x03F5, .w = 4.14 }, // varepsilon LM 0.414em
-        .{ .cp = 0x039E, .w = 6.67 }, // Xi LM 0.667em
-        .{ .cp = 0x03A5, .w = 7.78 }, // Upsilon LM 0.778em
-        .{ .cp = 0x03A8, .w = 7.78 }, // Psi LM 0.778em
-        .{ .cp = 0x03D8, .w = 7.77781 }, // digamma (not in LM Math; CM kept)
-        .{ .cp = 0x0131, .w = 2.78 }, // imath LM 0.278em
-        .{ .cp = 0x0237, .w = 3.06 }, // jmath LM 0.306em
-        .{ .cp = 0x210F, .w = 5.76 }, // hbar LM 0.576em
-        .{ .cp = 0x2127, .w = 7.22 }, // mho LM 0.722em
-        .{ .cp = 0x00F0, .w = 5 }, // eth LM 0.5em
-        .{ .cp = 0x25B3, .w = 9.68 }, // triangle LM 0.968em
-        .{ .cp = 0x25BD, .w = 9.68 }, // bigtriangledown LM 0.968em
-        .{ .cp = 0x25A1, .w = 7.78 }, // square LM 0.778em
-        .{ .cp = 0x25A0, .w = 7.78 }, // blacksquare LM 0.778em
-        .{ .cp = 0x25CA, .w = 5.72 }, // lozenge LM 0.572em
-        .{ .cp = 0x29EB, .w = 6.66669 }, // blacklozenge (not in LM Math; CM kept)
-        .{ .cp = 0x2713, .w = 8.33 }, // checkmark LM 0.833em
-        .{ .cp = 0x2660, .w = 7.78 }, // spadesuit LM 0.778em
-        .{ .cp = 0x2661, .w = 7.78 }, // heartsuit LM 0.778em
-        .{ .cp = 0x2662, .w = 7.78 }, // diamondsuit LM 0.778em
-        .{ .cp = 0x2663, .w = 7.78 }, // clubsuit LM 0.778em
-        .{ .cp = 0x266D, .w = 3.88 }, // flat LM 0.388em
-        .{ .cp = 0x266E, .w = 3.88 }, // natural LM 0.388em
-        .{ .cp = 0x266F, .w = 3.88 }, // sharp LM 0.388em
-        .{ .cp = 0x00A7, .w = 4.44 }, // S LM 0.444em
-        .{ .cp = 0x00B6, .w = 6.11 }, // P LM 0.611em
-        .{ .cp = 0x00A3, .w = 7.5 }, // pounds LM 0.75em
-        .{ .cp = 0x00A5, .w = 7.5 }, // yen LM 0.75em
-        .{ .cp = 0x00A9, .w = 6.83 }, // copyright LM 0.683em
-        .{ .cp = 0x2221, .w = 7.78 }, // measuredangle LM 0.778em
-        .{ .cp = 0x2222, .w = 7.78 }, // sphericalangle LM 0.778em
-        .{ .cp = 0x2035, .w = 3.11 }, // backprime LM 0.311em
-        .{ .cp = 0x2204, .w = 5.56 }, // nexists LM 0.556em
-        .{ .cp = 0x2241, .w = 7.73 }, // nsim LM 0.773em
-        .{ .cp = 0x2246, .w = 7.78 }, // simneqq LM 0.778em
-        .{ .cp = 0x2247, .w = 7.78 }, // ncong LM 0.778em
-        .{ .cp = 0x2249, .w = 7.73 }, // napprox LM 0.773em
-        .{ .cp = 0x2270, .w = 7.78 }, // nleq LM 0.778em
-        .{ .cp = 0x2271, .w = 7.78 }, // ngeq LM 0.778em
-        .{ .cp = 0x2288, .w = 7.78 }, // nsubseteq LM 0.778em
-        .{ .cp = 0x2289, .w = 7.78 }, // nsupseteq LM 0.778em
-        .{ .cp = 0x22D8, .w = 12.85 }, // lll LM 1.285em
-        .{ .cp = 0x22D9, .w = 12.85 }, // ggg LM 1.285em
-        .{ .cp = 0x21A3, .w = 11.92 }, // rightarrowtail LM 1.192em
-        .{ .cp = 0x21C4, .w = 10.18 }, // rightleftarrows LM 1.018em
-        .{ .cp = 0x2215, .w = 5.68 }, // diagup LM 0.568em
-        .{ .cp = 0x2A2F, .w = 7.78 }, // times LM 0.778em
-        .{ .cp = 0x2912, .w = 5.00002 }, // baruparrow (not in LM Math; CM kept)
-    };
-    for (cases) |c| {
-        const g = glyph(&default, c.cp, .roman) orelse
-            return error.TestUnexpectedResult;
-        try testing.expectApproxEqAbs(c.w, g.width, 0.001);
-        try testing.expect(g.height + g.depth > 0.0);
-    }
-    // The wide ones must beat the glyphEstimate 5.0pt width (narrow ones -
-    // iota 3.08, jmath 3.06, backprime 3.11, flat 3.88 - are deliberately
-    // real, not estimated).
-    const wide = [_]u21{
-        0x03C8, 0x03D6, 0x039E, 0x03A5, 0x03A8, 0x03D8, 0x210F, 0x2127,
-        0x25B3, 0x25BD, 0x25A1, 0x25A0, 0x25CA, 0x29EB, 0x2713, 0x2660,
-        0x2661, 0x2662, 0x2663, 0x00A3, 0x00A5, 0x00A9, 0x00B6, 0x2221,
-        0x2222, 0x2204, 0x2241, 0x2246, 0x2247, 0x2249, 0x2270, 0x2271,
-        0x2288, 0x2289, 0x22D8, 0x22D9, 0x21A3, 0x21C4, 0x2215, 0x2A2F,
-    };
-    for (wide) |cp| {
-        const g = glyph(&default, cp, .roman) orelse
-            return error.TestUnexpectedResult;
-        try testing.expect(g.width > 5.0);
-    }
-}
-
-test "metrics: roman style letters use LM Math advances, roman = italic" {
-    // \text/\mathrm are TeX family 0 = cmr10; math (italic) letters are
-    // cmmi10. LM Math is a single OTF: the advance of a letter is the same
-    // regardless of the style flag (roman/italic is a font-style switch to
-    // the same font), so roman and italic rows now agree - the old cmr10 vs
-    // cmmi10 split (e.g. 'f' +1.84pt at 10pt) is gone. Widths are the LM
-    // advances (em x 10 at 10pt).
-    const cases = [_]struct { cp: u21, roman: f32, italic: f32 }{
-        .{ .cp = 'a', .roman = 5.0, .italic = 5.0 },
-        .{ .cp = 'b', .roman = 5.56, .italic = 5.56 },
-        .{ .cp = 'c', .roman = 4.44, .italic = 4.44 },
-        .{ .cp = 'f', .roman = 3.06, .italic = 3.06 },
-        .{ .cp = 'i', .roman = 2.78, .italic = 2.78 },
-        .{ .cp = 'j', .roman = 3.06, .italic = 3.06 },
-        .{ .cp = 'h', .roman = 5.56, .italic = 5.56 },
-        .{ .cp = 'T', .roman = 7.22, .italic = 7.22 },
-        .{ .cp = 'V', .roman = 7.5, .italic = 7.5 },
-        .{ .cp = 'W', .roman = 10.28, .italic = 10.28 },
-        .{ .cp = 'Y', .roman = 7.5, .italic = 7.5 },
-        .{ .cp = 'H', .roman = 7.5, .italic = 7.5 },
-        .{ .cp = 'K', .roman = 7.78, .italic = 7.78 },
-    };
-    for (cases) |c| {
-        const r = glyph(&default, c.cp, .roman) orelse
-            return error.TestUnexpectedResult;
-        const i = glyph(&default, c.cp, .italic) orelse
-            return error.TestUnexpectedResult;
-        try testing.expectApproxEqAbs(c.roman, r.width, 0.001);
-        try testing.expectApproxEqAbs(c.italic, i.width, 0.001);
-    }
-    // \mathrm{ab} = LM a+b; "hello" = LM h+e+l+l+o (10.56 and 20.56).
-    var ab: f32 = 0;
-    for ("ab") |ch| ab += (glyph(&default, ch, .roman) orelse
-        return error.TestUnexpectedResult).width;
-    try testing.expectApproxEqAbs(@as(f32, 10.56), ab, 0.001);
-    var hello: f32 = 0;
-    for ("hello") |ch| hello += (glyph(&default, ch, .roman) orelse
-        return error.TestUnexpectedResult).width;
-    try testing.expectApproxEqAbs(@as(f32, 20.56), hello, 0.001);
-    var hello_italic: f32 = 0;
-    for ("hello") |ch| hello_italic += (glyph(&default, ch, .italic) orelse
-        return error.TestUnexpectedResult).width;
-    try testing.expectApproxEqAbs(@as(f32, 20.56), hello_italic, 0.001);
-}
-
-test "metrics: roman letters at script sizes scale the LM Math advance" {
-    // glyphAt at the 7pt/5pt bands: roman letters resolve against the same
-    // LM Math advance (em x 10) and the layout's size_pt/10 factor yields
-    // 0.7x/0.5x at 7pt/5pt - LM Math has no optical sizes, so the old
-    // cmr7/cmr5 optical values (5.69447 / 6.80567 for 'a') are gone.
-    const a7 = glyphAt(&default, 'a', .roman, 7.0) orelse
-        return error.TestUnexpectedResult;
-    try testing.expectApproxEqAbs(@as(f32, 5.0), a7.width, 0.001); // LM a
-    const a7i = glyphAt(&default, 'a', .italic, 7.0) orelse
-        return error.TestUnexpectedResult;
-    try testing.expectApproxEqAbs(@as(f32, 5.0), a7i.width, 0.001); // LM a
-    const a5 = glyphAt(&default, 'a', .roman, 5.0) orelse
-        return error.TestUnexpectedResult;
-    try testing.expectApproxEqAbs(@as(f32, 5.0), a5.width, 0.001); // LM a
-    // lookupAscii fast path agrees with glyph for roman letters.
-    const fast = lookupAscii(&default, 'a', .roman) orelse
-        return error.TestUnexpectedResult;
-    try testing.expectApproxEqAbs(@as(f32, 5.0), fast.width, 0.001);
-    const fast_i = lookupAscii(&default, 'a', .italic) orelse
-        return error.TestUnexpectedResult;
-    try testing.expectApproxEqAbs(@as(f32, 5.0), fast_i.width, 0.001);
-}
-
-test "metrics: glyphAt takes the lookupAscii fast path outside the optical bands" {
-    // glyphAt wires in lookupAscii: outside the 7pt/5pt bands it must
-    // return BIT-IDENTICAL values to the LUT (both derive from the same 10pt
-    // table rows); inside the bands the script-size tables carry their own
-    // h/d/ic and the slow path must win.
-    const fast = lookupAscii(&default, '+', .italic) orelse
-        return error.TestUnexpectedResult;
-    const g10 = glyphAt(&default, '+', .italic, 10.0) orelse
-        return error.TestUnexpectedResult;
-    try testing.expectEqual(fast.width, g10.width);
-    try testing.expectEqual(fast.height, g10.height);
-    try testing.expectEqual(fast.depth, g10.depth);
-    try testing.expectEqual(fast.italic_correction, g10.italic_correction);
-    const fast_r = lookupAscii(&default, 'a', .roman) orelse
-        return error.TestUnexpectedResult;
-    const g10r = glyphAt(&default, 'a', .roman, 10.0) orelse
-        return error.TestUnexpectedResult;
-    try testing.expectEqual(fast_r.width, g10r.width);
-    try testing.expectEqual(fast_r.height, g10r.height);
-    // 7pt band: table7's '+' is taller than the 10pt row (6.19049 vs
-    // 5.83334), so glyphAt must NOT take the LUT there.
-    const g7 = glyphAt(&default, '+', .italic, 7.0) orelse
-        return error.TestUnexpectedResult;
-    try testing.expectApproxEqAbs(@as(f32, 6.19049), g7.height, 0.0001);
-    try testing.expect(!std.math.approxEqAbs(f32, g7.height, fast.height, 0.0001));
-}
-
-test "metrics: roman style at >= 15pt uses the LMRoman17 optical advances" {
-    // XeTeX/fontspec optically swaps the roman TEXT font to the 17pt design
-    // at a requested size of 15pt (measured: \mathrm{mx} m advance 0.816em
-    // at 14.9pt, 0.772em at 15.0pt). glyphAt (the layout's size-aware path)
-    // serves the real lmroman17-regular.otf advances (em x 10) for roman
-    // style from 15pt up; below 15pt the LM Math advance (linear scaling)
-    // still applies.
-    const m30 = glyphAt(&default, 'm', .roman, 30.0) orelse
-        return error.TestUnexpectedResult;
-    try testing.expectApproxEqAbs(@as(f32, 7.72), m30.width, 0.001); // lmr17 m
-    const o30 = glyphAt(&default, 'o', .roman, 30.0) orelse
-        return error.TestUnexpectedResult;
-    try testing.expectApproxEqAbs(@as(f32, 4.59), o30.width, 0.001); // lmr17 o
-    const d30 = glyphAt(&default, 'd', .roman, 30.0) orelse
-        return error.TestUnexpectedResult;
-    try testing.expectApproxEqAbs(@as(f32, 5.11), d30.width, 0.001); // lmr17 d
-    // digits and punctuation in \mathrm/\text at 30pt are lmr17 too
-    const four = glyphAt(&default, '4', .roman, 30.0) orelse
-        return error.TestUnexpectedResult;
-    try testing.expectApproxEqAbs(@as(f32, 4.59), four.width, 0.001); // lmr17 4
-    const paren = glyphAt(&default, '(', .roman, 30.0) orelse
-        return error.TestUnexpectedResult;
-    try testing.expectApproxEqAbs(@as(f32, 3.54), paren.width, 0.001); // lmr17 (
-    // just below the band the 10pt-design linear scaling stays
-    const m14 = glyphAt(&default, 'm', .roman, 14.0) orelse
-        return error.TestUnexpectedResult;
-    try testing.expectApproxEqAbs(@as(f32, 8.33), m14.width, 0.001); // LM m
-    // math (italic) style is untouched by the roman optical band at any size
-    const m_math = glyphAt(&default, 'm', .italic, 30.0) orelse
-        return error.TestUnexpectedResult;
-    try testing.expectApproxEqAbs(@as(f32, 8.33), m_math.width, 0.001); // LM m
-}
-
 test "metrics: a text face is measured by its own LM Roman row" {
     // Every generated face is a DIFFERENT design, so no upright row can
     // stand in for one: the four real advances for 'x' are all distinct.
@@ -3805,15 +3694,6 @@ test "metrics: a text face is measured by its own LM Roman row" {
     const bold_p = glyphInkAt('p', .bold);
     try testing.expect(bold_p.desc > 0);
     try testing.expect(bold_p.asc > bold_p.desc);
-    // The generated tables answer only for the three faces they were
-    // generated from: upright roman and math keep their own rows.
-    try testing.expect(textFaceGlyph(.roman, 'x') == null);
-    try testing.expect(textFaceGlyph(.italic, 'x') == null);
-    // Accented Latin and the dotless letters are covered, not just ASCII —
-    // the text renderer emits exactly those.
-    for ([_]u21{ 0x00E9, 0x0131, 0x0237 }) |cp| {
-        try testing.expect(textFaceGlyph(.text_italic, cp) != null);
-    }
 }
 
 test "metrics: the extensible accent band is the mark's own ink" {
@@ -3885,28 +3765,26 @@ test "metrics: a glyph is framed by the face its style is drawn from" {
 
 test "metrics: the right edge is measured from the origin, not past the advance" {
     // The `f` hook is the frame's hard case in every face: its ink ends
-    // 0.357 / 0.452 / 0.437 / 0.538em from the ORIGIN, while the advance each
-    // style boxes it at is 0.276–0.400em. An overhang recorded past the face's
-    // own hmtx advance assumes the box IS that advance wide — LMRoman17 boxes
-    // `f` at 0.276em instead, so a carried-over 0.051em overhang would end
-    // the frame at 0.327em, 0.030em short of the hook. Measured from the
-    // origin, one number frames every one of them.
-    const hooks = [_]struct { style: atom.CharStyle, right_edge: f32, advance_em: f32 }{
-        .{ .style = .roman, .right_edge = 0.357, .advance_em = 0.276 },
-        .{ .style = .text_italic, .right_edge = 0.452, .advance_em = 0.307 },
-        .{ .style = .bold, .right_edge = 0.437, .advance_em = 0.351 },
-        .{ .style = .bold_italic, .right_edge = 0.538, .advance_em = 0.4 },
+    // 0.357 / 0.452 / 0.437 / 0.538em from the ORIGIN, past the advance each
+    // style boxes it at. An overhang recorded past the face's own hmtx
+    // advance assumes the box IS that advance wide, which for the hook it
+    // is not. Measured from the origin, one number frames every one of them.
+    const hooks = [_]struct { style: atom.CharStyle, right_edge: f32 }{
+        .{ .style = .roman, .right_edge = 0.357 },
+        .{ .style = .text_italic, .right_edge = 0.452 },
+        .{ .style = .bold, .right_edge = 0.437 },
+        .{ .style = .bold_italic, .right_edge = 0.538 },
     };
     for (hooks) |h| {
         const ink = glyphInkAt('f', h.style);
         try testing.expectApproxEqAbs(h.right_edge, ink.right_edge, 0.0001);
         // Every face's hook really does reach past the advance it is boxed
         // at, so the union the consumer takes is nonzero on that axis.
-        try testing.expect(ink.right_edge > h.advance_em);
+        try testing.expect(ink.right_edge > glyphAt(&default, 'f', h.style, 10.0).?.width / em);
     }
     // A glyph whose ink ENDS inside the advance it is boxed at keeps the
-    // plain advance box: the upright `x` ends at 0.516em and the cmr10 row
-    // boxes it at 0.528em, so the union adds nothing on that axis.
+    // plain advance box: the upright `x` ends at 0.516em and its LM Roman
+    // face row boxes it at 0.528em, so the union adds nothing on that axis.
     const x = glyphInkAt('x', .roman);
     try testing.expectApproxEqAbs(@as(f32, 0.516), x.right_edge, 0.0001);
     try testing.expect(x.right_edge < glyphAt(&default, 'x', .roman, 10.0).?.width / em);
@@ -3973,4 +3851,440 @@ test "metrics: the big-integral rows are the plain integral scaled by 2.488" {
     const variant = bigOpInk(.int, true);
     try testing.expect(variant.asc > plain.asc);
     try testing.expect(variant.desc > plain.desc);
+}
+
+test "metrics: the monospace alphabet advances at its own fixed pitch" {
+    // `\mathtt` remaps every letter and digit to the math monospace series,
+    // whose glyphs all advance 0.525em — the fixed pitch the style promises.
+    // Each box carries that pitch exactly; the 0.5em estimate is close but is
+    // not the drawn advance, so a run of them drifts off its own grid.
+    const runs = [_]struct { first: u21, count: u21 }{
+        .{ .first = 0x1D670, .count = 26 },
+        .{ .first = 0x1D68A, .count = 26 },
+        .{ .first = 0x1D7F6, .count = 10 },
+    };
+    for (runs) |run| {
+        for (0..run.count) |i| {
+            const cp = run.first + @as(u21, @intCast(i));
+            const g = staticGlyph(cp, .mono) orelse return error.TestUnexpectedResult;
+            try testing.expectApproxEqAbs(5.25, g.width, 0.001);
+            try testing.expect(g.width != glyphEstimate(&default, cp, .mono).width);
+            // The mapped codepoint is one the metric source recognises, so
+            // layout emits it instead of the ASCII letter.
+            try testing.expect(hasGlyph(&default, cp, .mono));
+        }
+    }
+    // The rows belong to the style that remaps them: the sans-serif series is
+    // not a monospace row.
+    try testing.expect(!hasGlyph(&default, 0x1D5A0, .mono));
+}
+
+test "metrics: a remapped alphabet glyph is boxed by the outline it draws" {
+    // The math sans-serif A: its own hmtx advance and its own ink, not the
+    // upright ASCII design the remapping replaced.
+    const a = staticGlyph(0x1D5A0, .sans) orelse return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(6.67, a.width, 0.001);
+    try testing.expectApproxEqAbs(6.94, a.height, 0.001);
+    const ink = glyphInkAt(0x1D5A0, .sans);
+    try testing.expectApproxEqAbs(0.694, ink.asc, 0.001);
+    // Sans is proportional: two of its capitals advance differently, so a
+    // sans run does not sit on the one pitch the `\mathtt` run does.
+    const sans_r = staticGlyph(0x1D5B1, .sans) orelse return error.TestUnexpectedResult;
+    try testing.expect(sans_r.width != a.width);
+    // The sans-serif j leans left of its own origin and descends below the
+    // baseline; both overhangs must reach the frame or the glyph is cut.
+    const j = glyphInkAt(0x1D5C3, .sans);
+    try testing.expectApproxEqAbs(0.061, j.left, 0.001);
+    try testing.expectApproxEqAbs(0.205, j.desc, 0.001);
+    try testing.expect(j.left > 0 and j.desc > 0);
+    // The face records the accent attachment for these glyphs, so a hat over
+    // `\mathsf{…}` lands where the font says rather than centred on the box.
+    const attach = accentAttach(0x1D5A0) orelse return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(0.333, attach, 0.001);
+}
+
+test "metrics: the native quadruple prime is measured, not composed" {
+    const one = staticGlyph(0x2032, .italic) orelse return error.TestUnexpectedResult;
+    const three = staticGlyph(0x2034, .italic) orelse return error.TestUnexpectedResult;
+    const four = staticGlyph(0x2057, .italic) orelse return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(3.11, one.width, 0.001);
+    try testing.expectApproxEqAbs(7.11, three.width, 0.001);
+    try testing.expectApproxEqAbs(9.11, four.width, 0.001);
+    // The face draws a quadruple prime as ONE composite, so it is narrower
+    // than four drawn single primes (12.44pt) — the advance has to come from
+    // the glyph, not from composing the prime.
+    try testing.expect(four.width < 4 * one.width - 2.0);
+    // … and its frame is that composite's own ink.
+    const ink = glyphInkAt(0x2057, .italic);
+    try testing.expectApproxEqAbs(0.748, ink.asc, 0.001);
+    try testing.expectApproxEqAbs(0.851, ink.right_edge, 0.001);
+    try testing.expect(ink.right_edge <= four.width / em);
+    try testing.expect(ink.asc <= four.height / em);
+}
+
+test "metrics: the static prime grid switches at the script threshold too" {
+    // Without a face behind it the same four codepoints are measured from this
+    // module's own rows, and they switch where the font hook switches: an 8pt
+    // base sets its script at 5.6pt and every prime in it is the face's
+    // unencoded alternate, a 12pt base at 8.4pt and the encoded composite
+    // answers again, at the width it always had. The gate is the single number
+    // `font.small_prime_max_size` states, pinned on both sides of the module
+    // graph that keeps them apart.
+    const grid = [_]struct { cp: u21, script_pt: f32, gate_pt: f32 }{
+        .{ .cp = 0x2032, .script_pt = 2.7384, .gate_pt = 2.6124 },
+        .{ .cp = 0x2033, .script_pt = 4.4184, .gate_pt = 4.2924 },
+        .{ .cp = 0x2034, .script_pt = 6.0984, .gate_pt = 5.9724 },
+        .{ .cp = 0x2057, .script_pt = 7.7784, .gate_pt = 7.6524 },
+    };
+    for (grid) |row| {
+        const script = glyphAt(&default, row.cp, .italic, 5.6) orelse
+            return error.TestUnexpectedResult;
+        try testing.expectApproxEqAbs(row.script_pt, script.width * 5.6 / em, 0.0001);
+        const gate = glyphAt(&default, row.cp, .italic, 8.4) orelse
+            return error.TestUnexpectedResult;
+        try testing.expectApproxEqAbs(row.gate_pt, gate.width * 8.4 / em, 0.0001);
+    }
+    // The 10pt base is the encoded row it has always been, and nothing but a
+    // prime moves across the gate.
+    const base = staticGlyph(0x2034, .italic) orelse return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(7.11, base.width, 0.001);
+    const x = glyphAt(&default, 'x', .italic, 5.6) orelse return error.TestUnexpectedResult;
+    const x_base = staticGlyph('x', .italic) orelse return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(x_base.width, x.width, 0.0001);
+    try testing.expect(smallPrimeEm(0x2035) == null);
+}
+
+test "metrics: a mark drawn OVER a nucleus takes the widest size variant it FITS" {
+    // A mark set ON a nucleus is not stretched across it: XeTeX + unicode-math
+    // draws the LARGEST variant the nucleus still holds, so over `M` (0.970em)
+    // it uses the 0.920em hat and over `abc` (1.391em) the 1.321em one. Every
+    // horizontal form reads that one rule, the brace half included. Both
+    // rungs of the bundled ladder are reachable and each AdvanceMeasurement is
+    // the exact boundary: a request for one rung's own size takes THAT rung,
+    // and a request a thousandth of an em under it takes the rung below.
+    const ladder = math_style_metrics.ladder(0x0302) orelse
+        return error.TestUnexpectedResult;
+    for (ladder.rungs, 0..) |rung, i| {
+        const chosen = (try horizontalGlyph(&default, 0x0302, rung.req)) orelse
+            return error.TestUnexpectedResult;
+        try testing.expectApproxEqAbs(rung.adv, chosen.advance_em, 0.001);
+        try testing.expectApproxEqAbs(rungInk(rung).asc, chosen.ink.asc, 0.001);
+        if (i == 0) continue;
+        const under = (try horizontalGlyph(&default, 0x0302, rung.req - 0.001)) orelse
+            return error.TestUnexpectedResult;
+        try testing.expectApproxEqAbs(
+            ladder.rungs[i - 1].adv,
+            under.advance_em,
+            0.001,
+        );
+    }
+    // The two nuclei XeTeX was measured on. The rung a covering walk would
+    // have taken really does span each nucleus, so the rules cannot pass for
+    // one another.
+    for ([_]struct { nucleus: f32, fit: usize, spanning: usize }{
+        .{ .nucleus = 0.970, .fit = 3, .spanning = 4 },
+        .{ .nucleus = 1.391, .fit = 5, .spanning = 6 },
+    }) |case| {
+        const chosen = (try horizontalGlyph(&default, 0x0302, case.nucleus)) orelse
+            return error.TestUnexpectedResult;
+        try testing.expectApproxEqAbs(ladder.rungs[case.fit].adv, chosen.advance_em, 0.001);
+        try testing.expect(ladder.rungs[case.spanning].req > case.nucleus);
+        try testing.expect(ladder.rungs[case.fit].req <= case.nucleus);
+    }
+    // A fitted variant is a real glyph drawn at its own origin: its ink starts
+    // there, ends at its advance, and floats above the baseline.
+    const hat = (try horizontalGlyph(&default, 0x0302, 0.7)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(ladder.rungs[1].adv, hat.advance_em, 0.001);
+    try testing.expectApproxEqAbs(0, hat.ink.left, 0.001);
+    try testing.expectApproxEqAbs(hat.advance_em, hat.ink.right_edge, 0.001);
+    try testing.expectApproxEqAbs(0, hat.ink.desc, 0.001);
+    try testing.expect(hat.ink.bottom > 0);
+    // A narrow request takes the base mark, which LM Math draws with zero
+    // advance and its ink left of the origin.
+    const narrow = (try horizontalGlyph(&default, 0x0302, 0.2)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(0, narrow.advance_em, 0.001);
+    // Past the last rung an accent has no assembly, so it degrades to the
+    // LARGEST variant the face draws, at that variant's OWN advance: the hat
+    // keeps one kink and its real width instead of being stretched to a size
+    // the font has no design for.
+    const last = ladder.rungs[ladder.rungs.len - 1];
+    const past = (try horizontalGlyph(&default, 0x0302, 2.0)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(last.adv, past.advance_em, 0.001);
+    try testing.expect(past.advance_em < 2.0);
+    try testing.expectApproxEqAbs(last.right_edge, past.ink.right_edge, 0.001);
+    try testing.expectApproxEqAbs(last.asc, past.ink.asc, 0.001);
+    // Every answer names the form's finite capacity, so a caller can tell
+    // "outgrew the face" from "fits inside it": the widest drawing LM Math
+    // has for this mark, reached here and not before.
+    try testing.expectApproxEqAbs(last.req, past.finite_ceiling_em orelse
+        return error.TestUnexpectedResult, 0.001);
+    try testing.expectApproxEqAbs(last.req, hat.finite_ceiling_em orelse
+        return error.TestUnexpectedResult, 0.001);
+    // A codepoint with no horizontal construction at all.
+    const plain = try horizontalGlyph(&default, 0x0058, 0.6);
+    try testing.expect(plain == null);
+}
+
+test "metrics: a brace half FITS its nucleus, it does not cover it" {
+    // A brace is SET ON the width under it like every other horizontal form,
+    // so it takes the widest rung of its own ladder that width still holds.
+    // The exact-font reference says so plainly: at 20pt XeTeX + unicode-math
+    // paints the brace half of `\underbrace{x}` 9.84pt wide where `x` is
+    // 11.48pt (0.574em) and the smallest rung covering it is 19.88pt; under
+    // `xx` (1.148em) 19.80pt, under `xxx` (1.722em) 29.88pt and under six of
+    // them (3.445em) 60.00pt — the 0.492, 0.993, 1.494 and 3.000em rungs, each
+    // a drawing the face made, never one rung wider.
+    for ([_]u21{ 0x23DE, 0x23DF }) |cp| {
+        const ladder = math_style_metrics.ladder(cp) orelse
+            return error.TestUnexpectedResult;
+        // A rung's own designed size takes THAT rung, and a thousandth of an
+        // em under it takes the rung below: the AdvanceMeasurement is the
+        // boundary, not the glyph.
+        for (ladder.rungs, 0..) |rung, i| {
+            const chosen = (try horizontalGlyph(&default, cp, rung.req)) orelse
+                return error.TestUnexpectedResult;
+            try testing.expectApproxEqAbs(rung.adv, chosen.advance_em, 0.001);
+            try testing.expectApproxEqAbs(rungInk(rung).asc, chosen.ink.asc, 0.001);
+            if (i == 0) continue;
+            const under = (try horizontalGlyph(&default, cp, rung.req - 0.001)) orelse
+                return error.TestUnexpectedResult;
+            try testing.expectApproxEqAbs(
+                ladder.rungs[i - 1].adv,
+                under.advance_em,
+                0.001,
+            );
+        }
+        // The five measured nuclei, each against the rung the face's own
+        // measurements put under it, and each still inside the ladder: the
+        // next rung up really does span the nucleus, so a covering walk and
+        // this one cannot pass for each other.
+        for ([_]f32{ 0.574, 0.651, 1.148, 1.722, 3.445 }) |nucleus| {
+            const chosen = (try horizontalGlyph(&default, cp, nucleus)) orelse
+                return error.TestUnexpectedResult;
+            var fit: usize = 0;
+            while (fit + 1 < ladder.rungs.len and ladder.rungs[fit + 1].req <= nucleus) fit += 1;
+            try testing.expectApproxEqAbs(ladder.rungs[fit].adv, chosen.advance_em, 0.001);
+            try testing.expectApproxEqAbs(rungInk(ladder.rungs[fit]).asc, chosen.ink.asc, 0.001);
+            try testing.expect(ladder.rungs[fit + 1].req > nucleus);
+            // A real drawing at its own advance: the ink ends where the rung
+            // ends and never starts left of the origin.
+            try testing.expectApproxEqAbs(0, chosen.ink.left, 0.001);
+            try testing.expectApproxEqAbs(
+                ladder.rungs[fit].right_edge,
+                chosen.ink.right_edge,
+                0.001,
+            );
+            // A brace ASSEMBLES, so it reaches any width and names no ceiling.
+            try testing.expect(chosen.finite_ceiling_em == null);
+        }
+        // A nucleus narrower than every rung keeps the base drawing.
+        const narrow = (try horizontalGlyph(&default, cp, ladder.rungs[0].req - 0.001)) orelse
+            return error.TestUnexpectedResult;
+        try testing.expectApproxEqAbs(ladder.rungs[0].adv, narrow.advance_em, 0.001);
+    }
+}
+
+test "metrics: a brace past its ladder is framed by the real assembly" {
+    const req: f32 = 5.0; // past the widest top-brace rung (4.007em)
+    const ladder = math_style_metrics.ladder(0x23DE) orelse
+        return error.TestUnexpectedResult;
+    const base = ladder.rungs[0];
+    const top_rung = ladder.rungs[ladder.rungs.len - 1];
+    try testing.expect(req > top_rung.req);
+    try testing.expect(ladder.parts.len > 0);
+    const brace = (try horizontalGlyph(&default, 0x23DE, req)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(brace.advance_em >= req);
+    // A brace ASSEMBLES, so it reaches any width and names no ceiling: a
+    // request past its last rung is still a drawing the face can make.
+    try testing.expect(brace.finite_ceiling_em == null);
+    // The SMALLEST legal frame that covers the request. The extenders are
+    // dropped before they are added, so the two hooks alone — the widest they
+    // can legally be, every connection down to MinConnectorOverlap — stop short
+    // of it, and one count below the one that reaches it is short however far
+    // its connections open.
+    try testing.expect(assembledStretch(ladder, 0, 0).advance_em < req);
+    var repeats: usize = 0;
+    while (assembledStretch(ladder, repeats, 0).advance_em < req) repeats += 1;
+    try testing.expect(repeats > 0);
+    try testing.expect(
+        assembledStretch(ladder, repeats - 1, maxOpen(ladder, repeats - 1)).advance_em < req,
+    );
+    // Each repeat-flagged part is one copy wider than the one before, and the
+    // copies JOIN rather than abut — so a repeat adds less than the whole
+    // FullAdvance it carries, and the count above really is a stack.
+    var nominal: f32 = 0;
+    for (ladder.parts) |part| {
+        if (part.repeat) nominal += part.adv;
+    }
+    const grown = assembledStretch(ladder, repeats + 1, 0).advance_em -
+        assembledStretch(ladder, repeats, 0).advance_em;
+    try testing.expect(grown > 0);
+    try testing.expect(grown < nominal);
+    // Within that count the connections are opened as LITTLE as the request
+    // allows: opening one step further drops the frame back under it.
+    const open = openFor(ladder, repeats, req) orelse return error.TestUnexpectedResult;
+    try testing.expect(assembledStretch(ladder, repeats, open).advance_em >= req);
+    try testing.expect(assembledStretch(ladder, repeats, open + 0.01).advance_em < req);
+    try testing.expectApproxEqAbs(
+        assembledStretch(ladder, repeats, open).advance_em,
+        brace.advance_em,
+        0.001,
+    );
+    // The ink is the parts' own: the top half floats above the baseline, its
+    // cusp rises past the plain glyph, and the frame spans the whole
+    // assembled width with nothing hanging off either end.
+    try testing.expectApproxEqAbs(0, brace.ink.desc, 0.001);
+    try testing.expect(brace.ink.bottom > 0);
+    try testing.expect(brace.ink.asc > base.asc);
+    try testing.expectApproxEqAbs(0, brace.ink.left, 0.001);
+    try testing.expectApproxEqAbs(brace.advance_em, brace.ink.right_edge, 0.001);
+    // The bottom half hangs below the baseline instead: no floating edge.
+    const under = (try horizontalGlyph(&default, 0x23DF, req)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(0, under.ink.asc, 0.001);
+    try testing.expect(under.ink.desc > 0);
+    try testing.expectApproxEqAbs(0, under.ink.bottom, 0.001);
+}
+
+test "metrics: an assembly opens its connections, it does not trim them" {
+    // The OpenType rule is an INTERVAL per connection: the overlap is at
+    // least MinConnectorOverlap and at most the connector ink both neighbours
+    // offer. A stack therefore has a wide end (every connection at the floor)
+    // and a tight end (every one at its ceiling), and the item grows between
+    // them by opening the connections — not by shaving the overlap.
+    const ladder = math_style_metrics.ladder(0x23DE) orelse
+        return error.TestUnexpectedResult;
+    const floor = ladder.min_connector_overlap;
+    const most_open = maxOpen(ladder, 1);
+    try testing.expect(most_open > 0);
+    // Every connection the stack can make stays inside the legal interval, at
+    // both ends of the opening and everywhere between — an extender joined to
+    // its own next copy included.
+    const joins = [_][2]math_style_metrics.Part{
+        .{ ladder.parts[0], ladder.parts[1] },
+        .{ ladder.parts[1], ladder.parts[1] },
+        .{ ladder.parts[1], ladder.parts[2] },
+        .{ ladder.parts[2], ladder.parts[3] },
+        .{ ladder.parts[3], ladder.parts[3] },
+        .{ ladder.parts[3], ladder.parts[4] },
+    };
+    for (joins) |pair| {
+        const ceiling = @min(pair[0].end_connector, pair[1].start_connector);
+        try testing.expect(ceiling >= floor);
+        for ([_]f32{ 0, most_open / 2, most_open, most_open * 2 }) |open| {
+            const overlap = joinOverlap(pair[0], pair[1], floor, open);
+            try testing.expect(overlap >= floor - 0.0001);
+            try testing.expect(overlap <= ceiling + 0.0001);
+        }
+        // Nothing opened is the floor itself, and opening past the interval
+        // stops at the ceiling: a connection keeps every bit of connector
+        // material the font drew, and not one bit more.
+        try testing.expectApproxEqAbs(floor, joinOverlap(pair[0], pair[1], floor, 0), 0.0001);
+        try testing.expectApproxEqAbs(
+            ceiling,
+            joinOverlap(pair[0], pair[1], floor, most_open * 4),
+            0.0001,
+        );
+    }
+    // The ends of the opening name the ends of the stack: nothing opened is
+    // the widest it can legally be, everything opened the narrowest.
+    const wide = assembledStretch(ladder, 1, 0).advance_em;
+    const tight = assembledStretch(ladder, 1, most_open).advance_em;
+    try testing.expect(wide > tight);
+    const none = openFor(ladder, 1, wide) orelse return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(0, none, 0.001);
+    const all = openFor(ladder, 1, tight) orelse return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(most_open, all, 0.001);
+    // A request between them is reached, not overshot by a whole connection.
+    const between = openFor(ladder, 1, (wide + tight) / 2) orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(between > 0 and between < most_open);
+    try testing.expectApproxEqAbs(
+        (wide + tight) / 2,
+        assembledStretch(ladder, 1, between).advance_em,
+        0.001,
+    );
+    // Past the widest frame this count can reach there is no answer: the
+    // stack may not tear its joins to cover a request it cannot reach.
+    try testing.expect(openFor(ladder, 1, wide + 0.01) == null);
+    // With no extenders left the join is measured straight across them: the
+    // two hooks alone, sharing one floor apiece.
+    try testing.expectApproxEqAbs(
+        ladder.parts[0].adv + ladder.parts[2].adv + ladder.parts[4].adv - 2 * floor,
+        assembledStretch(ladder, 0, 0).advance_em,
+        0.001,
+    );
+    // Only two copies of one extender open a join wider than the hooks share
+    // with it: the extenders' own connector material, and nothing else.
+    try testing.expect(maxOpen(ladder, 0) == maxOpen(ladder, 1));
+    try testing.expect(maxOpen(ladder, 2) > most_open);
+}
+
+test "metrics: an explicit stretch hook answers instead of the bundled geometry" {
+    // The font branch owns the choice, and what its resolver returns is
+    // final — including a null, which is the face saying it has no such form,
+    // and its errors, which must not decay into the bundled geometry.
+    const glyph_hook = struct {
+        fn get(_: *anyopaque, _: u21, _: atom.CharStyle, _: f32) ?Glyph {
+            return null;
+        }
+    }.get;
+    const stretch_hook = struct {
+        fn get(_: *anyopaque, cp: u21, _: f32) StretchError!?StretchGeometry {
+            return switch (cp) {
+                0x0302 => null, // the face has no such construction
+                0x0303 => error.OutOfMemory, // decoding the outline failed
+                else => .{ .advance_em = 3.5, .ink = .{ .asc = 0.9, .desc = 0 } },
+            };
+        }
+    }.get;
+    var anchor: u8 = 0;
+    const fm: FontMetrics = .{ .font = .{
+        .ctx = &anchor,
+        .glyph = glyph_hook,
+        .horizontal_glyph = stretch_hook,
+    } };
+    // A 1.25em request would take the brace's own 1.495em rung; the hook's
+    // frame is the answer instead.
+    const chosen = (try horizontalGlyph(&fm, 0x23DE, 1.25)) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(3.5, chosen.advance_em, 0.001);
+    try testing.expectApproxEqAbs(0.9, chosen.ink.asc, 0.001);
+    // A null stays null even though the bundled ladder has an answer.
+    const absent = try horizontalGlyph(&fm, 0x0302, 0.6);
+    try testing.expect(absent == null);
+    try testing.expectError(error.OutOfMemory, horizontalGlyph(&fm, 0x0303, 0.6));
+    // A hook with no resolver makes no claim about the face, so the generated
+    // ladders answer for it.
+    const bare: FontMetrics = .{ .font = .{
+        .ctx = &anchor,
+        .glyph = glyph_hook,
+    } };
+    const fallback_frame = try horizontalGlyph(&bare, 0x0302, 0.6);
+    try testing.expect(fallback_frame != null);
+}
+
+test "metrics: a text face without the glyph is framed by the math outline" {
+    // LM Roman carries no Greek: `\mathrm{α}` is drawn from the Math face
+    // beside it, so the frame is that face's own outline for the same
+    // codepoint — not a roman estimate of one.
+    try testing.expect(faceGlyphInk(0x03B1, .roman) == null);
+    const math_ink = faceGlyphInk(0x03B1, .italic) orelse
+        return error.TestUnexpectedResult;
+    const ink = glyphInkAt(0x03B1, .roman);
+    try testing.expectApproxEqAbs(math_ink.asc, ink.asc, 0.0001);
+    try testing.expectApproxEqAbs(math_ink.right_edge, ink.right_edge, 0.0001);
+    try testing.expect(ink.right_edge > 0);
+    // The face the style draws from answers for the glyphs it HAS: a bold
+    // letter keeps its own design's ink, descender and all.
+    const bold_p = faceGlyphInk('p', .bold) orelse return error.TestUnexpectedResult;
+    try testing.expect(bold_p.desc > 0);
+    // A codepoint no bundled face carries keeps the missing-glyph contract.
+    const missing = glyphInkAt(0x4E2D, .roman);
+    try testing.expectApproxEqAbs(0.750, missing.asc, 0.0001);
+    try testing.expectApproxEqAbs(0, missing.left, 0.0001);
 }

@@ -5,6 +5,12 @@
 //! immediate children just before the parent, so a subtree appears in the
 //! pool more than once and only the root-reachable chain is the tree.
 //! Provenance is a parallel token table of byte spans.
+//!
+//! This module is the VOCABULARY: the tags, the node records and the `data`
+//! encodings the parser writes and layout reads. It neither parses (that is
+//! `ztex.parse`) nor validates — the `Ast` builders store whatever they are
+//! given, and `layout.render` is the boundary that checks a tree before the
+//! recursive layout reads it.
 
 const std = @import("std");
 
@@ -41,6 +47,8 @@ pub const Span = struct {
     start: u32,
     end: u32,
 
+    /// Bytes covered, 0 for an empty or reversed span (see the body). The
+    /// span is a pair of offsets; the bytes themselves are the caller's.
     pub fn len(self: Span) usize {
         // Saturating: a hand-built span with end < start must not underflow
         // (panic in Debug/ReleaseSafe) — report 0 instead.
@@ -103,6 +111,29 @@ fn parseHex(s: []const u8) ?Color {
 /// Parser and layout share this bound for nested groups in a raw text leaf.
 pub const max_text_nesting: u32 = 500;
 
+/// The deepest `parseRow` recursion a parse may reach (src/parse/parser.zig
+/// `max_nesting`). Brace nesting costs one frame per level, so a source of
+/// nested groups beyond this fails with `error.NestingTooDeep` instead of
+/// overflowing the C stack. Layout does NOT read this bound: its own is
+/// `max_ast_depth`, below.
+pub const max_nesting: u32 = 500;
+
+/// The deepest atom tree `layout` will recurse into; a root-reachable node
+/// below this depth makes the layout boundary refuse the tree with
+/// `error.InvalidAst` BEFORE any recursive layout runs.
+///
+/// The bound has to admit every tree the parser can build and still keep
+/// the recursive layout inside the C stack. The parser spends at most
+/// `max_nesting` `parseRow` frames, and nesting a construct always costs a
+/// frame: the only wrappers built inside an existing frame are the row
+/// itself, an infix `\atop`/`\over` fraction (which replaces the row with a
+/// `.fraction` over two rows) and `\pmod`-style words (a `.row` over an
+/// `.opname` over the letter row) — three node levels at most, and every
+/// deeper construct takes its own frame. Four times the frame bound is
+/// therefore above anything a parse can produce, and keeps a hand-built
+/// tree far below the depth at which the recursion would exhaust the stack.
+pub const max_ast_depth: u32 = 4 * max_nesting;
+
 /// Combine two TEXT face styles into the single face that carries both
 /// (LaTeX's `\textbf{\textit{x}}` is BOLD ITALIC). A text face is upright
 /// roman plus the italic and bold modifiers, so the combination is the
@@ -149,6 +180,49 @@ pub const CharStyle = enum(u8) {
     /// two text faces combined; see `combineTextStyles`.
     bold_italic,
 };
+
+/// Raw text scopes add face modifiers; an inner upright scope preserves
+/// modifiers supplied by its enclosing scope.
+pub fn textFaceCommand(name: []const u8) ?CharStyle {
+    if (std.mem.eql(u8, name, "textit")) return .text_italic;
+    if (std.mem.eql(u8, name, "textbf")) return .bold;
+    if (std.mem.eql(u8, name, "text")) return .roman;
+    return null;
+}
+
+/// Whether `c` is one of the accent control symbols a `\text` run accepts
+/// (`\H \r \v \u \c \d \b \t` and the seven accent marks).
+pub inline fn isTextAccentControl(c: u8) bool {
+    return switch (c) {
+        'H',
+        'r',
+        'v',
+        'u',
+        'c',
+        'd',
+        'b',
+        't',
+        '\'',
+        '`',
+        '"',
+        '^',
+        '~',
+        '.',
+        '=',
+        => true,
+        else => false,
+    };
+}
+
+/// Parser validation and raw-text layout share one command repertoire.
+pub fn textCommandSupported(name: []const u8) bool {
+    if (textFaceCommand(name) != null) return true;
+    if (name.len != 1) return false;
+    return isTextAccentControl(name[0]) or switch (name[0]) {
+        'i', 'j', ' ', '{', '}', '$', '%', '&', '#', '_' => true,
+        else => false,
+    };
+}
 
 /// Big operator (rendered large; scripts become limits in display style).
 pub const BigOp = enum(u8) {
@@ -271,6 +345,9 @@ pub const EnvBits = struct {
     pub const max_spec_cols: usize = 12;
 };
 
+/// The environment kind an `.env` node's `data` carries. A `data` whose low
+/// bits name no kind is refused by `layout.render`, which checks the field
+/// before this `@enumFromInt` can trap on it.
 pub inline fn envKind(data: u32) EnvKind {
     return @enumFromInt(data & EnvBits.kind_mask);
 }
@@ -280,8 +357,9 @@ pub inline fn envSpecCount(data: u32) usize {
     return (data >> EnvBits.count_shift) & 0xF;
 }
 
-/// The packed colspec nibble for column `i`, or null beyond the packed
-/// spec (callers default to centered alignment).
+/// The packed colspec nibble for column `i`, or null past the encoded count.
+/// Requires `data` produced by `envData`, or a validated count no greater
+/// than `EnvBits.max_spec_cols`; larger counts cannot fit the shift encoding.
 pub inline fn envColSpec(data: u32, i: usize) ?u32 {
     if (i >= envSpecCount(data)) return null;
     return (data >> (EnvBits.col_shift + @as(u5, @intCast(2 * i)))) & EnvBits.col_nibble;
@@ -598,7 +676,15 @@ pub const Tag = enum(u8) {
 };
 
 /// A flat, fixed-size AST node.
+///
+/// Stored as given, never normalized: the constructors do not check that
+/// `first_token + num_tokens` fits the token table, that a span lands inside
+/// the source, or that `data` names a member of the enum a tag decodes it
+/// to. `layout.render` checks all three over the root-reachable subtree
+/// before layout reads them.
 pub const Node = struct {
+    /// what kind of atom this is; it fixes the meaning of `data` and how many
+    /// children the node must carry
     tag: Tag,
     /// index of the first token this node spans (into Ast.tokens)
     first_token: u32,
@@ -610,7 +696,12 @@ pub const Node = struct {
     first_child: u32,
     /// number of children in the contiguous run starting at `first_child`
     num_children: u16,
-    /// tag-specific scalar payload (style, width, line flag)
+    /// tag-specific scalar payload, encoded per tag (the `Bits` structs above
+    /// and the `Tag` docs): a `CharStyle` on `.styled`/`.text`, a
+    /// `MathStyle` on `.mathstyle`, a `BigOp` plus `LimitsBits` on `.op`, an
+    /// `EnvKind` plus the array colspec on `.env`, `FractionBits` on
+    /// `.fraction`, `ScriptBits` on `.script`, 0xRRGGBBAA on
+    /// `.color`/`.textcolor`, and a raw f32 bit pattern on `.space`.
     data: u32,
 };
 
@@ -629,6 +720,8 @@ pub const ColorBits = struct {
     pub const b_shift: u5 = 8;
 };
 
+/// Pack a color into the `0xRRGGBBAA` word a `.color`/`.textcolor` node's
+/// `data` holds; `nodeColor` is the inverse.
 pub inline fn colorData(c: Color) u32 {
     return (@as(u32, c.r) << ColorBits.r_shift) |
         (@as(u32, c.g) << ColorBits.g_shift) |
@@ -655,6 +748,8 @@ pub inline fn emToFixed(em: f32) u32 {
     return @bitCast(em);
 }
 
+/// The em width a `space` node's `data` carries, read back as the f32
+/// `emToFixed` stored.
 pub inline fn fixedToEm(v: u32) f32 {
     return @bitCast(v);
 }
@@ -693,10 +788,27 @@ inline fn checkNodeCapacity(current: usize, additional: usize) std.mem.Allocator
 /// Ownership: `Ast` OWNS its two ArrayLists. Do NOT copy an `Ast` by value
 /// (a copy would alias the same buffers and double-free on `deinit`); create
 /// with `init` and free with `deinit` exactly once, on the original.
+///
+/// Nothing in this module validates a tree. The constructors below build
+/// whatever the caller describes — an out-of-range token run or an
+/// out-of-range `data` is stored as given — so a hand-built `Ast` is only
+/// safe to read through `layout.render`, which checks the whole
+/// root-reachable subtree (arity, child bounds, tree shape, depth, token
+/// runs, source spans, enum payloads) before any layout recursion runs.
 pub const Ast = struct {
+    /// The allocator both tables are drawn from. The caller owns it and it
+    /// must outlive this Ast.
     gpa: std.mem.Allocator,
+    /// The formula source. BORROWED, never copied and never written here:
+    /// every node's token span and every layout read of a glyph's bytes are
+    /// offsets into it, so it must stay alive and unmodified for as long as
+    /// anything reads those spans.
     src: []const u8,
+    /// Lexical tokens in source order. `Node.first_token`/`num_tokens` index
+    /// a contiguous run here; `Ast.span` reads only the run's two ends.
     tokens: std.ArrayList(Token) = .empty,
+    /// The node pool: a node index is a slot in it, and a node's children
+    /// are the contiguous run starting at its `first_child`.
     nodes: std.ArrayList(Node) = .empty,
     /// index of the root node (the whole formula), set by the parser
     root: u32 = 0,
@@ -707,6 +819,9 @@ pub const Ast = struct {
         return .{ .gpa = gpa, .src = src };
     }
 
+    /// Releases the token and node tables; `src` is borrowed and left
+    /// untouched. The Ast is unusable afterward, and a second call is a
+    /// double free.
     pub fn deinit(self: *Ast) void {
         self.tokens.deinit(self.gpa);
         self.nodes.deinit(self.gpa);
@@ -724,6 +839,9 @@ pub const Ast = struct {
         try self.tokens.append(self.gpa, t);
     }
 
+    /// Appends one node and returns its index. The node's fields are stored
+    /// as given — a child run that does not exist or a `data` outside its
+    /// enum is accepted here and refused by `layout.render`.
     pub fn pushNode(self: *Ast, n: Node) !u32 {
         try checkNodeCapacity(self.nodes.items.len, 1);
         const idx: u32 = @intCast(self.nodes.items.len);
@@ -731,6 +849,7 @@ pub const Ast = struct {
         return idx;
     }
 
+    /// Appends `ns` and returns the index of the first; they stay contiguous.
     pub fn pushNodes(self: *Ast, ns: []const Node) !u32 {
         try checkNodeCapacity(self.nodes.items.len, ns.len);
         const first: u32 = @intCast(self.nodes.items.len);
@@ -740,6 +859,11 @@ pub const Ast = struct {
 
     /// Create a node with a contiguous child run: copies `children` into the
     /// pool, then appends the parent pointing at that run.
+    ///
+    /// `data` is stored verbatim (the per-tag encoding above). A run longer
+    /// than `maxInt(u16)` children is `error.ChildCountOverflow`, and a pool
+    /// that could not index the run is `error.OutOfMemory`; both are decided
+    /// before any append, so a failed call leaves the pool as it was.
     pub fn createNode(
         self: *Ast,
         tag: Tag,
@@ -766,6 +890,9 @@ pub const Ast = struct {
         return idx;
     }
 
+    /// Appends a childless node (`first_child` = `null_node`, which 0 also
+    /// is, so the no-children test stays `num_children == 0`) and returns its
+    /// index.
     pub fn createLeaf(
         self: *Ast,
         tag: Tag,
@@ -807,6 +934,15 @@ pub const Ast = struct {
     ///
     /// O(1): `src[tokens[first].start .. tokens[last].end]`. Only meaningful
     /// for nodes whose token range is non-empty.
+    ///
+    /// The returned offsets are whatever the tokens carry: nothing here
+    /// checks them against the token table or against `src`, because the
+    /// token reads themselves are unchecked. A tree that came from the
+    /// lexer has both, and `layout.render` verifies them for a hand-built
+    /// one before anything reads a span. DECODING the bytes is a separate
+    /// precondition: `src` is expected to be well-formed UTF-8 at its token
+    /// boundaries, and a span that cuts a codepoint in half decodes to
+    /// U+0000 rather than trapping.
     pub inline fn span(self: *const Ast, idx: u32) Span {
         const n = self.node(idx);
         if (n.num_tokens == 0) return .{ .start = 0, .end = 0 };
