@@ -1,15 +1,12 @@
 /*
  * ztex — LaTeX math rendered to SVG or a pixel buffer, over a C ABI.
  *
- * Ownership. Every byte the library takes comes from YOUR allocator
- * (ztex_allocator): the context block ztex_context_create allocates, the
- * embedded Latin Modern faces and the glyph metric cache that block owns
- * until ztex_context_destroy, and the parse, layout, SVG and pixel working
- * set of every call. That per-call working set is released before the call
- * returns; ztex_context_destroy hands the context block itself back
- * through the same dealloc. Nothing comes back as a pointer you cannot
- * identify and free: ztex_render_svg and ztex_render_raster copy into a
- * buffer you own.
+ * Ownership. All runtime allocations use YOUR allocator (ztex_allocator):
+ * the context block and its font/cache owner live until context destruction.
+ * Render scratch is released before return, but a render can add cache
+ * entries retained until ztex_context_destroy. Destruction releases every
+ * owned block through the matching dealloc. Render functions copy output
+ * into your buffer; no owned library allocation is returned to the host.
  *
  * Return values. ztex_context_create, ztex_render_svg, ztex_render_raster
  * and ztex_last_error return an int status, ZTEX_OK (0) for success. The
@@ -28,31 +25,50 @@
  * formula, and is only valid with latex_length 0.
  *
  * Lengths are 32-bit (ztex_u32 = unsigned int) so this header needs no
- * <stdint.h> — C89 has none — and the ABI is the same on every target. A
- * payload above 4 GiB - 2 bytes, or a raster frame whose width, height or
- * row stride has no 32-bit representation at all, fails with
- * ZTEX_OUTPUT_TOO_LARGE rather than truncating or wrapping. A failed render
- * writes nothing: out keeps its bytes, and out_length, out_width and
- * out_height keep the values you passed in.
+ * <stdint.h> — C89 has none. A payload above 4 GiB - 2 bytes, or a raster
+ * frame whose width, height or row stride has no 32-bit representation at
+ * all, fails with ZTEX_OUTPUT_TOO_LARGE rather than truncating or wrapping,
+ * and is measured before the pixel block is requested. On any failure, out
+ * keeps its bytes. ZTEX_BUFFER_TOO_SMALL reports the required length and
+ * raster dimensions; every other error leaves all output metadata unchanged.
+ *
+ * Targets. What this header fixes is the layout of the types it spells
+ * out: `int` and `unsigned int` (ztex_u32) must each be 32 bits, and the
+ * pointers are plain pointers. ztex checks those two widths at compile
+ * time for the target it is built for, so a target that does not hold is
+ * refused instead of shipped with a layout the header does not describe.
+ * The consuming C compiler must use the target's compatible pointer layout
+ * and 32-bit float ABI. The real-header parity check and C/C++ consumers
+ * verify the tested target/configuration, not every C compiler or target.
  *
  * Threads. A ztex_context is NOT thread-safe: the first render fills a glyph
  * metric cache. Use one context per thread, or serialize access to a shared
- * one.
+ * one. Your `alloc` and `dealloc` are called on the thread that called
+ * into ztex, synchronously, from inside the call that needed the memory.
  *
  * Linking. `zig build static-lib` produces zig-out/lib/libztex.a (built
  * position-independent, so it also links into a shared object). Link it
  * with libm (-lm on glibc): the archive calls libm's roundf, plus the
  * exp/log pair behind the font decoder's std.math.pow.
  *
- * C++. This header is plain C89. A C++ host includes it from inside its own
- * extern "C" block.
+ * C++. This header is plain C89, and it wraps its own declarations in
+ * extern "C" when the compiler is C++, so a C++ host includes it directly
+ * and needs no block of its own.
  */
 
 #ifndef ZTEX_H
 #define ZTEX_H
 
+/* A C++ host includes this header directly: the declarations below are C
+   names, and this is what keeps them that way. A C compiler never sees
+   either directive. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* 32-bit unsigned types, defined here so this header stays self-contained
-   and C89-clean. `unsigned int` is 32 bits on every target ztex builds for. */
+   and C89-clean. `unsigned int` is 32 bits wherever ztex builds, and the
+   build refuses a target where it is not — see Targets above. */
 typedef unsigned char ztex_u8;
 typedef unsigned int ztex_u32;
 
@@ -83,9 +99,10 @@ typedef unsigned int ztex_u32;
    and out_length carries the size needed. */
 #define ZTEX_BUFFER_TOO_SMALL 6
 /* The output has no 32-bit size: a raster frame whose width, height or row
-   stride cannot be expressed, or a payload above 4 GiB - 2 bytes. The
-   frame is measured before the pixel block is requested, so a request this
-   status answers never reaches your alloc. */
+   stride cannot be expressed, or a whole payload — width*height*4 in
+   ZTEX_PIXEL_RGBA32, width*height in ZTEX_PIXEL_ALPHA8 — above 4 GiB - 2
+   bytes. The frame and the payload are measured before the pixel block is
+   requested, so a frame this status answers never reaches your alloc. */
 #define ZTEX_OUTPUT_TOO_LARGE 7
 /* A font could not be read while rasterizing a glyph outline. */
 #define ZTEX_FONT_ERROR 8
@@ -115,17 +132,29 @@ typedef struct ztex_context ztex_context;
 /*
  * The caller's allocator, and the ONLY source of memory the library has:
  * every parse, layout, SVG and pixel allocation of every call comes from it
- * as well. ztex_context_create COPIES this struct, so it may be a
- * temporary; `user`, `alloc` and `dealloc` must stay valid until the
- * matching ztex_context_destroy.
+ * as well. ztex_context_create COPIES this struct, so the struct itself may
+ * be a temporary; `user`, and the two functions, must stay valid and
+ * callable until the matching ztex_context_destroy.
  *
- * `alloc` returns memory aligned for max_align_t (16 bytes on every target
- * ztex builds for), or NULL when it cannot. `dealloc` receives the exact
- * `len` its matching `alloc` call was given. The library grows a buffer by
- * allocating, copying and freeing, so an arena works and a size-tracking
- * free list stays exact. A NULL from `alloc`, or a request whose length
- * does not fit the 32-bit ABI, is an ordinary allocation failure, so a
- * render answers ZTEX_OUT_OF_MEMORY rather than failing some other way.
+ * `alloc` returns memory aligned for max_align_t, or NULL when it cannot.
+ * `dealloc` receives the exact `len` its matching `alloc` call was given,
+ * never more and never less, so a free list stays exact. The library grows
+ * a buffer by allocating, copying and freeing, so an arena works and a
+ * size-tracking allocator never has to guess. A NULL from `alloc`, or a
+ * request whose length does not fit the 32-bit ABI, is an ordinary
+ * allocation failure: a render answers ZTEX_OUT_OF_MEMORY rather than
+ * failing some other way.
+ *
+ * Both callbacks run on the thread that called into ztex — synchronously,
+ * from inside the call that needed the memory, before that call returns.
+ * Neither may reenter ztex on the same context: an allocator that calls
+ * ztex_render_svg or ztex_render_raster from inside `alloc` or `dealloc`
+ * corrupts the render already in flight, including entry from another thread.
+ * Access to one context must be serialized. A different context is independent
+ * if the shared allocator supports its use.
+ *
+ * `user` is passed back unchanged, so a state struct, an arena or a
+ * thread-local handle reaches both callbacks exactly as it was given.
  */
 typedef struct ztex_allocator {
     void *(*alloc)(void *user, ztex_u32 len);
@@ -139,9 +168,9 @@ typedef struct ztex_allocator {
  * a margin in points, on every side, and must be >= 0 and finite: a
  * negative margin is ZTEX_INVALID_ARGUMENT, a non-finite one
  * ZTEX_NON_FINITE_COORDINATE. `background` is a packed 0xRRGGBBAA color,
- * or ZTEX_COLOR_NONE for none. The two font stacks are NUL-terminated CSS
- * font-family lists for math (italic) runs and for upright (\text,
- * \mathrm, \mathbf) runs; NULL keeps ztex's own.
+ * or ZTEX_COLOR_NONE for none. Known glyphs are self-contained outlines.
+ * The two NUL-terminated CSS font-family lists affect only unavailable
+ * glyph fallback: math (italic) or upright text. NULL keeps ztex's own.
  */
 typedef struct ztex_svg_options {
     float padding;
@@ -151,18 +180,28 @@ typedef struct ztex_svg_options {
 } ztex_svg_options;
 
 /*
- * Raster rendering knobs. A NULL pointer means the defaults below (96 dpi,
- * 1x scale, RGBA), but a ZEROED struct is an error — dpi 0 is not a
- * resolution — and ztex says so. `dpi` and `scale` must be finite and > 0,
- * `format` one of ZTEX_PIXEL_*. `fg` is the ink color and `bg` the
- * background, both packed 0xRRGGBBAA, or ZTEX_COLOR_NONE for a transparent
- * buffer. `padding` is a margin in pixels, on both axes.
+ * Raster rendering knobs. A NULL `options` pointer asks for the defaults
+ * this paragraph spells out: 96 dpi, 1x scale, no margin,
+ * ZTEX_PIXEL_RGBA32, opaque black ink — `fg` 0x000000ff, alpha last — and a
+ * transparent background. A ZEROED struct is not that default: dpi 0 is
+ * not a resolution, so ztex answers ZTEX_INVALID_ARGUMENT and names `dpi`.
  *
- * These three size a 32-bit frame. A dpi, scale or padding that is
- * otherwise well formed but frames an image whose width, height or row
- * stride has no 32-bit representation is ZTEX_OUTPUT_TOO_LARGE, measured
- * before the pixel block is requested — a hostile option is never handed
- * to your alloc.
+ * `dpi` and `scale` must be finite and > 0, `format` one of ZTEX_PIXEL_*.
+ * `fg` is the ink color and `bg` the background, both packed 0xRRGGBBAA
+ * with the alpha byte LAST — opaque black is 0x000000ff — or
+ * ZTEX_COLOR_NONE for no background. `padding` is a margin in pixels, on
+ * both axes.
+ *
+ * C has no field defaults, so a struct you pass is exactly the fields you
+ * assigned: an omitted `fg` is zero, which is a fully transparent ink and
+ * paints nothing at all. Assign every field you pass, `fg` above all, or
+ * pass NULL for the defaults.
+ *
+ * dpi, scale and padding size a 32-bit frame. One that is otherwise well
+ * formed but frames an image whose width, height or row stride has no
+ * 32-bit representation, or whose payload is above 4 GiB - 2 bytes, is
+ * ZTEX_OUTPUT_TOO_LARGE. Both are measured before the pixel block is
+ * requested, so a frame ztex cannot describe never reaches your alloc.
  *
  * ZTEX_PIXEL_ALPHA8 ignores most of both colors: a mask byte is the glyph
  * coverage times the ALPHA byte of the ink — `fg`'s alpha for ordinary ink,
@@ -231,8 +270,7 @@ void ztex_context_destroy(ztex_context *context);
  * is caught before the document is built), ZTEX_PARSE_ERROR,
  * ZTEX_INVALID_AST, ZTEX_FONT_ERROR, ZTEX_NON_FINITE_COORDINATE,
  * ZTEX_OUT_OF_MEMORY, or ZTEX_OUTPUT_TOO_LARGE — a payload above
- * 4 GiB - 2 bytes, which no real render reaches. So a failed call is never
- * a size query: only ZTEX_BUFFER_TOO_SMALL reports a size.
+ * 4 GiB - 2 bytes. Only ZTEX_BUFFER_TOO_SMALL reports a required size.
  */
 int ztex_render_svg(
     ztex_context *context,
@@ -296,5 +334,9 @@ int ztex_last_error(
     ztex_u32 capacity,
     ztex_u32 *out_length
 );
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif /* ZTEX_H */

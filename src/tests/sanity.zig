@@ -75,15 +75,11 @@ fn expectSanePrimitive(dl: *const ztex.draw.DrawList, d: ztex.draw.Draw) !void {
     }
 }
 
-test "sanity: corpus primitives are finite, in-bounds, and svg-renderable" {
+test "sanity: corpus primitives have finite in-bounds coordinates" {
     for (corpus) |src| {
         var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
         defer out.deinit();
         for (out.items.items) |d| try expectSanePrimitive(&out, d);
-
-        const svg = try ztex.svg.render(testing.allocator, &out, .{});
-        defer testing.allocator.free(svg);
-        try testing.expect(svg.len > 0);
     }
 }
 

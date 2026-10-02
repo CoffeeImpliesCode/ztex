@@ -28,14 +28,16 @@
 //! `FontMetrics` argument. The metric source is the closed `FontMetrics`
 //! union: context.zig builds the `.font` arm — a `FontHook` carrying the
 //! `*FontContext` (opaque to the layout module, which cannot import
-//! font.zig), the font-glyph lookup below, and a borrowed pointer to the
+//! font.zig), the font-glyph lookup below, the horizontal and vertical MATH
+//! stretch resolvers below, and a borrowed pointer to the
 //! owned LM Math face's MATH constants — so `init` is one struct literal
 //! instead of hand-installed fn-pointer plumbing, and the concrete cast
 //! lives in exactly one place.
 
 const std = @import("std");
 const atom = @import("ztex.atom");
-const font = @import("font.zig");
+const font = @import("ztex.font");
+const glyph = @import("ztex.glyph");
 const parse = @import("ztex.parse");
 const layout = @import("ztex.layout");
 const metrics = layout.metrics;
@@ -58,45 +60,135 @@ const root = @import("root.zig");
 /// → LM Math), the same mapping the rasterizer draws from, so a run can
 /// never measure from one face and be drawn from another.
 /// The italic correction and top accent attachment are the face's OWN MATH
-/// measurements — read once per (face, cp) by the font context, cached
-/// beside the advance and scaled with it, so sup/sub placement follows the
-/// glyph that is actually drawn (LM Math's table: 𝑓 carries a 0.09em
-/// italic correction, 𝑥 a 0.329em top accent). A face that records none —
-/// every LM Roman text face — keeps the static row's correction instead.
-/// Null when the face has no glyph for `cp`: glyph/glyphAt then fall back
-/// to the static tables, and finally to glyphEstimate.
-fn contextGlyph(ctx: *anyopaque, cp: u21, style: atom.CharStyle) ?metrics.Glyph {
+/// measurements — read once per (face, cp, glyph) by the font context,
+/// cached beside the advance and scaled with it, so sup/sub placement
+/// follows the glyph that is actually drawn (LM Math's table: 𝑓 carries a
+/// 0.09em italic correction, 𝑥 a 0.329em top accent). A face that records
+/// none — every LM Roman text face — keeps the static row's correction
+/// instead. Null when the face has no glyph for `cp`: glyph/glyphAt then
+/// fall back to the static tables, and finally to glyphEstimate.
+///
+/// `size_pt` is the size the glyph is DRAWN at and selects nothing but the
+/// prime tier: the answer stays the 10pt base every caller scales, and it is
+/// asked for at `font.small_prime_max_size` or below so the prime composites
+/// are measured from the unencoded alternates the back ends paint there.
+/// Above the gate the base itself is asked for and multiplied by exactly one,
+/// so no size that was already correct gains a rounding step.
+fn contextGlyph(ctx: *anyopaque, cp: u21, style: atom.CharStyle, size_pt: f32) ?metrics.Glyph {
     const f: *font.FontContext = @ptrCast(@alignCast(ctx));
-    const face = f.faceForStyle(style);
+    const face = f.faceForCodepoint(cp, style);
     if (face.glyphIndex(cp) == null) return null;
-    const m = f.metrics(face, cp, 10.0);
+    const script: ?f32 = if (size_pt <= font.small_prime_max_size) size_pt else null;
+    const m = f.metrics(face, cp, script orelse base_pt);
+    const to_base: f32 = if (script) |drawn| base_pt / drawn else 1.0;
     var ic: f32 = 0;
     if (m.italic_correction) |value| {
-        ic = value;
+        ic = value * to_base;
     } else if (metrics.staticGlyph(cp, style)) |e| {
         ic = e.italic_correction;
     }
     return .{
-        .width = m.width,
-        .height = m.height,
-        .depth = m.depth,
+        .width = m.width * to_base,
+        .height = m.height * to_base,
+        .depth = m.depth * to_base,
         .italic_correction = ic,
-        .top_accent_attachment = m.top_accent_attachment,
+        .top_accent_attachment = if (m.top_accent_attachment) |value| value * to_base else null,
     };
 }
 
+/// The em size every per-glyph answer is stated at; the layout scales it with
+/// `s()`.
+const base_pt: f32 = 10.0;
+
+fn contextHorizontal(
+    ctx: *anyopaque,
+    cp: u21,
+    req_em: f32,
+) metrics.StretchError!?metrics.StretchGeometry {
+    const fonts: *font.FontContext = @ptrCast(@alignCast(ctx));
+    const stretch = (try glyph.stretchGeometry(
+        fonts.gpa,
+        fonts.math,
+        .{ .cp = cp, .horizontal_req = req_em },
+    )) orelse return null;
+    return .{
+        .advance_em = stretch.advance_em,
+        .finite_ceiling_em = stretch.finite_ceiling_em,
+        .ink = inkOf(stretch.ink),
+    };
+}
+
+/// A request's painted union as layout's `GlyphInk`, in em from the item's
+/// own origin and Y-up: `asc` above the baseline, `desc` below it, and
+/// `bottom` the lower edge measured back UP — positive only for ink that
+/// floats entirely above the baseline. `left` is how far the ink reaches
+/// left of the origin; `right_edge` is its absolute right edge and stays
+/// SIGNED, because the consumer takes `max(0, right_edge × size − advance)`
+/// for the overhang and ink that ends left of its own origin is not a margin.
+fn inkOf(ink: glyph.Bounds) metrics.GlyphInk {
+    return .{
+        .asc = @max(0, ink.y_max),
+        .desc = @max(0, -ink.y_min),
+        .left = @max(0, -ink.x_min),
+        .right_edge = ink.x_max,
+        .bottom = @max(0, ink.y_min),
+    };
+}
+
+/// The VERTICAL form of `cp` a draw item names, resolved from the owned LM
+/// Math face's own MATH table: `form` is the rung of THIS fence's own ladder,
+/// `assembly_req` the ink height in em that asks for its assembly, and
+/// `fixed_req` the amsmath FIXED-rule height whose covering rung this fence
+/// picks (0 for neither). The answer is the widest hmtx advance among the
+/// glyphs the form places — the column layout reserves — together with the
+/// ink those placements really paint, both from the same resolution the back
+/// ends draw through. A face with no MATH table degrades to its base cmap
+/// glyph exactly as raster and svg do; null is only "no glyph, or nothing
+/// painted", and the resolver's errors stay errors.
+fn contextVertical(
+    ctx: *anyopaque,
+    cp: u21,
+    form: u8,
+    assembly_req: f32,
+    fixed_req: f32,
+) metrics.StretchError!?metrics.StretchGeometry {
+    const fonts: *font.FontContext = @ptrCast(@alignCast(ctx));
+    const stretch = (try glyph.verticalGeometry(fonts.gpa, fonts.math, .{
+        .cp = cp,
+        .delim_form = form,
+        .delim_req = assembly_req,
+        .delim_fixed = fixed_req,
+    })) orelse return null;
+    return .{
+        .advance_em = stretch.advance_em,
+        .ink = inkOf(stretch.ink),
+    };
+}
+
+/// Reusable embedded-font renderer with one owner and mutable glyph caches.
+///
+/// Created by `init`; a zero or arbitrary literal is not a valid context.
+/// `fonts` has a stable heap address for the hooks in `fm`. A context value
+/// may move, but a copy shares its allocations and is not a second owner.
+/// Keep the original allocator and owned font/hook identities intact until
+/// exactly one `deinit`; fields are reachable, not enforced private state.
+/// Methods do not perform font discovery or I/O. Concurrent or reentrant
+/// access to one context requires external serialization.
 pub const Context = struct {
-    /// Caller's allocator; owns the FontContext allocation.
+    /// Borrowed allocator for the font owner, caches, and render results.
+    /// Keep its backing state and identity valid through each result's cleanup.
     gpa: std.mem.Allocator,
-    /// The FontContext: embedded LM fonts + the per-(face, cp) metric cache
-    /// (heap-owned).
+    /// Owned heap allocation; released by this context, never by a borrower.
     fonts: *font.FontContext,
-    /// Metric source: the `.font` arm of the `FontMetrics` union, pointing
-    /// at `fonts`.
+    /// Hooks and MATH constants borrowed from `fonts`; invalid after `deinit`.
     fm: metrics.FontMetrics,
 
-    /// Build a context preloaded with the embedded Latin Modern fonts.
-    pub fn init(gpa: std.mem.Allocator) !Context {
+    /// Allocation or embedded-font decoding failures; construction is failure-atomic.
+    pub const InitError = error{OutOfMemory} || font.FontError;
+
+    /// Construct the font owner and its metric hooks with `gpa`, which is retained.
+    /// On error every acquired allocation is released and no context escapes.
+    pub fn init(gpa: std.mem.Allocator) InitError!Context {
         const fonts = try gpa.create(font.FontContext);
         errdefer gpa.destroy(fonts);
         fonts.* = try font.FontContext.init(gpa);
@@ -108,6 +200,8 @@ pub const Context = struct {
                 .font = .{
                     .ctx = fonts,
                     .glyph = &contextGlyph,
+                    .horizontal_glyph = &contextHorizontal,
+                    .vertical_glyph = &contextVertical,
                     // Borrowed from the owned LM Math face and valid for the
                     // life of `fonts`: layout reads its script sizes, axis
                     // height, gaps and rule thicknesses from the font's own
@@ -118,36 +212,41 @@ pub const Context = struct {
         };
     }
 
-    /// Release the FontContext (arena: embedded fonts, cache entries) and
-    /// its heap allocation. Call exactly once.
+    /// Releases the owned font arena and heap allocation, not `gpa` or render results.
+    /// The value and its font/hook borrows become invalid; repeat disposal is invalid.
     pub fn deinit(self: *Context) void {
         self.fonts.deinit();
         self.gpa.destroy(self.fonts);
         self.* = undefined;
     }
 
-    /// Full pipeline: LaTeX source → draw list, measured from the real
-    /// fonts via `self.fm`. Thin wrapper over the shared `renderPipeline`
-    /// (root.zig) with this Context's metric source; the returned
-    /// `DrawList`'s `text` primitives alias `src`, so `src` must outlive
-    /// the draw list. `size_pt` is the base font size in points. On a
-    /// parse error, `err_info` (when non-null) is filled with the kind +
-    /// span. Allocates with `self.gpa`.
+    /// Lay out `src` using the owned font faces and metric cache.
     ///
-    /// Takes `*Context` (not `*const`): the first render fills the font
-    /// metric cache (`FontContext.metrics` mutates it while measuring), so
-    /// rendering is not a const operation.
+    /// `size_pt` must be finite and positive (`error.InvalidArgument` otherwise).
+    /// The returned list is owned by the caller and borrows only `src`, which
+    /// must remain alive and unchanged until its last use; it does not borrow
+    /// this context. Its stored allocator is `self.gpa`; dispose it once.
+    ///
+    /// Syntax/source-limit failures fill a supplied `err_info`; `null` opts
+    /// out. Success and other failures leave it unchanged. Failure releases
+    /// scratch and returns no partial list, but may retain valid cache entries.
+    /// This mutates caches, performs no I/O, and has no cancellation points.
     pub fn render(
         self: *Context,
         src: []const u8,
         style: layout.Style,
         size_pt: f32,
         err_info: ?*parse.Info,
-    ) (parse.Error || error{InvalidAst})!draw.DrawList {
+    ) root.RenderError!draw.DrawList {
         return root.renderPipeline(self.gpa, &self.fm, src, style, size_pt, err_info);
     }
 
-    /// Render a formula directly to a raster PixelBuffer (RGBA or Alpha mask).
+    /// Render through this context into an independently owned pixel buffer.
+    ///
+    /// Source, size, and diagnostic rules are those of `render`; frame limits
+    /// are those of `raster.rasterize`. The caller disposes the result once
+    /// while `self.gpa` remains valid. Neither source nor context is retained.
+    /// Failure returns no partial buffer and leaves the context usable.
     pub fn renderPixels(
         self: *Context,
         src: []const u8,
@@ -155,7 +254,7 @@ pub const Context = struct {
         size_pt: f32,
         opts: RasterOptions,
         err_info: ?*parse.Info,
-    ) !PixelBuffer {
+    ) root.PixelRenderError!PixelBuffer {
         var dl = try self.render(src, style, size_pt, err_info);
         defer dl.deinit();
         return raster.rasterize(self.gpa, self, &dl, opts);
@@ -269,6 +368,39 @@ test "context: the hook reports the drawn glyph's own MATH measurements" {
     try testing.expect(tg.top_accent_attachment == null);
 }
 
+test "context: tall and unpaired delimiter ink is enclosed by the zero-padding frame" {
+    var ctx = try Context.init(testing.allocator);
+    defer ctx.deinit();
+    const sources = [_][]const u8{
+        "\\begin{pmatrix}a&b\\\\c&d\\\\e&f\\end{pmatrix}",
+        "\\left\\{\\begin{matrix}a\\\\b\\\\c\\\\d\\\\e\\\\f\\end{matrix}\\right\\}",
+        "\\left.\\frac{a}{b}\\right|",
+    };
+    for (sources) |source| {
+        var out = try ctx.render(source, .display, 20, null);
+        defer out.deinit();
+        const frame = out.bounds();
+        for (out.items.items) |item| {
+            if (item != .text) continue;
+            const t = item.text;
+            if (t.delim_form == 0 and t.delim_req == 0 and t.delim_fixed == 0) continue;
+            const cp = std.unicode.utf8Decode(t.bytes) catch return error.TestUnexpectedResult;
+            const ink = (try glyph.paintedBounds(testing.allocator, ctx.fonts.math, .{
+                .cp = cp,
+                .delim_form = t.delim_form,
+                .delim_req = t.delim_req,
+                .delim_fixed = t.delim_fixed,
+            })) orelse return error.TestUnexpectedResult;
+            try testing.expect(t.x + ink.x_min * t.size >= frame.min_x - 0.001);
+            try testing.expect(t.x + ink.x_max * t.size <= frame.min_x + frame.width + 0.001);
+            try testing.expect(t.y - ink.y_max * t.size >= frame.min_y - 0.001);
+            try testing.expect(
+                t.y - ink.y_min * t.size <= frame.min_y + frame.height + frame.depth + 0.001,
+            );
+        }
+    }
+}
+
 test "context: every text style measures and rasterizes one identical face" {
     var ctx = try Context.init(testing.allocator);
     defer ctx.deinit();
@@ -306,5 +438,156 @@ test "context: every text style measures and rasterizes one identical face" {
         for (ink, 0..) |b, j| {
             if (i < j) try testing.expect(a != b);
         }
+    }
+}
+
+test "context: a font-backed accent lands the mark's attachment on the base's" {
+    var ctx = try Context.init(testing.allocator);
+    defer ctx.deinit();
+    var out = try ctx.render("\\hat{x}", .display, 20, null);
+    defer out.deinit();
+    // Two drawn items: the base 𝑥 and the combining circumflex, each placed
+    // by its own origin in the real face.
+    var base_x: f32 = 0;
+    var mark_x: f32 = 0;
+    var seen: usize = 0;
+    for (out.items.items) |item| {
+        if (item != .text) continue;
+        const cp = std.unicode.utf8Decode(item.text.bytes) catch continue;
+        if (cp == 0x1D465) base_x = item.text.x;
+        if (cp == 0x0302) mark_x = item.text.x;
+        seen += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), seen);
+    // LM Math's own MATH table: the base's 0.329em attachment receives the
+    // mark's -0.264em one, so the mark origin sits 0.593em right of the base's
+    // at 20pt. The mark's ink centre is NOT the target — the mark has a zero
+    // advance and all of its ink left of the origin, so `ink_metrics` clamps
+    // `right_edge` to 0 and an ink-centred mark lands 0.041em too far left.
+    const base_attach = metrics.fontTopAccentAttachment(&ctx.fm, 0x1D465, .italic) orelse
+        return error.TestUnexpectedResult;
+    const mark_attach = metrics.fontTopAccentAttachment(&ctx.fm, 0x0302, .italic) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectApproxEqAbs(0.329, base_attach, 0.001);
+    try testing.expectApproxEqAbs(-0.264, mark_attach, 0.001);
+    try testing.expectApproxEqAbs((base_attach - mark_attach) * 20.0, mark_x - base_x, 0.001);
+}
+
+/// Where `x'''` puts its two drawn items: the base's origin and the prime
+/// composite's own origin, size and baseline. The composite is one glyph for
+/// the whole prime run, so a `x'`-style render is the same two items.
+const PrimeRun = struct {
+    base_x: f32,
+    base_y: f32,
+    prime_x: f32,
+    prime_y: f32,
+    prime_size: f32,
+};
+
+fn primeRun(dl: *const draw.DrawList, cp: u21) error{TestUnexpectedResult}!PrimeRun {
+    var run: PrimeRun = undefined;
+    var seen: usize = 0;
+    for (dl.items.items) |item| {
+        if (item != .text) continue;
+        const t = item.text;
+        seen += 1;
+        const here = std.unicode.utf8Decode(t.bytes) catch continue;
+        if (here == 0x1D465) {
+            run.base_x = t.x;
+            run.base_y = t.y;
+        } else if (here == cp) {
+            run.prime_x = t.x;
+            run.prime_y = t.y;
+            run.prime_size = t.size;
+        }
+    }
+    if (seen != 2) return error.TestUnexpectedResult;
+    return run;
+}
+
+/// TeX's `\scriptspace`: the fixed 0.5pt a script box carries AFTER its own
+/// content. A `x'''` noad is the base's advance, then the prime composite's,
+/// then this pad — so reading a composite's advance off a drawn width without
+/// naming the pad measures the pad too.
+const script_space: f32 = 0.5;
+
+/// The base 𝑥's own advance at `size_pt`, read from the very face layout
+/// measures and draws it from: everything the prime adds to the noad sits on
+/// top of this, and nothing else does.
+fn baseAdvance(ctx: *const Context, size_pt: f32) f32 {
+    const face = ctx.fonts.faceForCodepoint(0x1D465, .italic);
+    return ctx.fonts.metrics(face, 0x1D465, size_pt).width;
+}
+
+test "context: a script-size prime run measures the face's unencoded composite" {
+    var ctx = try Context.init(testing.allocator);
+    defer ctx.deinit();
+    // An 8pt base sets its script at 5.6pt, and every prime composite at that
+    // size is the face's unencoded alternate on LM Math's 0.3em grid: 0.489 /
+    // 0.789 / 1.089 / 1.389em for a run of one to four primes. The triple
+    // prime therefore advances 6.0984pt, and the noad it hangs off is the
+    // base's own 4.576pt plus that plus TeX's 0.5pt scriptspace pad.
+    var out = try ctx.render("x'''", .display, 8, null);
+    defer out.deinit();
+    const run = try primeRun(&out, 0x2034);
+    try testing.expectApproxEqAbs(@as(f32, 5.6), run.prime_size, 0.0001);
+    const base = baseAdvance(&ctx, 8);
+    // The composite's origin is the base's right edge — 𝑥 carries no italic
+    // correction — so this is where the base ends and the prime begins.
+    try testing.expectApproxEqAbs(base, run.prime_x - run.base_x, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 6.0984), out.width - base - script_space, 0.001);
+    try testing.expectApproxEqAbs(base + 6.0984 + script_space, out.width, 0.001);
+    // The raise is the layout's own script shift — 0.363em of the base, the
+    // 2.904pt of an 8pt base — and no glyph swap moves it: the composite's
+    // baseline is exactly as far above the base's as it always was.
+    try testing.expectApproxEqAbs(@as(f32, 2.904), run.base_y - run.prime_y, 0.001);
+
+    // The whole family switches together, each run at its own composite.
+    const family = [_]struct { src: []const u8, cp: u21, width: f32 }{
+        .{ .src = "x'", .cp = 0x2032, .width = base + 2.7384 + script_space },
+        .{ .src = "x''", .cp = 0x2033, .width = base + 4.4184 + script_space },
+        .{ .src = "x'''", .cp = 0x2034, .width = base + 6.0984 + script_space },
+        .{ .src = "x''''", .cp = 0x2057, .width = base + 7.7784 + script_space },
+    };
+    for (family) |c| {
+        var one = try ctx.render(c.src, .display, 8, null);
+        defer one.deinit();
+        const item = try primeRun(&one, c.cp);
+        try testing.expectApproxEqAbs(@as(f32, 5.6), item.prime_size, 0.0001);
+        try testing.expectApproxEqAbs(c.width, one.width, 0.001);
+    }
+}
+
+test "context: past the script gate the prime composite measures exactly as before" {
+    var ctx = try Context.init(testing.allocator);
+    defer ctx.deinit();
+    // The gate is the drawn size, and a 12pt base is already past it: its
+    // 8.4pt script draws the cmap's own 0.711em composite, 5.9724pt. A 20pt
+    // and a 60pt base keep the measures they always had — 9.954pt over a
+    // 21.894001pt noad and 29.862pt over a 64.682pt one — and 12.06pt is the
+    // base whose script (8.442pt) sits closest to the gate from above. The
+    // noad is base + composite + \scriptspace at every size, gate or no gate.
+    const cases = [_]struct {
+        size: f32,
+        script: f32,
+        advance: f32,
+        width: f32,
+        raise: f32,
+    }{
+        .{ .size = 12, .script = 8.4, .advance = 5.9724, .width = 13.336401, .raise = 4.356 },
+        .{ .size = 12.06, .script = 8.442, .advance = 6.0024, .width = 13.400682, .raise = 4.3778 },
+        .{ .size = 20, .script = 14, .advance = 9.954, .width = 21.894001, .raise = 7.26 },
+        .{ .size = 60, .script = 42, .advance = 29.862, .width = 64.682, .raise = 21.78 },
+    };
+    for (cases) |c| {
+        var out = try ctx.render("x'''", .display, c.size, null);
+        defer out.deinit();
+        const run = try primeRun(&out, 0x2034);
+        try testing.expectApproxEqAbs(c.script, run.prime_size, 0.0001);
+        const base = baseAdvance(&ctx, c.size);
+        try testing.expectApproxEqAbs(base, run.prime_x - run.base_x, 0.001);
+        try testing.expectApproxEqAbs(c.advance, out.width - base - script_space, 0.001);
+        try testing.expectApproxEqAbs(c.width, out.width, 0.001);
+        try testing.expectApproxEqAbs(c.raise, run.base_y - run.prime_y, 0.001);
     }
 }

@@ -3,6 +3,11 @@
 //! A pure function: (atom tree + FontMetrics + style) → box pool. Each box
 //! carries its dimensions and the source byte span of the atom it came from,
 //! preserving provenance end to end.
+//!
+//! This file is the recursive engine; its PUBLIC boundary is `render` in
+//! ztex/layout/root.zig, which checks the whole atom tree once and then calls
+//! `layout` below. Callers reach this file through that boundary, so the
+//! preconditions documented on `layout` are established for them.
 
 const std = @import("std");
 const zg = @import("zg");
@@ -18,7 +23,15 @@ const Graphemes = @import("Graphemes");
 /// into a `fraction` node's `data` or a `.mathstyle` node's `data`.
 pub const Style = atom.MathStyle;
 
-pub const Error = error{ OutOfMemory, InvalidAst };
+/// Layout failures: a call argument outside its documented domain
+/// (`error.InvalidArgument` — the public boundary's size check), an
+/// allocation, a malformed hand-built atom tree, and — since the stretchy
+/// MATH forms resolve their horizontal geometry through a wired font —
+/// whatever that resolution itself can fail with (`metrics.StretchError`: an
+/// outline that will not decode, a table the face does not carry). Those
+/// stay errors instead of decaying into the bundled static geometry;
+/// `metrics.horizontalGlyph`'s errors propagate here.
+pub const Error = error{ InvalidArgument, OutOfMemory, InvalidAst } || metrics.StretchError;
 
 /// The `data` a \sqrt row node carries (set by the parser): children
 /// [surd char (optionally wrapped in a script node holding the root index),
@@ -138,6 +151,35 @@ const tag_row_data: u32 = 1 << 6;
 /// own ink. The test is structural — one `.char` box, possibly wrapped in
 /// single-child hboxes — so it never reads the source spelling and never
 /// allocates.
+/// The trailing italic correction TeX's fin_mlist appends to EVERY math
+/// list: the last character's MATH italic correction. The row already
+/// appends it between adjacent char noads, but a group ENDING in a char
+/// whose next atom is not a char (here: the accent mark itself) carries
+/// only the bare advance — `\hat{AB}` must add B's 0.025em back before
+/// halving. 0 for a base that is not a character row.
+fn trailingGroupIc(
+    list: *const box.BoxList,
+    base: u32,
+    fm: *const metrics.FontMetrics,
+    size_pt: f32,
+) f32 {
+    var cur = base;
+    while (true) {
+        const b = list.get(cur);
+        if (b.kind == .char) break;
+        const ch = list.children(cur);
+        if (b.kind != .hbox or ch.len == 0) return 0;
+        cur = ch[ch.len - 1].idx;
+    }
+    const cd = list.charData(cur);
+    // The box already carries the DRAWN codepoint in the base's own style,
+    // so the correction is the same one layoutRow appends after this atom:
+    // the font arm's base-point value scaled by s(), the static em value
+    // scaled by the size directly (see charIc).
+    if (metrics.fontItalicCorrection(fm, cd.cp, cd.style)) |ic| return s(ic, size_pt);
+    return envIc(cd.cp) * size_pt;
+}
+
 fn baseIsSingleChar(list: *const box.BoxList, base: u32) bool {
     var cur = base;
     while (true) {
@@ -199,10 +241,27 @@ const keep_depth: u32 = 4;
 /// parser's `smash_row`.
 const smash_row: u32 = 1 << 7;
 
-/// Lay out the atom tree rooted at `idx` into the box pool.
+/// Lay out the atom tree rooted at `idx` into the box pool and return that
+/// root box's index.
 ///
-/// `size_pt` is the current font size; `current_style` is the effective font
-/// style inherited from enclosing `styled` atoms (default `.italic` math).
+/// This is the LOW-LEVEL entry. `layout.render` validates a tree once and
+/// then calls it, and every datum this function reads out of `ast` — child
+/// indices, token runs, the source spans they name, and each `data` that
+/// decodes to an enum — is checked THERE and not here. Calling it directly
+/// therefore carries a precondition: `ast` is a tree that passed that
+/// validation (child counts against each tag's arity, in-bounds child
+/// indices, a tree-shaped root-reachable subgraph, depth within
+/// `atom.max_ast_depth`, token runs inside the token table, token spans
+/// inside `ast.src`, in-range enum payloads, and `.hline` only as an `.env`
+/// entry). A tree that breaks it reads out of bounds or panics in
+/// `@enumFromInt`; it does not report an error.
+///
+/// `list` receives every box and must outlive the caller's use of the
+/// returned index. `size_pt` is the current font size in POINTS and must be
+/// finite and positive — nothing here checks it, which is why the public
+/// boundary refuses a size that is not before it gets here. `current_style`
+/// is the effective font style inherited from enclosing `styled` atoms
+/// (default `.italic` math).
 pub fn layout(
     list: *box.BoxList,
     ast: *const atom.Ast,
@@ -940,6 +999,18 @@ inline fn mathFrak(cp: u21) ?u21 {
     return null;
 }
 
+inline fn mathPlainAlphabet(
+    cp: u21,
+    comptime upper: u21,
+    comptime lower: u21,
+    comptime digit: u21,
+) ?u21 {
+    if (cp >= 'A' and cp <= 'Z') return upper + cp - 'A';
+    if (cp >= 'a' and cp <= 'z') return lower + cp - 'a';
+    if (cp >= '0' and cp <= '9') return digit + cp - '0';
+    return null;
+}
+
 fn layoutChar(
     list: *box.BoxList,
     ast: *const atom.Ast,
@@ -975,6 +1046,12 @@ fn layoutChar(
     // \text runs bypass layoutChar (layoutText reads the source directly),
     // so `\text{a-b}` keeps the text hyphen, exactly like XeTeX.
     if (cp == 0x2D) mcp = 0x2212;
+    // `:` is TeX's math RATIO: unicode-math draws the MATH colon U+2236,
+    // whose dots sit higher and closer than the text colon's. Both `a:b`
+    // and `a\colon b` arrive here as 0x3A; `\text{a:b}` bypasses
+    // layoutChar, so the text colon is untouched. The class still comes
+    // from the source codepoint, so `:` stays a relation.
+    if (cp == 0x3A) mcp = 0x2236;
     if (cstyle == .italic) {
         if (mathItalic(cp)) |m| {
             if (metrics.hasGlyph(fm, m, cstyle)) mcp = m;
@@ -993,6 +1070,14 @@ fn layoutChar(
         }
     } else if (cstyle == .frak) {
         if (mathFrak(cp)) |m| {
+            if (metrics.hasGlyph(fm, m, cstyle)) mcp = m;
+        }
+    } else if (cstyle == .sans) {
+        if (mathPlainAlphabet(cp, 0x1D5A0, 0x1D5BA, 0x1D7E2)) |m| {
+            if (metrics.hasGlyph(fm, m, cstyle)) mcp = m;
+        }
+    } else if (cstyle == .mono) {
+        if (mathPlainAlphabet(cp, 0x1D670, 0x1D68A, 0x1D7F6)) |m| {
             if (metrics.hasGlyph(fm, m, cstyle)) mcp = m;
         }
     }
@@ -1055,61 +1140,50 @@ fn setCharOverhang(list: *box.BoxList, idx: u32, ink: metrics.GlyphInk, size_pt:
 /// \dot \hat \bar \vec \ddot \tilde (a row marked `accent_row_data`;
 /// children [base, accent-mark char]): lays out the base normally, then
 /// draws the combining mark as a separate char box AT THE BASE SIZE on the
-/// SAME baseline as the base, centered over it. The mark is ZERO-WIDTH (the
-/// LM Math hmtx advance of every combining mark is 0, measured with
+/// SAME baseline as the base, centred over it. The narrow mark is ZERO-WIDTH
+/// (the LM Math hmtx advance of every combining mark is 0, measured with
 /// fontTools) — it never widens the box, exactly TeX's zero-width accents.
 /// The mark's ink pokes above the base box, so the result box HEIGHT grows
 /// to bound it (TeX: an accent noad's height is max(base, accent)); width
 /// and depth stay the base's.
 ///
-/// Placement facts (measured on latinmodern-math.otf 2.005 and the XeTeX
-/// reference render at 10pt):
-///   · LM Math draws every combining mark's ink 0.554–0.746em ABOVE its own
-///     baseline (the marks live at the top of the em box) and 0.106–0.416em
-///     tall. On the SAME baseline as an x-height base (ink top 0.442em) the
-///     mark's ink bottom (0.521em) lands ~x_height/4 (0.108em) above the
-///     base ink top — the font's own accent design. XeTeX places \dot{q}'s
-///     dot at the base baseline (measured: every glyph, mark included, sits
-///     on y = 7.427), so the mark baseline is NOT raised.
-///   · every mark's ink is centered at −0.264em from the glyph origin (the
-///     marks are designed to combine with a PRECEDING glyph), so the origin
-///     is placed at the base's MATH-table MathTopAccentAttachment + 0.264em
-///     (XeTeX's accent rule with unicode-math — the attachment point of the
-///     slanted base's TOP, right of the ink center; measured \dot{q} at
-///     40pt: dot ink at q_origin + 0.349em = u1D45E's attachment vs the
-///     base ink center 0.246em).
-/// The SVG emits the mark as a separate <text> with the standalone combining
-/// char; the PIL critique raster and the geometric verifier draw it at the
-/// positioned baseline from the real LM Math outlines, so the mark lands
-/// exactly where this box says. A BROWSER may compose the standalone
-/// combining char differently (small mark at its baseline) — acceptable;
-/// the positioned box is the correct geometry. An accent over a base taller
-/// than AccentBaseHeight — a fraction, a big operator, `\widehat{abc}` whose
-/// last letter is short but whose b is not — is RAISED to clear the base's
-/// own ink top; see the vertical rule below.
+/// Horizontal placement facts (measured on latinmodern-math.otf 2.005 and
+/// both reference engines at 10–60pt):
+///   · each engine lands the MARK's own MATH-table TopAccentAttachment on
+///     the BASE's MathTopAccentAttachment. Measured `\hat{x}` at 20pt: the
+///     mark origin sits at base 0.329em minus mark −0.264em = 0.593em. The
+///     mark's attachment is NOT its ink centre: a combining mark has a zero
+///     advance with its whole ink left of the origin, so `ink_metrics`
+///     clamps `right_edge` to 0 and the ink centre lands 0.041em left of
+///     the attachment for U+0302.
+///   · that attachment belongs to a SINGLE-character base (`\hat{x}`,
+///     `\dot{q}`, and `\hat{=}`, whose group is one glyph). A multi-character
+///     argument has no one skew to inherit, so its mark is placed by the
+///     same rule against the argument's TeX width INCLUDING the trailing
+///     italic correction TeX's fin_mlist appends: `\hat{AB}` lands at
+///     (0.750 + 0.759 + 0.025) / 2 − mark attachment. A base with no MATH
+///     attachment (`=`, `+`) falls back to half its advance box. The old
+///     ink-centre rule put every mark left of all of these.
+///   · the mark ORIGIN follows from that target, by the mark's own datum. A
+///     rung that is the bare COMBINING glyph takes the mark's MATH
+///     TopAccentAttachment (origin = target − mark attachment): a zero-advance
+///     mark has its whole ink left of the origin, so its ink centre is the
+///     wrong datum. A SIZE VARIANT is not that glyph — it is a full-advance
+///     drawing whose ink is centred on the advance, so origin = target −
+///     variant ink centre. Subtracting the combining attachment from a
+///     variant parks every wide \widetilde/\widehat 0.264em + advance/2 to
+///     the right of where both engines draw it.
+///   · every mark's ink floats above the baseline (0.554–0.749em up for
+///     U+0302), and each engine places `\dot{q}`'s dot at the BASE baseline
+///     (measured: every glyph, mark included, sits on y = 7.427), so the mark
+///     baseline is NOT raised — the font's own ink does that.
 ///
-/// `extensible` is the \widehat / \widetilde form. A ONE-CHARACTER argument
-/// lays out exactly as \hat / \tilde do — the real combining mark, on the
-/// base's top-accent attachment. Every MULTI-character argument gets the
-/// extensible form, however short: `\widehat{xy}` is about 1em wide and
-/// still carries a hat over both letters. (amsfonts switched on an explicit
-/// width threshold; see `baseIsSingleChar` for why the shape of the argument
-/// is the real distinction.)
-///
-/// The wide form is ONE CONNECTED STROKE spanning the argument: a hat with a
-/// SINGLE apex, or a smooth single-period wave with one crest and one
-/// trough, at a constant stroke INSIDE the narrow mark's own ink band — the
-/// band's lower edge is the mark's own yMin (0.554em up for U+0302), so the
-/// stroke floats where the narrow accent does instead of dropping to the
-/// baseline and cutting through the argument. Repeating the narrow mark
-/// instead (a `\cleaders`-style leader fill) is NOT the same thing — it reads
-/// as a sawtooth row of little hats, one per letter, not an accent at all.
-///
-/// The stroke is fitted edge to edge: its ink starts on the base's left edge
-/// and ends on its right one, so nothing is painted outside the base's box
-/// and the draw list's ink bounds — which is what svg.zig's viewBox and
-/// raster.zig's pixel buffer are cut from — cover the accent exactly. See
-/// `wideAccentStroke` for the tessellation and the painted-band arithmetic.
+/// Extensible accents select the largest horizontal MATH variant that FITS
+/// the nucleus, or the first rung when even that is wider. A request past
+/// the ladder's last rung keeps that top rung UNSTRETCHED and centred —
+/// both reference engines draw the 1.916em tilde over `abcd` through
+/// `abcdefghij` alike, never a stretched stroke. One-character bases use
+/// the same width rule and keep their accent attachment.
 fn layoutAccent(
     list: *box.BoxList,
     ast: *const atom.Ast,
@@ -1125,33 +1199,17 @@ fn layoutAccent(
     const base = try layoutInner(list, ast, ast.child(idx, 0), fm, style, size_pt, cstyle, cramped);
     const bb = list.get(base);
 
-    // The mark's codepoint and drawn ink (glyphInk) — the narrow branch
-    // builds its mark box from them, and the long branch strokes inside the
-    // mark's own ink band so both forms share one vertical extent.
     const accent_size = size_pt;
-    const gl = metrics.glue(fm);
     const mark_atom = ast.node(ast.child(idx, 1));
     const mark_cp: u21 = @truncate(mark_atom.data);
-    const ink = metrics.glyphInk(mark_cp);
 
-    // Horizontal: XeTeX+unicode-math places the mark's attachment point (the
-    // combining marks draw their ink at −0.264em from the glyph origin — its
-    // MathTopAccentAttachment) on the BASE's MATH-table MathTopAccentAttachment
-    // — the slanted base's TOP, right of the ink center. So the mark origin
-    // sits (attachment + 0.264) × accent_size right of the base origin.
-    // Measured `\dot{q}` at 40pt: the reference dot ink lands at q_origin +
-    // 0.349em = u1D45E's attachment, 0.103em right of the q ink center
-    // (0.246em); the old box-center placement put it LEFT of the ink center
-    // (0.223em). Bases without a row (composites, unmeasured glyphs) fall
-    // back to centering on the base box. Vertical: the mark stays on the
-    // base's baseline (XeTeX reference; the font's ink height does the rest).
     // The base's drawn glyph: the LAST char box inside the base. A braced
     // base ({q}, the common case) is a group → row hbox whose cp is 0, so
     // the MATH attachment must come from its inner char (TeX places the
     // accent over the box with the last character's skew — the XeTeX MATH
     // attachment of the same glyph; a plain atom base is already the char).
     // Descend only through rows (hbox), never into vboxes/scripts (accents
-    // over those already fall back to centering — the tall-base limitation).
+    // over those already fall back to centring — the tall-base limitation).
     var attach_cp: u21 = 0;
     var char_x: f32 = 0;
     {
@@ -1173,16 +1231,85 @@ fn layoutAccent(
     }
     // The base's own top-accent attachment comes from the DRAWN glyph: the
     // `.font` arm's MATH TopAccentAttachment when the face records one, the
-    // measured `accentAttach` row otherwise (the static fallback).
+    // measured `accentAttach` row otherwise (the static fallback). Only a
+    // SINGLE-character base places by it; a multi-character argument has no
+    // one skew to inherit.
     const attach = if (attach_cp != 0)
         (metrics.fontTopAccentAttachment(fm, attach_cp, cstyle) orelse
             metrics.accentAttach(attach_cp))
     else
         null;
-    const x = if (attach) |a|
-        char_x + (a + 0.264) * accent_size
+    const single = baseIsSingleChar(list, base);
+
+    // The mark's OWN top-accent attachment: where it wants the base's
+    // attachment to land, and the datum for the ladder's ZERO-ADVANCE rung.
+    // A combining mark has a zero advance with its whole ink left of the
+    // origin, so the ink centre is NOT the attachment — for U+0302 the ink
+    // centre is 0.223em left of the origin while the MATH value is 0.264em,
+    // and ink-centring lands every accent 0.041em left of both reference
+    // engines. A full-advance SIZE VARIANT is not that glyph at all — it is
+    // placed by its own ink centre (mark_centre below). The font arm reads
+    // the real value; the static row carries the same measured marks.
+    const mark_attach = metrics.fontTopAccentAttachment(fm, mark_cp, .italic) orelse
+        metrics.accentAttach(mark_cp) orelse
+        0;
+    // The argument's TeX width INCLUDES the trailing italic correction
+    // TeX's fin_mlist appends to every math list — `\hat{AB}` centres on
+    // 0.750 + 0.759 + 0.025, not on the bare row advance.
+    const tex_w = bb.width + trailingGroupIc(list, base, fm, size_pt);
+    // The horizontal REQUEST: the base's own width, in em of the accent size.
+    // A non-zero request also rides the mark box out to the back ends, so the
+    // SVG and the rasterizer resolve the SAME variant this layout boxed.
+    const req_em = bb.width / accent_size;
+
+    // Only wide accents select a horizontal variant. A plain hat or tilde
+    // keeps its base glyph even when its argument is a wide character.
+    const native: ?metrics.StretchGeometry = blk: {
+        if (!extensible) break :blk null;
+        break :blk switch (mark_cp) {
+            0x0302, 0x0303 => try metrics.horizontalGlyph(fm, mark_cp, req_em),
+            else => null,
+        };
+    };
+
+    // The DRAWN form: the resolved variant, or the base combining glyph when
+    // the face declares no horizontal construction for this codepoint. A
+    // request past the ladder's last rung keeps that top rung UNSTRETCHED:
+    // both reference engines draw the 1.916em tilde centred over `abcd`
+    // through `abcdefghij` alike, never a stretched stroke.
+    const geom = native orelse metrics.StretchGeometry{
+        .advance_em = 0,
+        .ink = metrics.glyphInk(mark_cp),
+    };
+    const ink = geom.ink;
+    // Where the drawn form's INK must land, measured back from its ORIGIN.
+    // A zero-advance rung is the bare COMBINING glyph and keeps the mark's
+    // MATH attachment. Every SIZE VARIANT reserves a full advance and centres
+    // its ink on it, so the base's attachment has to meet the VARIANT's ink
+    // centre: `\widetilde{xy}` at 20pt draws the 0.931em rung with its ink at
+    // 0.466em, not at −0.264em, and subtracting the combining attachment
+    // there parked the whole tilde 0.73em right of the reference. The test is
+    // the ADVANCE, not `native != null`: a narrow argument that resolves to
+    // the base rung keeps mark_attach.
+    const mark_centre: f32 = if (geom.advance_em > 0)
+        (geom.ink.right_edge - geom.ink.left) / 2
     else
-        bb.width / 2 + 0.264 * accent_size;
+        mark_attach;
+
+    // Where the mark's datum must land. Both engines put the mark's own
+    // TopAccentAttachment on the base's, or — for a drawn size variant — the
+    // variant's ink centre: origin = base target − mark datum. A single base
+    // with a MATH attachment places by it; a base with none (`=`, `+`) falls
+    // back to half its advance box; a group places by the same rule against
+    // its TeX width INCLUDING the trailing italic correction TeX appends to
+    // the math list.
+    const base_target = if (single and attach != null)
+        char_x + attach.? * accent_size
+    else if (single)
+        bb.width / 2
+    else
+        tex_w / 2;
+    const x = base_target - mark_centre * accent_size;
 
     // Vertical: the mark sits on the base's baseline UNLESS the base's ink
     // is taller than AccentBaseHeight (LM Math MATH-table: 0.45em), when
@@ -1197,40 +1324,31 @@ fn layoutAccent(
     // The height the raise clears is the BASE BOX's own ink top — the tallest
     // glyph the argument really contains, not just the character the mark is
     // attached to. `\widehat{abc}` ends on a short c but carries a tall b, and
-    // raising only to c's 0.442em left the stroke straight through the b.
+    // raising only to c's 0.442em left the mark straight through the b.
     const accent_base_height = metrics.accentBaseHeightEm(fm) * accent_size;
     const raise = @max(0.0, bb.height - accent_base_height);
 
     const saved_len = list.scratch.items.len;
     defer list.scratch.items.len = saved_len;
     try list.scratch.append(list.gpa, .{ .idx = base, .x_shift = 0, .shift = 0 });
-    // The narrow branch: ONE mark, on the base's attachment point (the rule
-    // spelled out above). The long branch: ONE CONNECTED STROKE spanning the
-    // argument — a single hat with a single apex, or a single wave with one
-    // crest and one trough — never a run of repeated marks, which reads as a
-    // sawtooth row of little hats and is not an accent at all.
-    const wide = extensible and !baseIsSingleChar(list, base);
-    var accent_height: f32 = raise + ink.asc * accent_size;
-    if (wide) {
-        const t = s(gl.rule_thickness, accent_size);
-        // The mark's REAL ink band, `bottom` to `asc` — `bottom` is the
-        // glyph's yMin and a combining mark's is POSITIVE (the marks live at
-        // the top of the em box, 0.554em up for U+0302). The stroke is drawn
-        // INSIDE that band with its own baseline on the band's lower edge,
-        // not from the row baseline up: the extensible hat is a shallow
-        // chevron floating at the narrow mark's own height, and its feet
-        // must not reach down through the argument.
-        const band = (ink.asc - ink.bottom) * accent_size;
-        const mark_base = raise + ink.bottom * accent_size;
-        const stroke = wideAccentStroke(bb.width, band, t, size_pt, mark_cp == 0x0302);
-        const poly = try list.createPoly(stroke.stroke, bb.width, stroke.height, stroke.depth, span);
-        try list.scratch.append(list.gpa, .{ .idx = poly, .x_shift = 0, .shift = -mark_base });
-        accent_height = mark_base + stroke.height;
-    } else {
-        const mark = try accentMarkBox(list, mark_cp, ink, accent_size, span);
-        try list.scratch.append(list.gpa, .{ .idx = mark, .x_shift = x, .shift = -raise });
-    }
-    // Width/depth stay the base's (the accent is zero-width); the height
+    // ONE native mark over the argument: the resolved horizontal variant, or
+    // the base combining glyph when the face declares no construction. Never
+    // a run of repeated marks (a sawtooth row of little hats, not an accent)
+    // and never a parametric stroke: a request past the ladder's last rung
+    // keeps that top rung UNSTRETCHED, exactly what both engines draw.
+    const accent_height: f32 = raise + ink.asc * accent_size;
+    // A native variant carries the request; the base glyph, with no
+    // horizontal construction of its own, carries none.
+    const mark = try accentMarkBox(
+        list,
+        mark_cp,
+        geom,
+        if (native != null) req_em else 0,
+        accent_size,
+        span,
+    );
+    try list.scratch.append(list.gpa, .{ .idx = mark, .x_shift = x, .shift = -raise });
+    // Width/depth stay the base's (the accent never widens it); the height
     // grows to bound the raised mark's ink above the row baseline.
     return list.create(
         .hbox,
@@ -1245,179 +1363,45 @@ fn layoutAccent(
     );
 }
 
-/// The stroke of a LONG `\widehat` / `\widetilde`, plus the box extents that
-/// bound its ink (see `wideAccentStroke`).
-const WideStroke = struct {
-    stroke: box.Poly,
-    height: f32,
-    depth: f32,
-};
-
-/// ONE connected stroke spanning `width`, inside the narrow mark's own ink
-/// band `band` — the distance from the combining glyph's real yMin to its
-/// yMax (`GlyphInk.bottom`..`GlyphInk.asc`, scaled), because the extensible
-/// form is designed with the same vertical extent as the narrow one and the
-/// caller puts the stroke's own baseline on that band's lower edge — at the
-/// constant `t`
-/// — the font's own rule weight, the same `rule_thickness` the fraction bar,
-/// the overbar and an `\hline` use, so the stroke is FONT-SOURCED rather than
-/// a guessed margin. `hat` picks the chevron with a SINGLE apex; otherwise a
-/// smooth single-period wave with one crest and one trough.
+/// One combining-mark box of an accent: a `.char` at the base size drawing
+/// `geom`'s form — the resolved horizontal size variant, or the base glyph
+/// when the face declares no horizontal construction for this codepoint — in
+/// the MATH font family (.italic) so the rasterizer and the browser pick the
+/// LM Math face that carries the marks. The mark's utf-8 is the combining
+/// codepoint, which never equals the command's source bytes, so the box is
+/// synthetic and flatten dupes it into the arena.
 ///
-/// Every segment is emitted as its own butt-capped line, so the geometry is
-/// sized for what is really PAINTED, not for a hypothetical miter:
-///   · a segment paints a `t`-wide rectangle around it, and two of them
-///     meeting at a corner leave a notch on the outside of the turn as deep
-///     as a full miter's reach. Each interior vertex therefore carries that
-///     reach in `extend`, which overlaps the two bands and closes the
-///     corner. The two ENDS are unextended, so the stroke's outer extent is
-///     still exactly the box's edges.
-///   · a butt end overhangs its corner sideways by `(t/2)·|rise|/chord`,
-///     which a horizontal inset absorbs, so the ink runs edge to edge —
-///     which is what an extensible accent does (TeX's `\cleaders` always
-///     covers its target).
-///   · the box extent is the UNION OF THE PAINTED BANDS, measured off the
-///     final extended segments, so the draw list's ink bounds — what the
-///     viewBox and the pixel buffer are cut from — cover the stroke exactly.
-///
-/// The wave is a full sine period sampled at its exact quarter points, so
-/// the crest and the trough are always vertices, with a bounded number of
-/// chords per arc (1..6, from the argument's width, capped by
-/// `box.max_poly_points`). No allocation and no data-dependent shape: the same
-/// argument always yields the same stroke.
-fn wideAccentStroke(width: f32, band: f32, t: f32, size_pt: f32, hat: bool) WideStroke {
-    const half = t / 2;
-    var stroke: box.Poly = .{ .width = t };
-    if (hat) {
-        // ONE apex. The painted top of the stroke is the apex `rise` plus
-        // the butt band's own reach: half a thickness along the segment (the
-        // miter, `extend = half/sin α`, projects `half` onto the vertical)
-        // plus the band's perpendicular half-extent `half·cos α`. Fitting
-        // that painted top inside `band` is exactly
-        //   rise = band − half − half·dx/l,
-        // a weak contraction in `rise`, so a few fixed rounds reach it.
-        // Subtracting the miter reach itself instead — `half·l/rise` =
-        // `half/sin α` — over-subtracts by `half·(1/sin α − 1 − cos α)`,
-        // which grows without bound as the hat flattens, so a shallow hat
-        // over a wide argument diverges to a negative rise. The apex never
-        // sinks below one half-thickness: a band too thin to hold a hat
-        // clamps there rather than collapsing.
-        var rise: f32 = band;
-        var inset: f32 = 0;
-        for (0..6) |_| {
-            const dx = @max(width / 2 - inset, 0);
-            const l = @max(std.math.hypot(dx, rise), 1e-6);
-            rise = @max(band - half - half * dx / l, half);
-            inset = half * rise / l;
-        }
-        const dx = @max(width / 2 - inset, 0);
-        const l = @max(std.math.hypot(dx, rise), 1e-6);
-        stroke.count = 3;
-        stroke.points[0] = .{ .dx = inset, .dy = 0 };
-        stroke.points[1] = .{ .dx = width / 2, .dy = -rise };
-        stroke.points[2] = .{ .dx = width - inset, .dy = 0 };
-        stroke.extend[1] = @min(half * l / rise, l / 2);
-    } else {
-        // One full sine period: mid height at both ends, a crest at the
-        // first quarter, a trough at the third.
-        // At least two chords per arc, so even a one-em argument is a
-        // tessellated curve rather than a four-vertex zigzag.
-        const chords: usize = @intFromFloat(@max(2, @min(6, width / (1.5 * size_pt))));
-        const segs = 4 * chords;
-        const du = 1.0 / @as(f32, @floatFromInt(segs));
-        const mid = band / 2;
-        var amp = @max(mid - half, 0);
-        var inset: f32 = 0;
-        const angle = 2 * std.math.pi * du;
-        const crest_step = 1 - @cos(angle);
-        const first_sin = @sin(angle);
-        // At each extremum the joined band's reach is half / cos(chord angle).
-        // Fit that reach, not just the centreline, inside the mark's band.
-        for (0..6) |_| {
-            const dx = @max((width - 2 * inset) * du, 1e-6);
-            const slope = amp * crest_step / dx;
-            amp = @max(mid - half * @sqrt(1 + slope * slope), 0);
-            const first_dy = amp * first_sin;
-            const tangent = @max(std.math.hypot(dx, first_dy), 1e-6);
-            inset = @min(half * @abs(first_dy) / tangent, width / 4);
-        }
-        for (0..segs + 1) |i| {
-            const u: f32 = @as(f32, @floatFromInt(i)) * du;
-            const y = mid + amp * @sin(2 * std.math.pi * u);
-            stroke.points[i] = .{ .dx = inset + u * (width - 2 * inset), .dy = -y };
-        }
-        stroke.count = @intCast(segs + 1);
-        // Interior corners: the miter reach closes each one, capped at half
-        // the shorter adjacent chord so no segment can overshoot the path.
-        for (1..segs) |i| {
-            const a = stroke.points[i - 1];
-            const b = stroke.points[i];
-            const c = stroke.points[i + 1];
-            const l1 = @max(std.math.hypot(b.dx - a.dx, b.dy - a.dy), 1e-6);
-            const l2 = @max(std.math.hypot(c.dx - b.dx, c.dy - b.dy), 1e-6);
-            const ux1 = (b.dx - a.dx) / l1;
-            const uy1 = (b.dy - a.dy) / l1;
-            const ux2 = (c.dx - b.dx) / l2;
-            const uy2 = (c.dy - b.dy) / l2;
-            const dot = ux1 * ux2 + uy1 * uy2;
-            const cross = ux1 * uy2 - uy1 * ux2;
-            // The longitudinal overlap is half * tan(turn / 2): it vanishes
-            // for collinear chords instead of extending them by half a chord.
-            const reach = half * @abs(cross) / @max(1 + dot, 1e-6);
-            stroke.extend[i] = @min(reach, @min(l1, l2) / 2);
-        }
-    }
-    // The painted ink: the union of the extended bands' bounding boxes.
-    var min_x: f32 = std.math.inf(f32);
-    var max_x: f32 = -std.math.inf(f32);
-    var min_y: f32 = std.math.inf(f32);
-    var max_y: f32 = -std.math.inf(f32);
-    for (0..@as(usize, stroke.count) - 1) |k| {
-        const a = stroke.points[k];
-        const b = stroke.points[k + 1];
-        const l = @max(std.math.hypot(b.dx - a.dx, b.dy - a.dy), 1e-6);
-        const ux = (b.dx - a.dx) / l;
-        const uy = (b.dy - a.dy) / l;
-        const ax = a.dx - stroke.extend[k] * ux;
-        const ay = a.dy - stroke.extend[k] * uy;
-        const bx = b.dx + stroke.extend[k + 1] * ux;
-        const by = b.dy + stroke.extend[k + 1] * uy;
-        const nx = @abs(uy) * half; // the band's half-extent on each axis
-        const ny = @abs(ux) * half;
-        min_x = @min(min_x, @min(ax, bx) - nx);
-        max_x = @max(max_x, @max(ax, bx) + nx);
-        min_y = @min(min_y, @min(ay, by) - ny);
-        max_y = @max(max_y, @max(ay, by) + ny);
-    }
-    return .{ .stroke = stroke, .height = -min_y, .depth = max_y };
-}
-
-/// One combining-mark box of an accent: a `.char` at the base size, zero
-/// advance (every combining mark's LM Math hmtx advance is 0), boxed by the
-/// drawn ink, in the MATH font family (.italic) so the rasterizer and the
-/// browser pick the LM Math face that carries the marks. The mark's utf-8
-/// is the combining codepoint, which never equals the command's source
-/// bytes, so the box is synthetic and flatten dupes it into the arena.
+/// The box is the ADVANCE the form reserves and is bounded by the form's OWN
+/// ink, never the base codepoint's: `setCharOverhang` reads `geom.ink`, the
+/// same outline the resolver returned, so the frame encloses the variant that
+/// is really painted. That matters most at the ladder's base rung, a
+/// zero-advance glyph whose whole 0.446em ink hangs LEFT of the origin — a
+/// frame from the advance box alone would shave all of it off. `req_em`
+/// carries the request that chose the form out to the back ends (0 when the
+/// drawn form is the base glyph itself and has no construction to resolve).
 fn accentMarkBox(
     list: *box.BoxList,
     mark_cp: u21,
-    ink: metrics.GlyphInk,
+    geom: metrics.StretchGeometry,
+    req_em: f32,
     accent_size: f32,
     span: atom.Span,
 ) !u32 {
     const box_idx = try list.create(
         .char,
-        0,
-        ink.asc * accent_size,
-        ink.desc * accent_size,
+        geom.advance_em * accent_size,
+        geom.ink.asc * accent_size,
+        geom.ink.desc * accent_size,
         &.{},
         mark_cp,
         .italic,
         accent_size,
         span,
     );
-    list.charDataPtr(box_idx).synthetic = true;
-    setCharOverhang(list, box_idx, ink, accent_size);
+    const cd = list.charDataPtr(box_idx);
+    cd.synthetic = true;
+    cd.horizontal_req = req_em;
+    setCharOverhang(list, box_idx, geom.ink, accent_size);
     return box_idx;
 }
 
@@ -2045,14 +2029,8 @@ fn layoutSubstack(
 /// the TeX table, and TeX's \mkern suppresses any letter kern across it —
 /// so the pieces are simply laid at their advances with the two explicit
 /// kerns. The 6mu mod-n gap is a plain 6/18-em space leaf. The "mod" word
-/// is the ordinary opname mechanism (roman letters, no kerning), so it
-/// matches the KaTeX reference at every size (KaTeX_Main m/o/d/n advances
-/// equal ztex's cmr10 table) and the XeTeX reference at sizes <15pt; from
-/// 15pt up the roman metrics switch to the real LMRoman17 optical advances
-/// (m 0.772/o 0.459/d 0.511em vs the 0.833/0.5/0.556 LM Math values —
-/// XeTeX's fontspec optical-size selection — via metrics.zig's
-/// table_roman17/band17, which every roman renderer (\mathrm,
-/// \operatorname, opnames, \text) shares).
+/// is the ordinary opname mechanism (roman letters, no kerning), measured
+/// from the bundled LM Roman regular face at every size in both pipelines.
 fn layoutPmod(
     list: *box.BoxList,
     ast: *const atom.Ast,
@@ -2179,40 +2157,8 @@ fn layoutMod(
     return list.create(.hbox, x, height, depth, list.scratch.items[saved_len..], 0, cstyle, 0, span);
 }
 
-/// Forced-limit geometry for a \mathop carrying `\limits` — amsmath's
-/// \overset / \underset, the kernel's \stackrel, and the `_{...}` / `^{...}`
-/// annotation of \underbrace / \overbrace. Em × 10 at the 10pt base,
-/// measured on the XeTeX+unicode-math reference with Latin Modern Math
-/// (em × 10 so they scale linearly with size_pt; measured in a script:
-/// `\scriptstyle\overset{ab}{y}` reproduces them × 0.7 to 1e-5).
-///
-/// The limits box stacks the script over/under the base with the BASE'S OWN
-/// baseline as the reference point, so the base keeps its ink position
-/// exactly. Both gaps are measured from the base's INK edge, because the
-/// forced limit is an ordinary script of the base:
-///   over  — the script box's BOTTOM clears the base's TOP by `over_gap`,
-///           whatever the script's size (measured: `\overset{a}{b}` and
-///           `\overset{\frac12}{b}` put the limit's bottom at the same
-///           height, and `over_gap` is that height above the base's top)
-///   under — the script box's BASELINE clears the base's BOTTOM by
-///           `max(under_min, script_height + under_gap)`: at least
-///           `under_min` below the base's bottom edge, and at least
-///           `under_gap` past the script's own top. Equivalently the
-///           script's TOP clears the base's bottom by
-///           `max(under_min − script_height, under_gap)`, so a taller limit
-///           needs LESS clearance above it. The reference's
-///           `\underset{ab}{b}` and `\underset{ab}{y}` therefore DIFFER by
-///           y's 2.05pt depth, the same way a plain subscript of y sits
-///           lower than one of b.
-const limit_over_gap: f32 = 3.19967;
-const limit_under_min: f32 = 7.19924;
-const limit_under_gap: f32 = 2.86969;
-
-/// Stack a forced limit over/under an already-laid-out `base` box: the limit
-/// goes one step down the style ladder (script from display/text,
-/// scriptscript from script), is centred on max(base, limit), and the base
-/// stays on its own baseline. A limit's style is cramped for a subscript and
-/// inherits the base's for a superscript (tex.web make_scripts).
+/// Forced limits keep the nucleus's baseline and use the face's MATH spacing.
+/// The annotation follows the style ladder; under-limits are cramped.
 fn limitBox(
     list: *box.BoxList,
     ast: *const atom.Ast,
@@ -2245,19 +2191,12 @@ fn limitBox(
     const bb = list.get(base);
     const sb = list.get(script);
     const width = @max(bb.width, sb.width);
-    // The forced limit is an ordinary script of the base
-    // (\underset{bot}{base} = \mathop{base}\limits_{bot}), so it clears the
-    // base's DEPTH below / its HEIGHT above, exactly as layoutOpLimits does
-    // for a big operator (the limit's own top/bottom edge, not its
-    // reference point, measures the gap). Measuring from the base's
-    // BASELINE instead — the under side by `limit_under_min` alone, the
-    // over side without the limit's depth — dropped the annotation on top
-    // of any base that descends or ascends: `\underset{n}{\frac{a}{b}}`
-    // drew the n over the denominator.
+    // MATH gaps are inner clearances. TeX's outer operator padding must not
+    // be added between the nucleus and its annotation.
     const rise: f32 = if (under)
-        bb.depth + @max(s(limit_under_min, size_pt), sb.height + s(limit_under_gap, size_pt))
+        bb.depth + @max(s(gl.bigop_spacing4, size_pt), sb.height + s(gl.bigop_spacing2, size_pt))
     else
-        bb.height + sb.depth + s(limit_over_gap, size_pt);
+        bb.height + @max(s(gl.bigop_spacing3, size_pt), sb.depth + s(gl.bigop_spacing1, size_pt));
     // The limit hangs off the base's edge, so the result box reaches as far
     // as whichever of the two does — adding the base's depth to the limit's
     // own drop counted it twice.
@@ -2329,26 +2268,42 @@ fn layoutLimits(
     );
 }
 
-/// The band \underbrace / \overbrace occupies beyond the content, em × 10 at
-/// the 10pt base, measured on the XeTeX+unicode-math reference: `\underbrace{ab}`
-/// is 9.72 × 6.94 × 3.64 for a 9.72 × 6.94 × 0.11 content (the band hangs
-/// `underbrace_band` below), `\overbrace{ab}` is 9.72 × 10.27 × 0.11 (the band
-/// stands `overbrace_band` above). Both scale linearly with size_pt.
-const underbrace_band: f32 = 3.53;
-const overbrace_band: f32 = 3.33;
-
 /// \underbrace{x}_{c} / \overbrace{x}^{c} (a row carrying one of the two
 /// markers; children [content] or [content, annotation]): a \mathop — so
 /// class OP, no glue before and a thin space after (measured:
 /// `x\underbrace{ab}` has none, `x\underbrace{ab}y` a 3mu thin space) —
-/// carrying a brace band below (underbrace) or above (overbrace) the content
-/// and an optional forced-limit annotation. TeX assembles the band from the
-/// math font's extensible brace pieces (\downbracefill = \braceld + \braceru +
-/// \bracelu + \bracerd); the XeTeX reference resolves those to Latin Modern
-/// Math's square-brace assembly, whose per-piece ink is not in the bundled
-/// metric tables, so ztex draws the same band from three rules — a spine
-/// across the content width centred in the band and a tip at each end
-/// reaching toward the content.
+/// carrying a brace below (underbrace) or above (overbrace) the content, and
+/// an optional forced-limit annotation.
+///
+/// The brace is the MATH HORIZONTAL FORM the font itself draws — U+23DF under
+/// the content, U+23DE over it — resolved through `metrics.horizontalGlyph`
+/// for the content's own advance: the LARGEST horizontal size variant whose
+/// AdvanceMeasurement fits it. Requests beyond the ladder use the balanced
+/// GlyphAssembly of the glyph's own parts, which reaches any width.
+/// Measured with XeTeX+unicode-math, `\overbrace{a+b}` at 60pt paints U+23DE as
+/// ONE 1.996em glyph (the MATH variant with AdvanceMeasurement 1.997)
+/// centred on the content, and `\underbrace{\frac{a}{b}}` paints U+23DF as
+/// one glyph — a real curly brace with its cusp, never a rectangle.
+///
+/// Everything else follows the ink that will really be painted:
+///   · the chosen form's ADVANCE is the band's width, CENTRED on the content.
+///     The construct keeps the CONTENT's advance — an op's width is its
+///     content's, as the reference's box does too — and ink that overhangs it
+///     is recorded through `setCharOverhang`, so the draw list's bounds still
+///     enclose it.
+///   · the band's ink is cleared from the content's box edge by the font's own
+///     `rule_thickness`, the same clearance layoutOverUnder gives an overline
+///     (measured on the reference: the over brace's ink bottom sits 0.056em
+///     above the content's ink top, and `rule_thickness` is 0.0441em).
+///   · the height/depth grow to BOUND that ink, never by a guessed constant:
+///     U+23DE's ink floats above its own baseline (yMin 0.49–0.55em up, yMax
+///     0.78–0.85em), U+23DF's hangs below it (yMax 0, yMin 0.35–0.42em down),
+///     so each is placed by its own `bottom`/`asc`/`desc`.
+///
+/// The glyph's bytes are the codepoint, which never equals the `\underbrace`
+/// source, so the box is synthetic and `flatten` dupes them into the arena;
+/// `CharData.horizontal_req` carries the request so svg.zig and the rasterizer
+/// resolve the SAME form the layout boxed.
 fn layoutBrace(
     list: *box.BoxList,
     ast: *const atom.Ast,
@@ -2362,7 +2317,6 @@ fn layoutBrace(
 ) !u32 {
     const n = ast.node(idx);
     const span = ast.span(idx);
-    const gl = metrics.glue(fm);
     const content = try layoutInner(
         list,
         ast,
@@ -2374,35 +2328,59 @@ fn layoutBrace(
         cramped,
     );
     const cb = list.get(content);
-    const rt = s(gl.rule_thickness, size_pt);
-    const band = s(if (under) underbrace_band else overbrace_band, size_pt);
-    // The band is a square brace: a spine across the content width centred in
-    // the band, plus a tip at each end filling the half that faces the
-    // content. A rule box drawn at `shift` covers [shift − rt, shift] DOWN
-    // from the parent's baseline, so `shift` is minus the rule's lower edge
-    // measured upward (the same convention layoutOverUnder uses).
-    const half = band / 2 + rt / 2;
-    const spine_shift: f32 = if (under) cb.depth + half else -(cb.height + half - rt);
-    const tip_shift: f32 = if (under) cb.depth + half else -cb.height;
+    // The two halves of the extensible brace: U+23DF below the content, U+23DE
+    // above it. The request is the CONTENT's own advance, in em of the drawn
+    // size — the width the brace has to span.
+    const cp: u21 = if (under) 0x23DF else 0x23DE;
+    const req_em = if (size_pt > 0) cb.width / size_pt else 0;
+    // A wired face that declares no horizontal construction for this glyph
+    // answers null — a real "this face has no such form" — and the bundled
+    // ladder must NOT be substituted for it. The band then degrades to the
+    // glyph's own BASE form at the base size, the contract every other char
+    // box has, and never invents a stroke: with no request recorded the back
+    // ends draw that same base glyph.
+    const stretched = try metrics.horizontalGlyph(fm, cp, req_em);
+    const geo: metrics.StretchGeometry = stretched orelse blk: {
+        const g = metrics.glyphAt(fm, cp, .italic, size_pt) orelse
+            metrics.glyphEstimate(fm, cp, .italic);
+        break :blk .{
+            .advance_em = if (size_pt > 0) s(g.width, size_pt) / size_pt else 0,
+            .ink = metrics.glyphInkAt(cp, .italic),
+        };
+    };
+    const advance = geo.advance_em * size_pt;
+    const ink_asc = geo.ink.asc * size_pt;
+    const ink_desc = geo.ink.desc * size_pt;
+    // The band's own box: the drawn glyph, boxed by the ink of the form that
+    // was selected, at the base size in the MATH font family so the rasterizer
+    // and the browser pick the face that carries it.
+    const brace = try list.create(
+        .char,
+        advance,
+        ink_asc,
+        ink_desc,
+        &.{},
+        cp,
+        .italic,
+        size_pt,
+        span,
+    );
+    const cd = list.charDataPtr(brace);
+    cd.synthetic = true;
+    if (stretched != null) cd.horizontal_req = req_em;
+    setCharOverhang(list, brace, geo.ink, size_pt);
+    // XeTeX puts an underbrace on the nucleus's depth. An overbrace's baseline
+    // is AccentBaseHeight below the nucleus's top, not its glyph's lower edge.
+    const shift: f32 = if (under)
+        cb.depth
+    else
+        metrics.accentBaseHeightEm(fm) * size_pt - cb.height;
+    const height = if (under) cb.height else @max(cb.height, ink_asc - shift);
+    const depth = if (under) @max(cb.depth, shift + ink_desc) else cb.depth;
     const saved_len = list.scratch.items.len;
     defer list.scratch.items.len = saved_len;
     try list.scratch.append(list.gpa, .{ .idx = content, .x_shift = 0, .shift = 0 });
-    try list.scratch.append(list.gpa, .{
-        .idx = try list.createLeaf(.rule, cb.width, rt, 0, span),
-        .x_shift = 0,
-        .shift = spine_shift,
-    });
-    if (cb.width >= rt) {
-        for ([_]f32{ 0, cb.width - rt }) |x| {
-            try list.scratch.append(list.gpa, .{
-                .idx = try list.createLeaf(.rule, rt, half, 0, span),
-                .x_shift = x,
-                .shift = tip_shift,
-            });
-        }
-    }
-    const height = if (under) cb.height else cb.height + band;
-    const depth = if (under) cb.depth + band else cb.depth;
+    try list.scratch.append(list.gpa, .{ .idx = brace, .x_shift = (cb.width - advance) / 2, .shift = shift });
     const band_box = try list.create(
         .hbox,
         cb.width,
@@ -2560,6 +2538,19 @@ const fboxrule_pt: f32 = 0.4;
 /// a fixed dimension, so it never scales with the font size, and the same
 /// 0.4pt as `\fboxrule` above.
 const arrayrulewidth_pt: f32 = 0.4;
+
+/// LaTeX's `\doublerulesep` (article.cls: `\setlength\doublerulesep{2pt}`),
+/// fixed like `\arrayrulewidth` and never scaled with the font size.
+/// latex.ltx:16728 spells `\hline` as `\noalign{\hrule \@height
+/// \arrayrulewidth}` followed by a `\futurelet`, and `@xhline` — which sees
+/// whether the next token is another `\hline` — inserts `\vskip\doublerulesep
+/// \vskip-\arrayrulewidth` between the two. That is why two rules on ONE
+/// boundary are 2pt apart from ink top to ink top, and why the boundary opens
+/// up by \arrayrulewidth + (n − 1)·\doublerulesep rather than n thicknesses.
+/// Measured on the exact-font XeLaTeX reference at 20pt: the leading pair of
+/// `\begin{matrix}\hline\hline a&b\\c&d\\\hline\end{matrix}` has its rule
+/// centres 2.0004pt apart.
+const doublerulesep_pt: f32 = 2.0;
 
 /// \boxed{x} — LaTeX's `\fbox{\m@th$\displaystyle#1$}` (latex.ltx:1093):
 /// the frame goes OUTSIDE the content, the content keeps its baseline, and
@@ -2960,13 +2951,15 @@ fn charIc(
 ///     left-aligned, adjacent (the \minalignsep trailing tabskip is
 ///     cancelled by \math@cr@@@aligned's \kern-\alignsep@ — the "10pt"
 ///     gap between a and = is the THICK rel glue inside the right part).
-///   · ROWS get a strut of 0.7/0.3 \baselineskip (1.2× the current size;
-///     ×\arraystretch 1.2 for cases). matrix/array/cases stack rows
-///     DIRECTLY (LaTeX \@array zeroes \baselineskip/\lineskip — the strut
-///     forces the baseline distance = \baselineskip, measured 12pt at
-///     10pt, 43.2pt at 36pt). aligned \openup\jot's the interline:
-///     baselineskip+3pt, limit 3pt, lineskip 4pt — measured 3pt gap at
-///     both sizes.
+///   · ROWS get amsmath's `\strut@`, which copies LaTeX's `\strutbox`:
+///     0.7\baselineskip tall and 0.3\baselineskip deep (latex.ltx:12596 —
+///     `\normallineskiplimit` is 0pt, so `\strutbox` is never re-set per
+///     size), scaled by \arraystretch (1.2 for cases). matrix/array/cases
+///     stack rows DIRECTLY (LaTeX \@array zeroes \baselineskip/\lineskip —
+///     the strut forces the baseline distance = \baselineskip, measured 12pt
+///     at 10pt, 43.2pt at 36pt). aligned \openup\jot's the interline:
+///     baselineskip+3pt, limit 3pt, lineskip 4pt — measured 3pt gap at both
+///     sizes.
 ///   · the whole array is \vcenter'd (its vertical center sits on the math
 ///     axis — TeX \vcenter shift (h−d)/2 − axis, measured (14.5−9.5)/2 =
 ///     axis at 10pt); the pmatrix-family delimiters box via the variant
@@ -2993,6 +2986,14 @@ fn layoutEnv(
     // against the XeTeX reference at 10pt and 36pt).
     const acs: f32 = if (kind == .cases) 0 else 5.0; // \arraycolsep (fixed pt)
     const bs = 1.2 * size_pt; // \baselineskip (LaTeX normalsize ratio)
+    // amsmath's `\strut@` copies `\strutbox@`, which latex.ltx:12596 builds
+    // as 0.7\baselineskip tall and 0.3\baselineskip deep (`\normallineskiplimit`
+    // is 0pt, so the box is never re-set per size; amsmath's `\strut@` is the
+    // same 0.7/0.3 rule). The text paren's `(` box is NOT it: at 0.75em/0.25em
+    // that made every row 0.09em taller and 0.11em deeper than \baselineskip
+    // allows, which is the loose bottom under a trailing \hline.
+    const strut_h0 = 0.7 * bs;
+    const strut_d0 = 0.3 * bs;
     const quad = size_pt; // 1em, the cases column gap
 
     // Children: [open?, row1..rowN, close?] — the delimiter char leaves
@@ -3082,7 +3083,7 @@ fn layoutEnv(
         var height: f32 = 0;
         var depth: f32 = 0;
         if (open_idx) |o| {
-            const ob = try layoutDelimChar(list, ast, o, fm, axis / size_pt, size_pt, cstyle);
+            const ob = try layoutDelimChar(list, ast, o, fm, axis / size_pt, 0, size_pt, cstyle);
             const b = list.get(ob);
             const sh = (b.height - b.depth) / 2 - axis;
             try list.scratch.append(list.gpa, .{ .idx = ob, .x_shift = x, .shift = sh });
@@ -3091,7 +3092,7 @@ fn layoutEnv(
             depth = @max(depth, b.depth + sh);
         }
         if (close_idx) |c| {
-            const cb = try layoutDelimChar(list, ast, c, fm, axis / size_pt, size_pt, cstyle);
+            const cb = try layoutDelimChar(list, ast, c, fm, axis / size_pt, 0, size_pt, cstyle);
             const b = list.get(cb);
             const sh = (b.height - b.depth) / 2 - axis;
             try list.scratch.append(list.gpa, .{ .idx = cb, .x_shift = x, .shift = sh });
@@ -3114,8 +3115,8 @@ fn layoutEnv(
     // encoding cannot express, so it falls back to the default.
     const stretch: f32 = atom.rowStretch(ast.node(entries.items[row_entry.items[0]].node).data) orelse
         (if (kind == .cases) 1.2 else 1.0);
-    const strut_h = 0.7 * bs * stretch;
-    const strut_d = 0.3 * bs * stretch;
+    const strut_h = strut_h0 * stretch;
+    const strut_d = strut_d0 * stretch;
 
     // 2. Column widths = max cell width per column.
     var col_w: std.ArrayList(f32) = .empty;
@@ -3153,12 +3154,20 @@ fn layoutEnv(
         try row_h.append(list.gpa, @max(strut_h, h));
         try row_d.append(list.gpa, @max(strut_d, d));
     }
-    // A \hline is amsmath's zero-height row holding a bare \hrule, so the
+    // A \hline is a zero-height \noalign entry holding a bare \hrule, so the
     // boundary it sits on opens up by the rule's own thickness — that is
     // where the rule is drawn, and it is the only geometry a rule adds (it
     // is not a row, so it never touches the column count or the struts).
     // index k = the gap ABOVE row k; nrows = the gap below the last row.
+    // A boundary with n rules opens up n × \arrayrulewidth plus (n − 1) gaps
+    // of \doublerulesep − \arrayrulewidth; a gap and a thickness make up
+    // exactly \doublerulesep, so that is \arrayrulewidth plus (n − 1) ×
+    // \doublerulesep (doublerulesep_pt). One rule stays a plain
+    // \arrayrulewidth, which is what the single-rule case always was.
     const hline_thickness: f32 = arrayrulewidth_pt;
+    var rule_count: std.ArrayList(u32) = .empty;
+    defer rule_count.deinit(list.gpa);
+    try rule_count.appendNTimes(list.gpa, 0, nrows + 1);
     var rule_gap: std.ArrayList(f32) = .empty;
     defer rule_gap.deinit(list.gpa);
     try rule_gap.appendNTimes(list.gpa, 0, nrows + 1);
@@ -3168,7 +3177,12 @@ fn layoutEnv(
         for (entries.items[0..i]) |prev| {
             if (!prev.rule) above += 1;
         }
-        rule_gap.items[above] += hline_thickness;
+        rule_count.items[above] += 1;
+    }
+    for (rule_count.items, 0..) |count, k| {
+        if (count == 0) continue;
+        rule_gap.items[k] = hline_thickness +
+            @as(f32, @floatFromInt(count - 1)) * doublerulesep_pt;
     }
     const bs_jot = bs + 3.0; // \openup\jot for aligned
     // y-down model (positive shift = below the baseline): each row sits
@@ -3340,32 +3354,57 @@ fn layoutEnv(
         );
         try array_children.append(list.gpa, .{ .idx = row_box, .x_shift = 0, .shift = row_shift.items[r] + shift_s });
     }
-    // \hline: one full-width rule per rule entry, at the boundary it sits
-    // on. A `.rule` box at `shift` paints [shift − height, shift], so a
-    // rule ABOVE row k hangs at that row's top edge and the gap it opened
-    // up is exactly its height; a trailing rule hangs below the last row's
-    // bottom edge. The rules are children of the array vbox (not of a row),
-    // so they span the whole array advance and never enter the column count.
-    for (entries.items, 0..) |e, i| {
-        if (!e.rule) continue;
-        var above: usize = 0;
-        for (entries.items[0..i]) |prev| {
-            if (!prev.rule) above += 1;
+    // \hline: one rule per rule entry, at the boundary it sits on. A `.rule`
+    // box paints [shift − height, shift], so `shift` is the rule's OWN bottom
+    // edge. The space a boundary opened up is filled from its top edge
+    // downward — each rule one \doublerulesep below the previous one's TOP —
+    // which is the pitch the reference shows and what keeps two rules on one
+    // boundary from painting over each other. The LAST rule of a boundary is
+    // the one flush against the row below it, or, at the leading boundary,
+    // against the first row's top edge.
+    //
+    // A `\hline` is `\noalign{\hrule}` (latex.ltx:16729), and a noalign rule
+    // spans the WHOLE \halign width — the outer \arraycolsep pads included. The
+    // matrix family's `\hskip -\arraycolsep` wrapper cancels those pads from
+    // the ADVANCE only, so its rule overhangs the array box by \arraycolsep on
+    // each side: measured on XeTeX at 20pt, `\begin{matrix}\hline a&b…` is a
+    // 41.5402pt rule around a 31.5405pt box. array keeps its pads (cases and
+    // aligned never had any), so those rules start flush at the left edge.
+    // The rules are children of the array vbox, not of a row, so they never
+    // enter the column count.
+    const rule_x: f32 = if (amsmath_wrapped) -acs else 0;
+    const rule_w: f32 = x;
+    var above: usize = 0;
+    var at_boundary: u32 = 0;
+    for (entries.items) |e| {
+        if (!e.rule) {
+            above += 1;
+            at_boundary = 0;
+            continue;
         }
+        const top: f32 = if (above == 0)
+            // the leading boundary hangs above the first row
+            row_shift.items[0] + shift_s - row_h.items[0] - rule_gap.items[0]
+        else if (above == nrows)
+            // the trailing boundary hangs below the last row
+            row_shift.items[nrows - 1] + shift_s + row_d.items[nrows - 1]
+        else
+            // an interior boundary starts at the row above's bottom edge
+            row_shift.items[above - 1] + shift_s + row_d.items[above - 1];
         const rule = try list.createLeaf(
             .rule,
-            arr_w,
+            rule_w,
             hline_thickness,
             0,
             ast.span(e.node),
         );
-        const at: f32 = if (above == 0)
-            row_shift.items[0] + shift_s - row_h.items[0]
-        else if (above == nrows)
-            row_shift.items[nrows - 1] + shift_s + row_d.items[nrows - 1] + hline_thickness
-        else
-            row_shift.items[above] + shift_s - row_h.items[above];
-        try array_children.append(list.gpa, .{ .idx = rule, .x_shift = 0, .shift = at });
+        try array_children.append(list.gpa, .{
+            .idx = rule,
+            .x_shift = rule_x,
+            .shift = top + @as(f32, @floatFromInt(at_boundary)) * doublerulesep_pt +
+                hline_thickness,
+        });
+        at_boundary += 1;
     }
     const arr_box = try list.create(.vbox, arr_w, arr_h, arr_d, array_children.items, 0, cstyle, 0, span);
 
@@ -3382,7 +3421,7 @@ fn layoutEnv(
     var height: f32 = arr_h;
     var depth: f32 = arr_d;
     if (open_idx) |o| {
-        const ob = try layoutDelimChar(list, ast, o, fm, req_em, size_pt, cstyle);
+        const ob = try layoutDelimChar(list, ast, o, fm, req_em, 0, size_pt, cstyle);
         const b = list.get(ob);
         const sh = (b.height - b.depth) / 2 - axis;
         try list.scratch.append(list.gpa, .{ .idx = ob, .x_shift = bx, .shift = sh });
@@ -3393,7 +3432,7 @@ fn layoutEnv(
     try list.scratch.append(list.gpa, .{ .idx = arr_box, .x_shift = bx, .shift = 0 });
     bx += arr_w;
     if (close_idx) |c| {
-        const cb = try layoutDelimChar(list, ast, c, fm, req_em, size_pt, cstyle);
+        const cb = try layoutDelimChar(list, ast, c, fm, req_em, 0, size_pt, cstyle);
         const b = list.get(cb);
         const sh = (b.height - b.depth) / 2 - axis;
         try list.scratch.append(list.gpa, .{ .idx = cb, .x_shift = bx, .shift = sh });
@@ -3417,17 +3456,14 @@ fn layoutEnv(
 /// scaled to 101.3pt).
 ///   · required delimiter ink height (TeX make_delim — tex.web §1114,
 ///     MicroTeX FencedAtom): with δ = max(h − a, d + a),
-///     ink ≥ max(2·δ·901/1000, 2·δ − shortfall), shortfall = 0.1em;
+///     ink ≥ max(2·δ·901/1000, 2·δ − shortfall), shortfall = 5pt;
 ///   · pick the SMALLEST variant whose ink (asc + desc) covers it (the
 ///     LARGEST when none does — TeX's "exceed if it can't match"); the
 ///     ladder's base entry covers a plain \left(x\right), byte-identical
 ///     to the un-stretched render;
-///   · the delimiter BOX is the variant's hmtx advance × size and the
-///     variant's ink asc/desc × size, at the BASE font size — no font-size
-///     scaling (scaling the base glyph thickens its stroke linearly; the
-///     variants keep a constant stroke at any size). The SVG emits the
-///     base delimiter char at the base font-size; the rasterizer resolves
-///     the variant from the MATH table (FixParenVariants);
+///   · the box uses the selected variant or assembly's actual horizontal
+///     advance and ink. SVG and CPU resolve the same request at the base size,
+///     rather than thickening a scaled copy of the base drawing;
 ///   · delimiters without a variant ladder (e.g. \left\backslash) fall back
 ///     to the old continuous scaled-base path (layoutScaledChar); | \| /
 ///     now have ladders (divides/parallel/slash), so they pick real
@@ -3555,24 +3591,11 @@ fn layoutLeftRight(
     // variants asc−desc = 0.5em, so the shift is 0.25·size − axis = 0 — the
     // variant ink center sits ON the axis like the reference).
     if (open_idx) |o| {
-        // A fence whose partner is a null delimiter (\left. / \right.) is
-        // UNPAIRED: the critique rasterizer pairs delimiters by matching
-        // open/close codepoints and cannot reconstruct the stretched size
-        // of a lone delimiter, so it — and the browser — would draw the
-        // base glyph at the base size (the "brace does not grow over a
-        // tall scripted tower" defect). Draw such fences via the
-        // continuous scaled-base path so the intent lives in the SVG.
-        const ob = if (close_idx == null)
-            try layoutDelimScaled(list, ast, o, fm, ib.height, ib.depth, size_pt, cstyle)
-        else
-            try layoutDelimChar(list, ast, o, fm, req_em, size_pt, cstyle);
+        const fixed_req = if (binom_fixed) req_em else 0;
+        const ob = try layoutDelimChar(list, ast, o, fm, req_em, fixed_req, size_pt, cstyle);
         const b = list.get(ob);
         fence_asc = b.height;
         fence_desc = b.depth;
-        // Mark a FIXED-rule fence (\binom/\genfrac-with-delims) with the
-        // req_em the layout boxed it by, so the rasterizer resolves the same
-        // variant instead of reconstructing it from the (short) enclosed ink.
-        if (binom_fixed) list.charDataPtr(ob).delim_fixed = req_em;
         const shift = (b.height - b.depth) / 2 - axis;
         try list.scratch.append(list.gpa, .{ .idx = ob, .x_shift = x, .shift = shift });
         x += b.width;
@@ -3594,14 +3617,11 @@ fn layoutLeftRight(
     depth = @max(depth, mid_ext.desc_pt);
 
     try list.scratch.append(list.gpa, .{ .idx = inner, .x_shift = x, .shift = 0 });
-    x += ib.width;
+    x += list.get(inner).width;
     if (close_idx) |c| {
-        const cb = if (open_idx == null)
-            try layoutDelimScaled(list, ast, c, fm, ib.height, ib.depth, size_pt, cstyle)
-        else
-            try layoutDelimChar(list, ast, c, fm, req_em, size_pt, cstyle);
+        const fixed_req = if (binom_fixed) req_em else 0;
+        const cb = try layoutDelimChar(list, ast, c, fm, req_em, fixed_req, size_pt, cstyle);
         const b = list.get(cb);
-        if (binom_fixed) list.charDataPtr(cb).delim_fixed = req_em;
         const shift = (b.height - b.depth) / 2 - axis;
         try list.scratch.append(list.gpa, .{ .idx = cb, .x_shift = x, .shift = shift });
         x += b.width;
@@ -3611,20 +3631,15 @@ fn layoutLeftRight(
     return list.create(.hbox, x, height, depth, list.scratch.items[saved_len..], 0, cstyle, 0, span);
 }
 
-/// A \left/\right delimiter char box: the SMALLEST MATH size-variant whose
-/// ink (asc + desc) covers the required height `req_em` (the largest when
-/// none does), boxed at the BASE font size by the variant's hmtx advance and
-/// ink extents — no font-size scaling. The drawn glyph stays the base
-/// delimiter char at the base size (the rasterizer resolves the variant from
-/// the MATH table). Codepoints without a variant ladder (e.g. \left\backslash)
-/// fall back to the continuous scaled-base path (layoutScaledChar) with the
-/// extent floors as the old layoutLeftRight.
+/// The box and both backends resolve the same MATH form or assembly request.
+/// Delimiters without a ladder use the measured, continuously scaled base.
 fn layoutDelimChar(
     list: *box.BoxList,
     ast: *const atom.Ast,
     idx: u32,
     fm: *const metrics.FontMetrics,
     req_em: f32,
+    fixed_req: f32,
     size_pt: f32,
     cstyle: atom.CharStyle,
 ) !u32 {
@@ -3648,61 +3663,23 @@ fn layoutDelimChar(
             best.desc * size_pt,
             &.{},
             cp,
-            cstyle,
+            .italic,
             size_pt,
             span,
         );
         const cd = list.charDataPtr(box_idx);
         if (n.data != 0) cd.synthetic = true;
-        // Tag the variant index so svg.zig can emit data-delim-form="vN"
-        // (rasterizer resolves the same MATH-table glyph the layout boxed).
         cd.delim_form = @intCast(best_idx);
-        // When the required ink EXCEEDS the largest variant (the ladder is
-        // exhausted — e.g. a 4-row pmatrix at 20pt needs ~4em > parenleft.v7's
-        // 2.99em), the layout still boxes the delimiter by the largest
-        // variant (its width for the following atoms) but ALSO carries the
-        // exact required height so svg.zig can emit data-delim-req and the
-        // rasterizer assemble an XeTeX-style GlyphAssembly (top + N extenders
-        // + bottom) to that height. Without it the fence would be drawn at
-        // the largest variant — too short to cover the content.
+        cd.delim_fixed = fixed_req;
         const largest_ink = ladder[ladder.len - 1].asc + ladder[ladder.len - 1].desc;
         if (req_em > largest_ink) cd.delim_req = req_em;
+        try measureVerticalChar(list, fm, box_idx);
         return box_idx;
     }
     const ink = metrics.glyphInk(cp);
     const half = (ink.asc + ink.desc) / 2;
     const del_size = @max(size_pt, req_em * size_pt / (2 * half));
     return layoutScaledChar(list, ast, idx, fm, del_size, cstyle);
-}
-
-/// An UNPAIRED \left/\right fence delimiter — the partner is a null
-/// delimiter (`\left.` / `\right.`), so the critique rasterizer's open/
-/// close pairing cannot reconstruct the stretched size and would draw the
-/// declared glyph at the base size (the "brace does not grow over a tall
-/// scripted tower" defect). The intended size must live in the SVG: draw
-/// the BASE glyph at the font-size whose axis-centered ink covers the
-/// content exactly — TeX make_delim's 2δ with δ = max(h−a, d+a) of the
-/// enclosed box, no \delimitershortfall (XeTeX's brace over
-/// `x^{x^{x^{x^x}}}` covers the tower exactly: 118px = 118px), floored at
-/// the base size. The box is the scaled base glyph's own advance and ink
-/// (layoutScaledChar), so the drawn ink bounds exactly what the box
-/// reserves — the following atom never overlaps the wider scaled glyph.
-fn layoutDelimScaled(
-    list: *box.BoxList,
-    ast: *const atom.Ast,
-    idx: u32,
-    fm: *const metrics.FontMetrics,
-    h_pt: f32,
-    d_pt: f32,
-    size_pt: f32,
-    cstyle: atom.CharStyle,
-) !u32 {
-    const cp = delimiterCp(ast, idx);
-    const axis = s(metrics.glue(fm).axis_height, size_pt);
-    const ink = metrics.glyphInk(cp);
-    const need = 2 * @max(h_pt - axis, d_pt + axis);
-    const gs = @max(size_pt, need / (ink.asc + ink.desc));
-    return layoutScaledChar(list, ast, idx, fm, gs, cstyle);
 }
 
 /// The codepoint a delimiter char leaf renders (node data override or the
@@ -3714,9 +3691,23 @@ fn delimiterCp(ast: *const atom.Ast, idx: u32) u21 {
     return firstCodepoint(ast.src[sp.start..sp.end]);
 }
 
-/// layoutChar's char-box construction at an explicit drawn size — the
-/// \left/\right delimiters are the normal LM Math glyphs drawn larger (the
-/// font's parens scale linearly; no composite extension parts are needed).
+fn measureVerticalChar(list: *box.BoxList, fm: *const metrics.FontMetrics, idx: u32) !void {
+    const cd = list.charData(idx);
+    const geometry = try metrics.verticalGlyph(
+        fm,
+        cd.cp,
+        cd.delim_form,
+        cd.delim_req,
+        cd.delim_fixed,
+    ) orelse return;
+    const b = &list.boxes.items[idx];
+    b.width = geometry.advance_em * cd.size;
+    b.height = geometry.ink.asc * cd.size;
+    b.depth = geometry.ink.desc * cd.size;
+    setCharOverhang(list, idx, geometry.ink, cd.size);
+}
+
+/// A delimiter without a MATH ladder, measured at its actual drawn size.
 fn layoutScaledChar(
     list: *box.BoxList,
     ast: *const atom.Ast,
@@ -3777,11 +3768,14 @@ fn layoutDelimLevel(
             best.desc * size_pt,
             &.{},
             cp,
-            cstyle,
+            .italic,
             size_pt,
             span,
         );
-        if (n.data != 0) list.charDataPtr(box_idx).synthetic = true;
+        const cd = list.charDataPtr(box_idx);
+        if (n.data != 0) cd.synthetic = true;
+        cd.delim_form = @intCast(big_ladder_idx[level]);
+        try measureVerticalChar(list, fm, box_idx);
         return box_idx;
     }
     // No variant ladder: scaled base glyph whose ink reaches the level's
@@ -3800,8 +3794,7 @@ fn layoutDelimLevel(
 /// ladder (XeTeX `\left\{ x \middle| \frac{x}{2} \in S \right\}` at 36pt:
 /// braceleft.v4 for the fence, divides.v3 for the |). Delimiters without a
 /// ladder fall back to the continuous scaled-base path. Returns the largest
-/// ink extents among the sized middles (the fence hbox bounds them; the
-/// inner row box keeps its pre-middle dims — only the frame matters).
+/// ink extents and reserves each middle's resolved width in its containing row.
 fn sizeMiddleDelims(
     list: *box.BoxList,
     ast: *const atom.Ast,
@@ -3810,17 +3803,19 @@ fn sizeMiddleDelims(
     req_em: f32,
     size_pt: f32,
     cstyle: atom.CharStyle,
-) !struct { asc_pt: f32, desc_pt: f32 } {
+) !struct { asc_pt: f32, desc_pt: f32, width_delta: f32 } {
     const b = &list.boxes.items[idx];
     if (b.kind == .char) {
         const cd = list.charDataPtr(idx);
         // A \middle placeholder: zero-width AND zero-height, delimiter cp.
         if (b.width == 0 and b.height == 0 and b.depth == 0 and cd.cp != 0) {
             if (metrics.delimVariants(cd.cp)) |ladder| {
-                var best = ladder[ladder.len - 1];
-                for (ladder) |v| {
+                var best_idx: usize = ladder.len - 1;
+                var best = ladder[best_idx];
+                for (ladder, 0..) |v, i| {
                     if (v.asc + v.desc >= req_em) {
                         best = v;
+                        best_idx = i;
                         break;
                     }
                 }
@@ -3828,6 +3823,11 @@ fn sizeMiddleDelims(
                 b.height = best.asc * size_pt;
                 b.depth = best.desc * size_pt;
                 cd.size = size_pt;
+                cd.style = .italic;
+                cd.delim_form = @intCast(best_idx);
+                const largest = ladder[ladder.len - 1];
+                if (req_em > largest.asc + largest.desc) cd.delim_req = req_em;
+                try measureVerticalChar(list, fm, idx);
             } else {
                 // No ladder: continuous scaled base (layoutDelimChar's
                 // no-ladder fallback, with the same extent floor).
@@ -3840,19 +3840,32 @@ fn sizeMiddleDelims(
                 b.height = ink.asc * gs;
                 b.depth = ink.desc * gs;
                 cd.size = gs;
+                setCharOverhang(list, idx, ink, gs);
             }
-            return .{ .asc_pt = b.height, .desc_pt = b.depth };
+            return .{ .asc_pt = b.height, .desc_pt = b.depth, .width_delta = b.width };
         }
-        return .{ .asc_pt = 0, .desc_pt = 0 };
+        return .{ .asc_pt = 0, .desc_pt = 0, .width_delta = 0 };
     }
     var asc: f32 = 0;
     var desc: f32 = 0;
-    for (list.children(idx)) |cr| {
+    const old_width = b.width;
+    var added_width: f32 = 0;
+    const children = list.childrefs.items[b.first_child .. b.first_child + b.num_children];
+    for (children) |*cr| {
+        if (b.kind == .hbox) cr.x_shift += added_width;
         const r = try sizeMiddleDelims(list, ast, cr.idx, fm, req_em, size_pt, cstyle);
-        asc = @max(asc, r.asc_pt);
-        desc = @max(desc, r.desc_pt);
+        if (b.kind == .hbox) {
+            added_width += r.width_delta;
+        } else if (r.width_delta != 0) {
+            b.width = @max(b.width, cr.x_shift + list.get(cr.idx).width);
+        }
+        asc = @max(asc, r.asc_pt - cr.shift);
+        desc = @max(desc, r.desc_pt + cr.shift);
     }
-    return .{ .asc_pt = asc, .desc_pt = desc };
+    b.width += added_width;
+    b.height = @max(b.height, asc);
+    b.depth = @max(b.depth, desc);
+    return .{ .asc_pt = asc, .desc_pt = desc, .width_delta = b.width - old_width };
 }
 
 /// \sqrt (a row marked `sqrt_row_data`; children [surd, radicand]): the TeX
@@ -3861,8 +3874,13 @@ fn sizeMiddleDelims(
 /// top. Matches XeTeX+unicode-math+LM Math (make_radical reading the MATH-
 /// table gaps) and KaTeX:
 ///   · radicand set in cramped style (same size);
-///   · clearance clr = RadicalDisplayStyleVerticalGap 0.148em in display/text,
-///     RadicalVerticalGap 0.05em in script/scriptscript;
+///   · clearance clr = RadicalDisplayStyleVerticalGap 0.148em in DISPLAY
+///     style only, RadicalVerticalGap 0.05em in text/script/scriptscript —
+///     the MATH table has no text-style gap of its own, and XeTeX reads the
+///     display gap in display style ALONE (measured XeTeX \textstyle
+///     \sqrt{\frac ab} at 20pt: the rule kerns 0.05em and the variant excess
+///     above, clr 1.544pt; \displaystyle\sqrt{\frac ab}: 0.148em, clr
+///     6.944pt);
 ///   · vinculum: a rule of thickness θ = rule_thickness at height
 ///     radicand_height + clr, spanning exactly the radicand's width;
 ///   · the radical glyph is drawn at the CURRENT font size (size_pt), NOT
@@ -3880,15 +3898,20 @@ fn sizeMiddleDelims(
 ///     (total−θ) − (radicand_height + radicand_depth + clr), and half the
 ///     excess goes into the clearance. Tall variants add ~0.2em here,
 ///     floating the vinculum clear of the radicand and centering the radicand
-///     on the radical.
+///     on the radical. Past .v4 the extensible assembly gets NO such slack:
+///     XeTeX sizes it to cover the radicand exactly (ink = radicand_height +
+///     radicand_depth + clr, clr2 = clr), and every N+1 joint of the stack
+///     overlaps by an equal share of the slack (the OpenType MATH assembly
+///     rule), so the vertical advance never quantizes.
 ///   · the construction box: height = radicand_height + clr + 2θ (the empty
 ///     kern above the vinculum), depth = max(radicand_depth, total −
 ///     (radicand_height + clr + θ)).
-///   · \sqrt[n]{x}: the degree is set at 0.5×size (measured XeTeX), its
-///     bottom raised by 0.6·(height − depth) of the construction (amsmath
-///     \r@@t's \raise .6\dimen@\copy\rootbox), its left edge 0.278em
-///     (RadicalKernBeforeDegree of the degree size) right of the radical
-///     bar.
+///   · \sqrt[n]{x}: amsmath \r@@t sets the degree at 0.5×size, raises it by
+///     RadicalDegreeBottomRaisePercent·(height − depth) of the construction
+///     (its \raise .6\dimen@\copy\rootbox), brackets it with
+///     RadicalKernBeforeDegree / RadicalKernAfterDegree at the CURRENT size
+///     and lets it ride the radical's left shoulder: only the kern that does
+///     not fit inside the radical's own advance widens the box.
 fn layoutSqrt(
     list: *box.BoxList,
     ast: *const atom.Ast,
@@ -3901,7 +3924,7 @@ fn layoutSqrt(
     const span = ast.span(idx);
     const gl = metrics.glue(fm);
     const rt = s(gl.rule_thickness, size_pt);
-    const clr: f32 = if (style == .display or style == .text) 0.148 * size_pt else 0.05 * size_pt;
+    const clr: f32 = if (style == .display) 0.148 * size_pt else 0.05 * size_pt;
 
     // children: [surd, radicand]; a degree wraps the surd in a script node
     // (parser: \sqrt[n]{x} → script[surd, degree] with the SUP bit).
@@ -3923,7 +3946,7 @@ fn layoutSqrt(
     // radical ink height EXCEEDS the LARGEST pre-built MATH variant's
     // AdvanceMeasurement (radical.v4, 3.001em). Below this threshold XeTeX
     // selects the smallest variant covering the radicand (radical.v0–v4) — a
-    // single ⟨text⟩ char at the base math size with the variant's ink
+    // single glyph at the base math size with the variant's ink
     // extents. Pre-built variants give the "classic" look; the assembly is
     // only needed for genuinely tall stacks beyond what .v4 covers.
     const largest_variant_em: f32 = 3.001;
@@ -3935,15 +3958,13 @@ fn layoutSqrt(
     defer list.scratch.items.len = saved_len;
     const sn_surd = ast.node(surd_leaf);
 
-    // radicand_x, rad_ink_height, rule_top, clr2, hbox_depth are computed
-    // per-branch below (each branch places its surd glyph(s) with ABSOLUTE
-    // shifts anchored at rule_top, matching the pre-fix assembly code).
+    // Both forms anchor the glyph's ink top at rule_top.
     var radicand_x: f32 = undefined;
     var rad_ink_height: f32 = undefined;
     var rule_top: f32 = undefined;
     var clr2: f32 = undefined;
     var hbox_depth: f32 = undefined;
-    const overlap_em: f32 = 0.320;
+    var radical: u32 = undefined;
 
     if (!use_assembly) {
         // Variant path (shallow radicals).
@@ -3968,12 +3989,16 @@ fn layoutSqrt(
             rv.desc * size_pt,
             &.{},
             0x221A, // √ \surd
-            cstyle,
+            .italic,
             size_pt,
             ast.span(surd_leaf),
         );
+        radical = surd;
         if (sn_surd.data != 0) list.charDataPtr(surd).synthetic = true;
         list.charDataPtr(surd).radical_form = @intCast(vi);
+        if (try metrics.verticalGlyph(fm, 0x221A, @intCast(vi + 1), 0, 0)) |geometry| {
+            setCharOverhang(list, surd, geometry.ink, size_pt);
+        }
         // glyph_baseline = rule_top − asc; shift = −glyph_baseline
         const glyph_baseline = rule_top - rv.asc * size_pt;
         try list.scratch.append(list.gpa, .{
@@ -3982,98 +4007,49 @@ fn layoutSqrt(
             .shift = -glyph_baseline,
         });
     } else {
-        // ── Assembly path (tall radicals beyond .v4) ────────────────────
-        // MATH vertical radical construction (VertGlyphConstruction): stack
-        // top + N*extender + bottom pieces at constant stroke.
-        // Each extender contributes (ext.asc − overlap) = 0.320em of new
-        // ink height (the overlap with the piece above is already counted).
-        // The formula in the original code used ext.asc (0.64) instead of
-        // the true stride (0.32), under-counting extenders and leaving the
-        // assembly's ink short of the radicand bottom.
-        const stride_em: f32 = metrics.radical_ext_piece.ink_asc - overlap_em; // 0.320
-        const base_em: f32 = metrics.radical_top_piece.ink_asc +
-            metrics.radical_bot_piece.ink_asc - overlap_em; // 2.120
-        const n_ext: usize = blk: {
-            if (req_em <= base_em) break :blk @as(usize, 0);
-            break :blk @intFromFloat(@ceil((req_em - base_em) / stride_em));
-        };
-        rad_ink_height = metrics.radicalAssemblyHeight(n_ext) * size_pt;
-        radicand_x = metrics.radical_piece_adv * size_pt;
-        const delta_a = @max(
-            0.0,
-            rad_ink_height - rt - (radicand_height + radicand_depth + clr),
-        );
-        clr2 = clr + delta_a / 2;
-        rule_top = radicand_height + clr2 + rt;
+        // Match the radicand exactly; variant quantization adds no clearance.
+        rad_ink_height = radicand_height + radicand_depth + clr;
+        clr2 = clr;
+        rule_top = radicand_height + clr + rt;
         hbox_depth = @max(radicand_depth, rad_ink_height - rule_top);
 
-        // TOP piece: ink TOP at vinculum top (rule_top) → baseline at
-        // rule_top − top.asc. shift = −baseline (piece baselines are below
-        // the row baseline for desc=0 pieces, so cur_y grows downward).
-        var cur_y = rule_top - metrics.radical_top_piece.ink_asc * size_pt;
-        const top_surd = try list.create(
+        // Keep every part in one glyph plan. Both backends then paint its
+        // connector union once, including translucent scopes.
+        const surd = try list.create(
             .char,
             metrics.radical_piece_adv * size_pt,
-            metrics.radical_top_piece.ink_asc * size_pt,
+            rad_ink_height,
             0,
             &.{},
-            metrics.radical_top_piece.cp,
-            cstyle,
+            0x221A,
+            .italic,
             size_pt,
             ast.span(surd_leaf),
         );
-        if (sn_surd.data != 0) list.charDataPtr(top_surd).synthetic = true;
-        list.charDataPtr(top_surd).radical_form = 5;
-        try list.scratch.append(list.gpa, .{ .idx = top_surd, .x_shift = 0, .shift = -cur_y });
-
-        // Extenders: overlap the piece above by overlap_em; each baseline at
-        // (prev baseline − (ext.asc − overlap)).
-        const ext_gap = stride_em * size_pt;
-        for (0..n_ext) |_| {
-            cur_y -= ext_gap;
-            const ext_box = try list.create(
-                .char,
-                metrics.radical_piece_adv * size_pt,
-                metrics.radical_ext_piece.ink_asc * size_pt,
-                0,
-                &.{},
-                metrics.radical_ext_piece.cp,
-                cstyle,
-                size_pt,
-                ast.span(surd_leaf),
-            );
-            if (sn_surd.data != 0) list.charDataPtr(ext_box).synthetic = true;
-            list.charDataPtr(ext_box).radical_form = 6;
-            try list.scratch.append(list.gpa, .{ .idx = ext_box, .x_shift = 0, .shift = -cur_y });
-        }
-
-        // BOTTOM piece: baseline at (prev baseline − (bot.asc − overlap)).
-        cur_y -= (metrics.radical_bot_piece.ink_asc - overlap_em) * size_pt;
-        const bot_box = try list.create(
-            .char,
-            metrics.radical_piece_adv * size_pt,
-            metrics.radical_bot_piece.ink_asc * size_pt,
-            0,
-            &.{},
-            metrics.radical_bot_piece.cp,
-            cstyle,
-            size_pt,
-            ast.span(surd_leaf),
-        );
-        if (sn_surd.data != 0) list.charDataPtr(bot_box).synthetic = true;
-        list.charDataPtr(bot_box).radical_form = 7;
-        try list.scratch.append(list.gpa, .{ .idx = bot_box, .x_shift = 0, .shift = -cur_y });
+        radical = surd;
+        const cd = list.charDataPtr(surd);
+        if (sn_surd.data != 0) cd.synthetic = true;
+        cd.delim_req = rad_ink_height / size_pt;
+        try measureVerticalChar(list, fm, surd);
+        const sb = list.get(surd);
+        radicand_x = sb.width;
+        try list.scratch.append(list.gpa, .{
+            .idx = surd,
+            .x_shift = 0,
+            .shift = sb.height - rule_top,
+        });
     }
 
     // Radicand: flush at x = surd advance; baseline = row baseline (shift 0).
     try list.scratch.append(list.gpa, .{ .idx = radicand, .x_shift = radicand_x, .shift = 0 });
-    // Vinculum: rule of thickness rt centered at radicand_height + clr2 + rt/2.
-    const rule = try list.createLeaf(.rule, rb.width, rt / 2, rt / 2, span);
-    try list.scratch.append(list.gpa, .{
-        .idx = rule,
-        .x_shift = radicand_x,
-        .shift = -(radicand_height + clr2 + rt / 2),
-    });
+    if (rb.width > 0) {
+        list.charDataPtr(radical).radical_bar = .{
+            .x = radicand_x,
+            .y = -list.get(radical).height,
+            .w = rb.width,
+            .h = rt,
+        };
+    }
     // The construction's height = vinculum top + rt: XeTeX's overbar is
     // [kern rt, rule rt, kern clr2, radicand], the empty kern above the rule
     // part of the box extent (measured \sqrt{x}: 25.485 = 13.26 + 9.825 +
@@ -4081,30 +4057,27 @@ fn layoutSqrt(
     var height = rule_top + rt;
     var width = radicand_x + rb.width;
     if (degree) |d| {
-        // Root index at scriptscript size (XeTeX measured), left edge
-        // 0.278·deg_size right of the bar. Its BASELINE is raised above the
-        // row baseline (amsmath \r@@t: \raise .6\dimen@\copy\rootbox with
-        // \dimen@ = \ht−\dp of the radical box):
-        //  · variant path (shallow radicals): 0.6 × (height − hbox_depth) —
-        //    for shallow radicands hbox_depth is small so this ≈ 0.6·rule_top,
-        //    matching the measured reference (\sqrt[3]{a/b}: degree baseline
-        //    ~11.7pt above the axis at 30pt);
-        //  · assembly path (tall radicals): 0.6 × rule_top — the
-        //    (height − hbox_depth) formula collapses for deep radicands
-        //    (hbox_depth ≈ radicand_depth is large), parking the degree far too low.
-        //    places the index at the upper-left of the radical, baseline ≈
-        //    0.6 of the radical's top (rule_top above the row baseline).
+        // amsmath brackets the scriptscript index with MATH degree kerns.
+        // LuaLaTeX evaluates them at the CURRENT size (the index sits
+        // 0.278em right of the radical's own origin at 20pt and 60pt
+        // alike); the old 10pt-based product was 0.139em here. The static
+        // fallback carries the same em value scaled to the size.
+        const mc = gl.math_constants;
+        const kern_before: f32 = if (mc) |m| m.radical_kern_before_degree * size_pt else 0.278 * size_pt;
+        const kern_after: f32 = if (mc) |m| m.radical_kern_after_degree * size_pt else -0.556 * size_pt;
         const deg_size = size_pt * gl.scriptscriptfactor;
         const db = try layoutInner(list, ast, d, fm, .script_script, deg_size, cstyle, true);
         const gb = list.get(db);
-        // TeX places the radical index at the upper-left of the radical stem.
-        // The degree x-offset should NOT scale with total radical height;
-        // anchor it consistently near the radical left overhang.
-        const deg_x = 0.20 * deg_size;
-        const raise = if (use_assembly) 0.6 * rule_top else 0.6 * (height - hbox_depth);
-        try list.scratch.append(list.gpa, .{ .idx = db, .x_shift = deg_x, .shift = -raise });
+        // The index rides the radical's left shoulder: only the kern that
+        // does not fit inside the radical's own advance widens the box.
+        const over = @max(0.0, kern_before + gb.width + kern_after - radicand_x);
+        for (list.scratch.items[saved_len..]) |*child| child.x_shift += over;
+        width += over;
+        // amsmath raises the degree from the construction's ht-dp.
+        const raise_pct: f32 = if (mc) |m| m.radical_degree_bottom_raise_percent else 0.6;
+        const raise = raise_pct * (height - hbox_depth);
+        try list.scratch.append(list.gpa, .{ .idx = db, .x_shift = kern_before, .shift = -raise });
         height = @max(height, raise + gb.height);
-        width = @max(width, deg_x + gb.width);
     }
     return list.create(
         .hbox,
@@ -4744,19 +4717,9 @@ fn emUp(v: f32) f32 {
 /// (and every parent shift) is computed from, and it stays AT DESIGN (the
 /// variant extents × size_pt) in every style.
 ///
-/// The DRAWN glyph is a second, independent knob: the SVG <text> draws the
-/// cmap BASE glyph at font-size `size` (always AT DESIGN — size_pt in every
-/// style), while XeTeX draws the MATH-table display VARIANT (summation.v1,
-/// integral.v1, …) — a taller, proportionally different glyph (∫ base aspect
-/// 0.498 vs .v1 0.399). Round 2 drew the base glyph at a scaled font-size
-/// (variant ink height ÷ base ink height: ∑ 1.4, ∫ 2.0) to match the HEIGHT,
-/// but a single font-size scalar cannot match width too: the ∫ came out ~25%
-/// too wide at the height-matched scale and overlapped its beside scripts.
-/// Round 3 keeps the drawn size AT DESIGN (reverted) and lets the critique
-/// PIL rasterizer resolve the actual .v1 variant glyph (fontTools MATH table
-/// → patched-font PUA → PIL) so the drawn ink matches the reference in width
-/// and height at 48pt (∑ 63.9×67.2, ∫ 42.6×106.7).
-/// The box uses the variant's extents at size_pt; flatten frames that ink.
+/// SVG and CPU resolve the selected MATH display variant from the same face.
+/// The drawn size stays at design: scaling a base glyph to match the variant's
+/// height would give the wrong width and overlap its beside scripts.
 fn layoutOp(
     list: *box.BoxList,
     ast: *const atom.Ast,
@@ -5174,10 +5137,12 @@ fn layoutFraction(
     // null-delimiter boxes of width \nulldelimiterspace (measured \showbox:
     // the row box is hbox{pad 1.2, vbox max(num,den), pad 1.2} — 11.44455pt
     // for a 9.04456pt vbox at 10pt). The pads are FIXED 1.2pt, unscaled in
-    // script styles (measured at 5pt). We keep the superflat model by folding
-    // the pads into the vbox: widen it by 2·pad and shift every child 1.2pt
-    // right (the rule spans only the inner max(num,den) width).
-    const pad: f32 = 1.2; // TeX \nulldelimiterspace
+    // script styles (measured at 5pt). A fraction with REAL delimiters —
+    // the `\binom` family, `\genfrac{()}` — carries none: both engines draw
+    // `\tbinom{n}{k}` flush between its parens. We keep the superflat model
+    // by folding the pads into the vbox: widen it by 2·pad and shift every
+    // child 1.2pt right (the rule spans only the inner max(num,den) width).
+    const pad: f32 = if (atom.fracFixedDelim(n.data)) 0 else 1.2; // TeX \nulldelimiterspace
     const box_w = vbox_w + 2 * pad;
 
     try list.scratch.append(list.gpa, .{ .idx = num, .x_shift = pad + (vbox_w - nb.width) / 2, .shift = num_shift });
@@ -5232,8 +5197,19 @@ fn layoutText(
     // inside an italic formula stays roman and a math alphabet
     // (`\mathbf{\mathbb R}`) is untouched. See `combineStyle`.
     const base_style: atom.CharStyle = combineStyle(cstyle, @enumFromInt(n.data));
-    // strip the surrounding braces: text bytes are span.start+1 .. span.end-1
-    const inner = ast.src[span.start + 1 .. span.end - 1];
+    // The run's bytes are the INSIDE of the braces that frame it: the parser's
+    // textFace leaf always spans the balanced group it opened, so the span's
+    // first and last bytes are that group's `{` and `}`. Stripping them
+    // UNCONDITIONALLY drops whatever byte a hand-built leaf happens to end on
+    // — a trailing backslash (an escape the repertoire rejects) would vanish
+    // with no error at all, which is the one failure this scanner exists to
+    // prevent. A span that is not brace-framed is not a text run we can
+    // typeset.
+    const frame = ast.src[span.start..span.end];
+    if (frame.len < 2 or frame[0] != '{' or frame[frame.len - 1] != '}') {
+        return error.InvalidAst;
+    }
+    const inner = frame[1 .. frame.len - 1];
 
     const saved_len = list.scratch.items.len;
     defer list.scratch.items.len = saved_len;
@@ -5259,13 +5235,24 @@ fn layoutText(
     // `c~ {ab} \ e` corpus entry lays out as 9.06pt glues at 30pt), literal
     // spaces are the same width, and backslash escapes are consumed without
     // leaking the backslash (textAccentCp maps the common accents to the
-    // precomposed char, \i → ı, \j → ȷ, unknown commands vanish).
+    // precomposed char, \i → ı, \j → ȷ).
+    //
+    // The escape repertoire is `atom.textCommandSupported` — ONE list shared
+    // with the parser, which rejects an unsupported command in a real parse
+    // with `UnknownCommand` and its exact span. A hand-built AST can carry
+    // raw bytes the parser never produces, and a `\text` run has no layout
+    // model for anything outside that repertoire (a font switch, `\LaTeX`, a
+    // `\\` line break): silently consuming the name and emitting NOTHING is
+    // how a formula lost whole words. Such a run is `error.InvalidAst` here,
+    // which is the same "this is not a text run we can typeset" answer.
     var off: usize = 0;
     while (off < inner.len) {
         const b = inner[off];
         if (b == '\\') {
             off += 1;
-            if (off >= inner.len) break; // a trailing backslash: drop it
+            // A trailing backslash is not an escape: no such bytes can come out
+            // of the parser.
+            if (off >= inner.len) return error.InvalidAst;
             const c = inner[off];
             if (c == ' ') {
                 // `\ ` — the control space: one interword space.
@@ -5292,10 +5279,12 @@ fn layoutText(
                     try textEmitChar(list, ast.src, fm, face, size_pt, 0x0237, gs, gs + 2, &x, &height, &depth);
                     continue;
                 }
-                if (cmd.len == 1 and isTextAccent(cmd[0])) {
+                if (cmd.len == 1 and atom.isTextAccentControl(cmd[0]) and cmd[0] >= 'a') {
                     // \H \r \v \u \c \d \b \t: accent over the next
-                    // braced group or single atom.
-                    const tgt = textEscapeTarget(inner, &off);
+                    // braced group or single atom. The `>= 'a'` guard leaves
+                    // the seven SYMBOL accents (`\' \` \" \^ \~ \. \=`) to
+                    // the switch below, which handles them the same way.
+                    const tgt = try textEscapeTarget(inner, &off);
                     const gs: u32 = @intCast(span.start + 1 + cmd_start);
                     const ge: u32 = @intCast(span.start + 1 + tgt.end);
                     try textEmitAccented(
@@ -5317,7 +5306,7 @@ fn layoutText(
                 // \textit{…} / \textbf{…} / \text{…} INSIDE the run: a face
                 // scope, never typeset bytes. TeX swallows the spaces after a
                 // control word, so `\textit {x}` opens the same scope.
-                if (faceCommand(cmd)) |f| {
+                if (atom.textFaceCommand(cmd)) |f| {
                     var k = off;
                     while (k < inner.len and inner[k] == ' ') k += 1;
                     if (k < inner.len and inner[k] == '{') {
@@ -5329,62 +5318,33 @@ fn layoutText(
                         continue;
                     }
                 }
-                // Unknown command (a font switch, \LaTeX, ...): consume the
-                // name, emit nothing. A following braced group is handled by
-                // the ordinary group branch below.
-                continue;
+                // Any other control word (a font switch, \LaTeX, `\\`): the
+                // repertoire has no layout for it, so the run is invalid.
+                return error.InvalidAst;
             }
             const cmd_start = off - 1; // the backslash
             switch (c) {
                 // single-symbol accents: \' \` \" \^ \~ \. \=
                 '\'', '`', '"', '^', '~', '.', '=' => {
                     off += 1;
-                    const tgt = textEscapeTarget(inner, &off);
+                    const tgt = try textEscapeTarget(inner, &off);
                     const gs: u32 = @intCast(span.start + 1 + cmd_start);
                     const ge: u32 = @intCast(span.start + 1 + tgt.end);
                     try textEmitAccented(list, ast.src, fm, face, size_pt, c, tgt.cp, gs, ge, &x, &height, &depth);
                 },
-                // literal escapes: the escaped char itself (the backslash is
-                // never output).
-                '{' => {
+                // The escaped char itself, in the repertoire
+                // `atom.textCommandSupported` admits: the seven special
+                // characters LaTeX makes an escape out of. The backslash is
+                // never output.
+                '{', '}', '$', '%', '&', '#', '_' => {
                     const gs: u32 = @intCast(span.start + 1 + cmd_start);
-                    try textEmitChar(list, ast.src, fm, face, size_pt, 0x7B, gs, gs + 2, &x, &height, &depth);
+                    try textEmitChar(list, ast.src, fm, face, size_pt, c, gs, gs + 2, &x, &height, &depth);
                     off += 1;
                 },
-                '}' => {
-                    const gs: u32 = @intCast(span.start + 1 + cmd_start);
-                    try textEmitChar(list, ast.src, fm, face, size_pt, 0x7D, gs, gs + 2, &x, &height, &depth);
-                    off += 1;
-                },
-                '$' => {
-                    const gs: u32 = @intCast(span.start + 1 + cmd_start);
-                    try textEmitChar(list, ast.src, fm, face, size_pt, 0x24, gs, gs + 2, &x, &height, &depth);
-                    off += 1;
-                },
-                '%' => {
-                    const gs: u32 = @intCast(span.start + 1 + cmd_start);
-                    try textEmitChar(list, ast.src, fm, face, size_pt, 0x25, gs, gs + 2, &x, &height, &depth);
-                    off += 1;
-                },
-                '&' => {
-                    const gs: u32 = @intCast(span.start + 1 + cmd_start);
-                    try textEmitChar(list, ast.src, fm, face, size_pt, 0x26, gs, gs + 2, &x, &height, &depth);
-                    off += 1;
-                },
-                '#' => {
-                    const gs: u32 = @intCast(span.start + 1 + cmd_start);
-                    try textEmitChar(list, ast.src, fm, face, size_pt, 0x23, gs, gs + 2, &x, &height, &depth);
-                    off += 1;
-                },
-                '_' => {
-                    const gs: u32 = @intCast(span.start + 1 + cmd_start);
-                    try textEmitChar(list, ast.src, fm, face, size_pt, 0x5F, gs, gs + 2, &x, &height, &depth);
-                    off += 1;
-                },
-                // `\\` — a line break in text; consume it (no model).
-                else => {
-                    off += 1;
-                },
+                // `\\` — a line break inside a text run. There is no line
+                // model here (the run is one hbox), so it is unsupported
+                // rather than silently dropped.
+                else => return error.InvalidAst,
             }
             continue;
         }
@@ -5666,14 +5626,6 @@ fn textAccentMark(accent: u8) u21 {
     };
 }
 
-/// Whether a command byte names a text accent (\H \r \v \u \c \d \b \t).
-inline fn isTextAccent(c: u8) bool {
-    return switch (c) {
-        'H', 'r', 'v', 'u', 'c', 'd', 'b', 't' => true,
-        else => false,
-    };
-}
-
 inline fn isAsciiLetter(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z');
 }
@@ -5682,7 +5634,13 @@ inline fn isAsciiLetter(c: u8) bool {
 /// grapheme inside, which may itself be an escape like \i) or one
 /// following grapheme/escape. Returns the base codepoint (an ASCII letter
 /// or the dotless \i/\j bases) and the inner offset just past the target.
-fn textEscapeTarget(inner: []const u8, off: *usize) struct { cp: u21, end: usize } {
+/// An escape the run's repertoire has no base for — any command other than
+/// \i/\j — is `error.InvalidAst`, the same answer the surrounding dispatch
+/// gives an unsupported command in any other position.
+fn textEscapeTarget(
+    inner: []const u8,
+    off: *usize,
+) error{InvalidAst}!struct { cp: u21, end: usize } {
     // TeX ignores spaces after a control sequence: `\H e` is \H{e}.
     while (off.* < inner.len and inner[off.*] == ' ') off.* += 1;
     if (off.* >= inner.len) return .{ .cp = 0, .end = off.* };
@@ -5714,11 +5672,9 @@ fn textEscapeTarget(inner: []const u8, off: *usize) struct { cp: u21, end: usize
             off.* = i + 2;
             return .{ .cp = 'j', .end = i + 2 };
         }
-        // an unknown command as the target: consume its name, no base
-        var j = i + 1;
-        while (j < inner.len and isAsciiLetter(inner[j])) j += 1;
-        off.* = j;
-        return .{ .cp = 0, .end = j };
+        // A command other than \i/\j as the accent target: outside the
+        // repertoire, exactly as it would be anywhere else in the run.
+        return error.InvalidAst;
     }
     var it = Graphemes.iterator(inner[i..]);
     const g = it.next() orelse return .{ .cp = 0, .end = i };
@@ -5834,17 +5790,6 @@ fn textEmitMark(
     try list.scratch.append(list.gpa, .{ .idx = cbox, .x_shift = x.*, .shift = 0 });
     height.* = @max(height.*, ink.asc * size_pt);
     depth.* = @max(depth.*, ink.desc * size_pt);
-}
-
-/// The text face a control word names inside a raw run, or null when it is
-/// none of the three. `\text` is reported as `.roman`: upright roman adds no
-/// modifier of its own, so `atom.combineTextStyles` leaves the enclosing face
-/// alone — an inner `\text` never weakens a bold run.
-fn faceCommand(name: []const u8) ?atom.CharStyle {
-    if (std.mem.eql(u8, name, "textit")) return .text_italic;
-    if (std.mem.eql(u8, name, "textbf")) return .bold;
-    if (std.mem.eql(u8, name, "text")) return .roman;
-    return null;
 }
 
 /// The width of a `\text` interword space at `size_pt`, in the face the run is
@@ -6310,6 +6255,53 @@ test "layout: an overdeep raw text leaf is invalid" {
     );
 }
 
+test "layout: a raw text leaf with an unsupported escape is invalid" {
+    // The parser already rejects these in a real parse (`UnknownCommand` plus
+    // the exact span), but a hand-built leaf can carry them, and a `\text` run
+    // has no layout for anything outside `atom.textCommandSupported`. Swallowing
+    // the name and emitting nothing is how a formula lost whole words, so such
+    // a run is invalid rather than quietly short.
+    const cases = [_][]const u8{
+        "{a\\LaTeX b}", // a control word outside the repertoire
+        "{a\\mathrm{b}c}", // a real command, still not a text-run escape
+        "{a\\\\b}", // a line break: one hbox has no line model
+        "{a\\@b}", // a symbol escape outside the repertoire
+        "{ab\\}", // a trailing backslash inside the frame is not an escape
+        "{ab\\", // and a run that never closes its frame is not a text run
+    };
+    for (cases) |src| {
+        var list = box.BoxList.init(testing.allocator);
+        defer list.deinit();
+        var a = atom.Ast.init(testing.allocator, src);
+        defer a.deinit();
+        const leaf = try textRunLeaf(&a, .roman);
+        try testing.expectError(
+            error.InvalidAst,
+            layout(&list, &a, leaf, &fm_default, .text, 10, .italic),
+        );
+    }
+}
+
+test "layout: the raw text repertoire's literal escapes all reach the page" {
+    // The seven characters LaTeX makes an escape out of draw themselves, in
+    // order, and the backslash never leaks: the repertoire that rejects
+    // everything outside it must keep admitting these.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    var a = atom.Ast.init(testing.allocator, "{\\$\\%\\&\\#\\_\\{\\}}");
+    defer a.deinit();
+    const leaf = try textRunLeaf(&a, .roman);
+    const b = try layout(&list, &a, leaf, &fm_default, .text, 10, .italic);
+    const ch = list.children(b);
+    try testing.expectEqual(@as(usize, 7), ch.len);
+    for (ch, [_]u21{ 0x24, 0x25, 0x26, 0x23, 0x5F, 0x7B, 0x7D }) |cr, cp| {
+        try testing.expectEqual(.char, list.get(cr.idx).kind);
+        try testing.expectEqual(cp, list.charData(cr.idx).cp);
+        // synthetic: the drawn glyph is the escaped char, not the `\$` bytes.
+        try testing.expect(list.charData(cr.idx).synthetic);
+    }
+}
+
 test "layout: styled wraps a char with the declared style" {
     var list = box.BoxList.init(testing.allocator);
     defer list.deinit();
@@ -6425,6 +6417,54 @@ test "layout: cfrac sets both parts in display style (uncramped, display gaps)" 
     // kern1 = 6.765 - strut_depth 3.6 - (axis 2.5 + rt/2 0.2) = 0.465
     // → bump 0.735) + strut height 0.84*10=8.4 = 15.9.
     try testing.expectApproxEqAbs(@as(f32, 15.9), list.get(b).height, 0.01);
+}
+
+test "layout: a radical reads the display clearance gap in display style alone" {
+    // XeTeX takes RadicalDisplayStyleVerticalGap (0.148em) in DISPLAY style and
+    // RadicalVerticalGap (0.05em) in text/script/scriptscript — the MATH table
+    // has no text-style gap. Over a 20pt \frac ab (h+d 21.122) the text radical
+    // needs 21.122 + 1.0 + θ 0.8 = 22.92pt, which radical.v1 covers (advance
+    // 1.201em = 24.02), while the display gap raised the requirement to 24.88
+    // and bought the 1.801em .v2: a 36pt surd for a 21pt radicand, its 11.1pt
+    // excess floating the vinculum 8.5pt clear of the numerator. Measured
+    // XeTeX (20.075pt em): \textstyle the rule kerns 0.05em then half the .v1
+    // excess (clr 1.544), \displaystyle 0.148em then half the .v3 excess
+    // (clr 6.944) — the glyphs are radical.v1 (gid 3081) and .v3 (gid 3083).
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    var a = atom.Ast.init(testing.allocator, "sqrtab");
+    defer a.deinit();
+    try a.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
+    try a.pushToken(.{ .tag = .char, .start = 1, .end = 2 });
+    try a.pushToken(.{ .tag = .char, .start = 2, .end = 3 });
+    try a.pushToken(.{ .tag = .char, .start = 3, .end = 4 });
+    const num = try a.createLeaf(.char, 1, 1, 0x1D44E); // 𝑎
+    const den = try a.createLeaf(.char, 2, 1, 0x1D44F); // 𝑏
+    const frac = try a.createNode(
+        .fraction,
+        1,
+        2,
+        &.{ a.node(num), a.node(den) },
+        atom.fracData(true, null, false),
+    );
+    const surd = try a.createLeaf(.char, 0, 1, 0x221A);
+    const row = try a.createNode(
+        .row,
+        0,
+        4,
+        &.{ a.node(surd), a.node(frac) },
+        sqrt_row_data,
+    );
+    for ([_]struct { style: Style, extent: f32 }{
+        .{ .style = .text, .extent = 24.80 },
+        .{ .style = .display, .extent = 48.80 },
+    }) |c| {
+        const b = try layout(&list, &a, row, &fm_default, c.style, 20, .italic);
+        const bb = list.get(b);
+        // Exact-font XeTeX box extents, rescaled from its 20.075pt em.
+        // Static glyph metrics account for the sub-point difference.
+        try testing.expectApproxEqAbs(c.extent, bb.height + bb.depth, 0.6);
+    }
 }
 
 test "layout: mathstyle wrapper forces style and rescales size" {
@@ -6631,53 +6671,6 @@ fn pushCharTokens(a: *atom.Ast, src: []const u8) !void {
 /// A `\script`-style size at the 10pt base (gl.scriptfactor).
 const script_size: f32 = 7.0;
 
-test "layout: \\overset / \\underset stack a forced limit on the base" {
-    // \mathop{base}\limits^{script}: the script is set one ladder step down
-    // and centred on max(base, script), and it stays over/under the base in
-    // EVERY style (the \limits is forced) — measured on XeTeX.
-    var list = box.BoxList.init(testing.allocator);
-    defer list.deinit();
-    var a = atom.Ast.init(testing.allocator, "overset");
-    defer a.deinit();
-    try a.pushToken(.{ .tag = .char, .start = 0, .end = 6 });
-
-    const base_only = try charBox(&list, &a, 0x1D465, .text, 10); // x
-    const bb = list.get(base_only);
-    const script_only = try charBox(&list, &a, 0x1D466, .script, script_size); // y
-    const sb = list.get(script_only);
-
-    for ([_]struct { data: u32, under: bool }{
-        .{ .data = overset_row_data, .under = false },
-        .{ .data = underset_row_data, .under = true },
-        .{ .data = stackrel_row_data, .under = false },
-    }) |c| {
-        const script = try a.createLeaf(.char, 0, 1, 0x1D466);
-        const base = try a.createLeaf(.char, 0, 1, 0x1D465);
-        const row = try a.createNode(.row, 0, 1, &.{ a.node(script), a.node(base) }, c.data);
-        // Display and text style must agree: the limits are forced.
-        for ([_]Style{ .display, .text }) |st| {
-            const b = try layout(&list, &a, row, &fm_default, st, 10, .italic);
-            const rb = list.get(b);
-            try testing.expectEqual(.vbox, rb.kind);
-            try testing.expectApproxEqAbs(@max(bb.width, sb.width), rb.width, 0.001);
-            const rise = if (c.under)
-                bb.depth + @max(limit_under_min, sb.height + limit_under_gap)
-            else
-                bb.height + sb.depth + limit_over_gap;
-            const want_h = if (c.under) bb.height else @max(bb.height, rise + sb.height);
-            const want_d = if (c.under) @max(bb.depth, rise + sb.depth) else bb.depth;
-            try testing.expectApproxEqAbs(want_h, rb.height, 0.001);
-            try testing.expectApproxEqAbs(want_d, rb.depth, 0.001);
-            // The base keeps the construct's baseline; the limit is shifted
-            // by exactly `rise` (negative = up).
-            const ch = list.children(b);
-            try testing.expectEqual(@as(u16, 2), rb.num_children);
-            try testing.expectApproxEqAbs(@as(f32, 0), ch[0].shift, 0.001);
-            try testing.expectApproxEqAbs(if (c.under) rise else -rise, ch[1].shift, 0.001);
-        }
-    }
-}
-
 test "layout: \\stackrel is a relation, \\overset takes no inter-atom class" {
     // The kernel's \stackrel IS a \mathrel (thick 5mu on both sides); amsmath's
     // \overset expands to an EMPTY \mathrel before the construct, which takes
@@ -6783,50 +6776,29 @@ test "layout: the phantoms are invisible and \\smash still draws" {
     }
 }
 
-test "layout: \\underbrace / \\overbrace hang a brace band and take an annotation" {
-    var list = box.BoxList.init(testing.allocator);
-    defer list.deinit();
-    var a = atom.Ast.init(testing.allocator, "underbrace");
-    defer a.deinit();
-    try a.pushToken(.{ .tag = .char, .start = 0, .end = 10 });
-
-    const content_box = try charBox(&list, &a, 0x1D465, .text, 10); // x
-    const cb = list.get(content_box);
-    const rt = metrics.glue(&fm_default).rule_thickness;
-
-    for ([_]struct { data: u32, under: bool }{
-        .{ .data = underbrace_row_data, .under = true },
-        .{ .data = overbrace_row_data, .under = false },
-    }) |c| {
-        const content = try a.createLeaf(.char, 0, 1, 0x1D465);
-        const row = try a.createNode(.row, 0, 1, &.{a.node(content)}, c.data);
-        const b = try layout(&list, &a, row, &fm_default, .text, 10, .italic);
-        const rb = list.get(b);
-        const band = if (c.under) underbrace_band else overbrace_band;
-        // The content keeps the construct's width and baseline; the band is
-        // added below (underbrace) or above (overbrace).
-        try testing.expectApproxEqAbs(cb.width, rb.width, 0.0001);
-        const want_h = if (c.under) cb.height else cb.height + band;
-        const want_d = if (c.under) cb.depth + band else cb.depth;
-        try testing.expectApproxEqAbs(want_h, rb.height, 0.0001);
-        try testing.expectApproxEqAbs(want_d, rb.depth, 0.0001);
-        // The band is drawn: the content plus a full-width spine and the two
-        // end tips (skipped for content narrower than the rule).
-        const n_rules = countRules(&list, b);
-        try testing.expectEqual(if (cb.width >= rt) @as(usize, 3) else 1, n_rules);
-    }
-}
-
-/// The number of `.rule` boxes directly under `root`.
-fn countRules(list: *box.BoxList, root: u32) usize {
-    var n: usize = 0;
-    for (list.children(root)) |cr| {
-        if (list.get(cr.idx).kind == .rule) n += 1;
-    }
-    return n;
-}
-
-test "layout: \\underbrace_{n} drops the annotation below the brace" {
+test "layout: a face without the brace's horizontal form keeps the base glyph" {
+    // A wired face that declares no construction for the brace answers null —
+    // a real "no such form" — and the bundled ladder must NOT be stood in for
+    // it: the band degrades to the glyph's OWN base form at the base size,
+    // records no request (so the back ends draw that same glyph), and never
+    // replaces it with a synthesised stroke. A resolver that FAILS stays an
+    // error instead of quietly painting some other form.
+    const glyph_hook = struct {
+        fn get(_: *anyopaque, _: u21, _: atom.CharStyle, _: f32) ?metrics.Glyph {
+            return null;
+        }
+    }.get;
+    const absent = struct {
+        fn get(_: *anyopaque, _: u21, _: f32) metrics.StretchError!?metrics.StretchGeometry {
+            return null;
+        }
+    }.get;
+    const failing = struct {
+        fn get(_: *anyopaque, _: u21, _: f32) metrics.StretchError!?metrics.StretchGeometry {
+            return error.OutOfMemory;
+        }
+    }.get;
+    var anchor: u8 = 0;
     var list = box.BoxList.init(testing.allocator);
     defer list.deinit();
     var a = atom.Ast.init(testing.allocator, "underbrace");
@@ -6834,29 +6806,39 @@ test "layout: \\underbrace_{n} drops the annotation below the brace" {
     try a.pushToken(.{ .tag = .char, .start = 0, .end = 10 });
 
     const content = try a.createLeaf(.char, 0, 1, 0x1D465);
-    const ann = try a.createLeaf(.char, 0, 1, 0x1D45B); // n
-    const row = try a.createNode(
-        .row,
-        0,
-        1,
-        &.{ a.node(content), a.node(ann) },
-        underbrace_row_data,
-    );
-    const b = try layout(&list, &a, row, &fm_default, .text, 10, .italic);
-    const rb = list.get(b);
+    const row = try a.createNode(.row, 0, 1, &.{a.node(content)}, underbrace_row_data);
 
-    const cb = list.get(try charBox(&list, &a, 0x1D465, .text, 10));
-    const ab = list.get(try charBox(&list, &a, 0x1D45B, .script, script_size));
-    // The annotation is the band box's forced limit: like any subscript it
-    // is placed below the base's DEPTH — here the brace band's — and then
-    // pushed down to satisfy the under-limit minimum.
-    const band_depth = cb.depth + underbrace_band;
-    const rise = band_depth + @max(limit_under_min, ab.height + limit_under_gap);
-    try testing.expectEqual(.vbox, rb.kind);
-    try testing.expectApproxEqAbs(cb.height, rb.height, 0.0001);
-    try testing.expectApproxEqAbs(rise + ab.depth, rb.depth, 0.0001);
-    try testing.expectApproxEqAbs(@max(cb.width, ab.width), rb.width, 0.0001);
-    try testing.expectApproxEqAbs(rise, list.children(b)[1].shift, 0.0001);
+    const no_form: metrics.FontMetrics = .{ .font = .{
+        .ctx = &anchor,
+        .glyph = glyph_hook,
+        .horizontal_glyph = absent,
+    } };
+    const b = try layout(&list, &a, row, &no_form, .text, 10, .italic);
+    const ch = list.children(b);
+    try testing.expectEqual(@as(usize, 2), ch.len);
+    const band = ch[1];
+    const bb = list.get(band.idx);
+    const cd = list.charData(band.idx);
+    try testing.expectEqual(.char, bb.kind);
+    try testing.expectEqual(@as(u21, 0x23DF), cd.cp);
+    try testing.expectEqual(@as(f32, 0), cd.horizontal_req);
+    // No construction: preserve the base glyph's advance and ink.
+    const base = metrics.glyphAt(&no_form, 0x23DF, .italic, 10) orelse
+        metrics.glyphEstimate(&no_form, 0x23DF, .italic);
+    const ink = metrics.glyphInkAt(0x23DF, .italic);
+    try testing.expectApproxEqAbs(base.width, bb.width, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0), bb.height, 0.0001);
+    try testing.expectApproxEqAbs(ink.desc * 10, bb.depth, 0.0001);
+
+    const broken: metrics.FontMetrics = .{ .font = .{
+        .ctx = &anchor,
+        .glyph = glyph_hook,
+        .horizontal_glyph = failing,
+    } };
+    try testing.expectError(
+        error.OutOfMemory,
+        layout(&list, &a, row, &broken, .text, 10, .italic),
+    );
 }
 
 test "layout: mu spacing is style-invariant while em spacing follows the style" {
@@ -7284,30 +7266,33 @@ test "layout: \\arraystretch scales the row struts; cases keeps its own default"
     defer a.deinit();
     try a.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
     try a.pushToken(.{ .tag = .char, .start = 1, .end = 2 });
-    const bs = 1.2 * 10.0; // \baselineskip at the 10pt base
+    // amsmath's `\strut@` copies LaTeX's `\strutbox`: 0.7\baselineskip tall
+    // and 0.3\baselineskip deep, so a stretched row's baseline distance is
+    // exactly \baselineskip × \arraystretch (12pt at 10pt).
+    const strut_pitch = 1.2 * 10.0;
 
     // A matrix with no assignment: LaTeX's \arraystretch default of 1.
     const plain = try twoRowEnv(&a, .matrix, null);
     const plain_pitch =
         envRowPitch(&list, try layout(&list, &a, plain, &fm_default, .display, 10, .italic));
-    try testing.expectApproxEqAbs(bs, plain_pitch, 0.001);
+    try testing.expectApproxEqAbs(strut_pitch, plain_pitch, 0.001);
     // The same matrix with \arraystretch{1.4}: the exact factor, since both
     // rows are shallower than the strut at either stretch.
     const wide = try twoRowEnv(&a, .matrix, 1.4);
     const wide_pitch =
         envRowPitch(&list, try layout(&list, &a, wide, &fm_default, .display, 10, .italic));
-    try testing.expectApproxEqAbs(1.4 * bs, wide_pitch, 0.001);
+    try testing.expectApproxEqAbs(1.4 * strut_pitch, wide_pitch, 0.001);
     try testing.expectApproxEqAbs(@as(f32, 1.4), wide_pitch / plain_pitch, 0.001);
     // cases with no assignment keeps amsmath's \def\arraystretch{1.2}.
     const cases = try twoRowEnv(&a, .cases, null);
     const cases_pitch =
         envRowPitch(&list, try layout(&list, &a, cases, &fm_default, .display, 10, .italic));
-    try testing.expectApproxEqAbs(1.2 * bs, cases_pitch, 0.001);
+    try testing.expectApproxEqAbs(1.2 * strut_pitch, cases_pitch, 0.001);
     // ... and an explicit assignment overrides it.
     const stretched = try twoRowEnv(&a, .cases, 2.0);
     const stretched_pitch =
         envRowPitch(&list, try layout(&list, &a, stretched, &fm_default, .display, 10, .italic));
-    try testing.expectApproxEqAbs(2.0 * bs, stretched_pitch, 0.001);
+    try testing.expectApproxEqAbs(2.0 * strut_pitch, stretched_pitch, 0.001);
 }
 
 /// The `\tag{3}` atom of a source holding `\tag{3}` with its backslash at
@@ -7428,163 +7413,463 @@ test "layout: \\tag adds no inter-atom glue to its neighbours" {
     try testing.expectEqual(@as(usize, 3), list.children(b).len);
 }
 
-/// A `\widehat{...}` / `\widetilde{...}` atom over `n` char cells, each the
-/// math-italic letter at byte `i` of the source.
-fn wideAccentNode(a: *atom.Ast, marker: u32, mark_cp: u21, n: usize) !u32 {
+/// A `\hat{...}` / `\widehat{...}` / `\widetilde{...}` atom over the `n` char
+/// cells starting at source byte `first`, each the math-italic letter there.
+fn wideAccentNode(
+    a: *atom.Ast,
+    marker: u32,
+    mark_cp: u21,
+    first: usize,
+    n: usize,
+) !u32 {
     var cells: std.ArrayList(atom.Node) = .empty;
     defer cells.deinit(a.gpa);
     for (0..n) |i| {
-        try cells.append(a.gpa, a.node(try a.createLeaf(.char, @intCast(i), 1, 0)));
+        try cells.append(a.gpa, a.node(try a.createLeaf(.char, @intCast(first + i), 1, 0)));
     }
     const base = try a.createNode(.row, 0, @intCast(n), cells.items, 0);
     const mark = try a.createLeaf(.char, 0, 1, mark_cp);
     return a.createNode(.row, 0, @intCast(n), &.{ a.node(base), a.node(mark) }, marker);
 }
 
-test "layout: \\widehat / \\widetilde span the full width of their argument" {
+/// A laid-out accent's mark box, read the way a consumer reads it: the
+/// reserved geometry, the recorded char state, and where the mark's INK
+/// CENTRE landed. The centre comes from the recorded overhangs and the
+/// advance, because that is all the draw list has — and it is the only
+/// measure that locates every form, the ladder's zero-advance base rung
+/// included.
+const AccentMark = struct {
+    box: box.Box,
+    cd: box.CharData,
+    x: f32,
+    ink_center: f32,
+};
+
+fn accentMark(list: *const box.BoxList, accent: u32) AccentMark {
+    const ch = list.children(accent);
+    std.debug.assert(ch.len == 2);
+    const mb = list.get(ch[1].idx);
+    const cd = list.charData(ch[1].idx);
+    return .{
+        .box = mb,
+        .cd = cd,
+        .x = ch[1].x_shift,
+        .ink_center = ch[1].x_shift + (mb.width + cd.ink_right - cd.ink_left) / 2,
+    };
+}
+
+test "layout: \\widehat is the face's own horizontal variant at every width" {
     var list = box.BoxList.init(testing.allocator);
     defer list.deinit();
-    const src = "abcdefghij";
+    const src = "Mabcdefghij";
     var a = atom.Ast.init(testing.allocator, src);
     defer a.deinit();
     try pushCharTokens(&a, src);
-    // The narrow branch is probed over a letter whose top-accent
-    // attachment sits well right of its left edge, so the attachment
-    // placement and the fill's left-edge placement cannot be confused.
-    const narrow_src = "M";
-    var an = atom.Ast.init(testing.allocator, narrow_src);
-    defer an.deinit();
-    try pushCharTokens(&an, narrow_src);
-    const size_pt: f32 = 20;
-    const stroke_w = s(metrics.glue(&fm_default).rule_thickness, size_pt);
+    // The largest variant the ladder holds: asking far past its end is what
+    // the resolver answers with the top rung, unscaled.
+    const largest = (try metrics.horizontalGlyph(&fm_default, 0x0302, 1e9)) orelse
+        return error.MissingGlyph;
+    const ladder_top = largest.advance_em;
 
-    for ([_]struct { marker: u32, cp: u21, hat: bool }{
-        .{ .marker = wide_hat_row_data, .cp = 0x0302, .hat = true },
-        .{ .marker = wide_tilde_row_data, .cp = 0x0303, .hat = false },
-    }) |c| {
-        // SHORT, MID and LONG: every MULTI-character argument is spanned,
-        // however narrow. A width threshold would leave `\widehat{xy}` with
-        // one little mark parked in the middle of the two letters.
-        for ([_]usize{ 2, 4, 10 }) |n| {
-            const wide = try wideAccentNode(&a, c.marker, c.cp, n);
-            const b = try layout(&list, &a, wide, &fm_default, .text, size_pt, .italic);
-            const base_w = list.get(b).width; // the accent never widens its base
-            const ch = list.children(b);
-            // [base, ONE stroke] — a single connected polyline, never a run
-            // of repeated marks: a leader fill reads as a sawtooth row of
-            // little hats, which is not an accent over the argument at all.
-            try testing.expectEqual(@as(usize, 2), ch.len);
-            const pb = list.get(ch[1].idx);
-            try testing.expectEqual(box.Kind.poly, pb.kind);
-            const stroke = list.poly(ch[1].idx);
-            try testing.expectApproxEqAbs(base_w, pb.width, 0.001);
-            try testing.expectApproxEqAbs(stroke_w, stroke.width, 0.001);
-            // The box bounds the union of the PAINTED butt-capped bands (the
-            // segments, extended through every interior corner), so the draw
-            // list's ink bounds — what the viewBox and the pixel buffer are
-            // cut from — cover the stroke with no padding fudge.
-            var ink_x0: f32 = std.math.inf(f32);
-            var ink_x1: f32 = -std.math.inf(f32);
-            var ink_y0: f32 = std.math.inf(f32);
-            var ink_y1: f32 = -std.math.inf(f32);
-            for (0..@as(usize, stroke.count) - 1) |k| {
-                const p0 = stroke.points[k];
-                const p1 = stroke.points[k + 1];
-                const l = std.math.hypot(p1.dx - p0.dx, p1.dy - p0.dy);
-                const ux = (p1.dx - p0.dx) / l;
-                const uy = (p1.dy - p0.dy) / l;
-                const sx = p0.dx - stroke.extend[k] * ux;
-                const sy = p0.dy - stroke.extend[k] * uy;
-                const ex = p1.dx + stroke.extend[k + 1] * ux;
-                const ey = p1.dy + stroke.extend[k + 1] * uy;
-                const nx = @abs(uy) * stroke.width / 2;
-                const ny = @abs(ux) * stroke.width / 2;
-                ink_x0 = @min(ink_x0, @min(sx, ex) - nx);
-                ink_x1 = @max(ink_x1, @max(sx, ex) + nx);
-                ink_y0 = @min(ink_y0, @min(sy, ey) - ny);
-                ink_y1 = @max(ink_y1, @max(sy, ey) + ny);
-            }
-            try testing.expectApproxEqAbs(-ink_y0, pb.height, 0.001);
-            try testing.expectApproxEqAbs(ink_y1, pb.depth, 0.001);
-            // Edge to edge: the ink starts on the argument's left edge and
-            // ends on its right one, inside the base's own box.
-            try testing.expectApproxEqAbs(@as(f32, 0), ink_x0, 0.01);
-            try testing.expectApproxEqAbs(base_w, ink_x1, 0.01);
-            // The stroke lives INSIDE the narrow mark's own ink band — the
-            // combining glyph's real yMin..yMax, not the whole ascent — so
-            // both forms share one vertical extent and neither pokes out of
-            // the other.
-            const mark_ink = metrics.glyphInk(c.cp);
-            const band = (mark_ink.asc - mark_ink.bottom) * size_pt;
-            try testing.expect(pb.height <= band + 0.001);
-            try testing.expect(pb.depth <= stroke.width / 2 + 0.001);
-            // The poly's own baseline sits on the band's LOWER edge, lifted by
-            // the mark's own yMin: the accent floats at the narrow mark's
-            // height, never reaching down to the argument's baseline, and a
-            // base taller than AccentBaseHeight lifts it further still.
-            const poly_base = -ch[1].shift;
-            try testing.expect(poly_base >= mark_ink.bottom * size_pt - 0.001);
-            // ... and nothing it paints ever crosses the base's own ink, which
-            // is what a hat drawn from the row baseline up did.
-            const base_ink_top = list.get(ch[0].idx).height;
-            try testing.expect(poly_base - pb.depth > base_ink_top);
-            if (c.hat) {
-                // ONE apex: three vertices, two segments, at the argument's
-                // centre, with both feet on the baseline.
-                try testing.expectEqual(@as(u8, 3), stroke.count);
-                try testing.expectApproxEqAbs(@as(f32, 0), stroke.points[0].dy, 0.0001);
-                try testing.expectApproxEqAbs(@as(f32, 0), stroke.points[2].dy, 0.0001);
-                try testing.expectApproxEqAbs(base_w / 2, stroke.points[1].dx, 0.001);
-                try testing.expect(stroke.points[1].dy < 0);
-                // The apex corner is closed by the miter reach — two separate
-                // butt-capped bands would leave a notch there — and both ENDS
-                // are unextended, which keeps the ink on the box's edges.
-                try testing.expect(stroke.extend[1] > 0);
-                try testing.expectApproxEqAbs(@as(f32, 0), stroke.extend[0], 0.0001);
-                try testing.expectApproxEqAbs(@as(f32, 0), stroke.extend[2], 0.0001);
-            } else {
-                // A SMOOTH single-period wave, not a four-vertex zigzag: many
-                // chords, one crest and one trough, ends at mid height.
-                try testing.expect(stroke.count >= 9);
-                try testing.expectApproxEqAbs(-band / 2, stroke.points[0].dy, 0.001);
-                const end_dy = stroke.points[stroke.count - 1].dy;
-                try testing.expectApproxEqAbs(-band / 2, end_dy, 0.001);
-                var crest: usize = 0;
-                var trough: usize = 0;
-                for (0..@as(usize, stroke.count)) |i| {
-                    if (stroke.points[i].dy < stroke.points[crest].dy) crest = i;
-                    if (stroke.points[i].dy > stroke.points[trough].dy) trough = i;
-                }
-                // The crest comes before the trough, both strictly inside,
-                // and each is a SINGLE vertex (a zigzag would tie).
-                try testing.expect(crest > 0 and crest < trough);
-                try testing.expect(trough < @as(usize, stroke.count) - 1);
-                try testing.expect(stroke.points[crest - 1].dy > stroke.points[crest].dy);
-                try testing.expect(stroke.points[crest + 1].dy > stroke.points[crest].dy);
-                try testing.expect(stroke.points[trough - 1].dy < stroke.points[trough].dy);
-                try testing.expect(stroke.points[trough + 1].dy < stroke.points[trough].dy);
-                try testing.expectApproxEqAbs(@as(f32, 0), stroke.extend[0], 0.0001);
-                const last_i = @as(usize, stroke.count) - 1;
-                try testing.expectApproxEqAbs(@as(f32, 0), stroke.extend[last_i], 0.0001);
-            }
+    for ([_]f32{ 8, 20, 60 }) |size_pt| {
+        var widths: [4]f32 = undefined;
+        // ONE character, two, four and ten: a wide base, a middle one inside
+        // the ladder, and two that outrun it.
+        for ([_]usize{ 1, 2, 4, 10 }, 0..) |n, i| {
+            const node = try wideAccentNode(&a, wide_hat_row_data, 0x0302, 0, n);
+            const b = try layout(&list, &a, node, &fm_default, .text, size_pt, .italic);
+            const m = accentMark(&list, b);
+            widths[i] = m.box.width;
+            // ONE mark box, the real combining codepoint, and NEVER a stroke:
+            // the face draws the hat, with its single apex and its own
+            // proportions. The three-kink parametric chevron this replaced
+            // was the defect, not the mark.
+            try testing.expectEqual(box.Kind.char, m.box.kind);
+            try testing.expectEqual(@as(u21, 0x0302), m.cd.cp);
+            try testing.expect(m.cd.synthetic);
+            // The accent never widens its base, and the request it carries is
+            // the base's own width in em — so every back end resolves the SAME
+            // variant this box reserves.
+            const base_w = list.get(list.children(b)[0].idx).width;
+            try testing.expectApproxEqAbs(base_w, list.get(b).width, 0.001);
+            const req_em = base_w / size_pt;
+            try testing.expectApproxEqAbs(req_em, m.cd.horizontal_req, 0.0001);
+            const geom = (try metrics.horizontalGlyph(&fm_default, 0x0302, req_em)) orelse
+                return error.MissingGlyph;
+            // The reserved advance IS the variant's own hmtx advance: a real
+            // width, never the base glyph's 0 and never a made-up one.
+            try testing.expectApproxEqAbs(geom.advance_em * size_pt, m.box.width, 0.001);
+            // The box is bounded by the DRAWN VARIANT's own ink, which is
+            // what the back ends actually paint.
+            try testing.expectApproxEqAbs(geom.ink.left * size_pt, m.cd.ink_left, 0.001);
+            try testing.expectApproxEqAbs(
+                @max(0.0, geom.ink.right_edge * size_pt - m.box.width),
+                m.cd.ink_right,
+                0.001,
+            );
+            try testing.expectApproxEqAbs(
+                (geom.ink.asc - geom.ink.desc) * size_pt,
+                m.box.height - m.box.depth,
+                0.001,
+            );
+            // The result box still bounds the hat above the base's own ink.
+            try testing.expect(list.get(b).height >= m.box.height - 0.001);
         }
-        // A ONE-character argument stays on the narrow branch: the REAL
-        // combining glyph, on the base's top-accent attachment — never the
-        // stroke's left-edge placement.
-        const narrow = try wideAccentNode(&an, c.marker, c.cp, 1);
-        const nb = try layout(&list, &an, narrow, &fm_default, .text, size_pt, .italic);
-        const nch = list.children(nb);
-        try testing.expectEqual(@as(usize, 2), nch.len);
-        try testing.expectEqual(box.Kind.char, list.get(nch[1].idx).kind);
-        const nw = list.get(nb).width;
-        // 𝑴's MathTopAccentAttachment, read from the measured table; the
-        // mark's ink is centred 0.264em left of its zero-advance origin.
-        const attach = metrics.accentAttach(0x1D440) orelse return error.TestUnexpectedResult;
-        const ink_center = nch[1].x_shift - 0.264 * size_pt;
-        try testing.expectApproxEqAbs(attach * size_pt, ink_center, 0.001);
-        // On the letter, well inside the argument's own box.
-        try testing.expect(ink_center > 0.3 * size_pt);
-        try testing.expect(ink_center < nw);
+        // The two the ladder covers grow with their argument...
+        try testing.expect(widths[1] > widths[0]);
+        // ... and the two it does NOT both keep the SAME top variant, so
+        // nothing is stretched to fit: `\widehat{abcd}` keeps the font's own
+        // rise instead of flattening into a chevron.
+        try testing.expectApproxEqAbs(widths[2], widths[3], 0.001);
+        try testing.expectApproxEqAbs(ladder_top * size_pt, widths[3], 0.001);
+    }
+}
+
+test "layout: an accent mark rides ITS OWN top-accent attachment" {
+    // A combining mark has a ZERO advance with its whole ink LEFT of the
+    // origin, so `ink_metrics` records `right_edge = max(0, xMax) = 0` and the
+    // ink centre (left/2) is NOT the mark's attachment. Both reference engines
+    // put the MARK's TopAccentAttachment on the base's attachment: at 20pt
+    // `\hat{x}` puts the mark origin at 0.329 - (-0.264) = 0.593em, while
+    // ink-centring lands it at 0.552em — 0.041em left of every accent.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    const src = "xAB";
+    var a = atom.Ast.init(testing.allocator, src);
+    defer a.deinit();
+    try pushCharTokens(&a, src);
+    const size_pt: f32 = 20;
+    const node = try wideAccentNode(&a, accent_row_data, 0x0302, 0, 1);
+    const b = try layout(&list, &a, node, &fm_default, .text, size_pt, .italic);
+    const m = accentMark(&list, b);
+    const base_attach = metrics.accentAttach(0x1D465) orelse return error.MissingGlyph;
+    const mark_attach = metrics.accentAttach(0x0302) orelse return error.MissingGlyph;
+    // Attachment onto attachment, for ONE base character.
+    try testing.expectApproxEqAbs((base_attach - mark_attach) * size_pt, m.x, 0.001);
+    // ... and NOT the ink centre the clamp invents (0.223em, 0.041em left).
+    const ink_centre = metrics.glyphInk(0x0302);
+    try testing.expect(@abs(ink_centre.left / 2 - mark_attach) > 0.03);
+}
+
+test "layout: an accent over a group centres on the group's TeX width" {
+    // `\hat{AB}`: the reference's mark ink centre is 0.767em — half of the
+    // argument's TeX width 1.534em = 0.750 (A) + 0.759 (B) + 0.025 (B's
+    // italic correction, the one TeX's fin_mlist appends to EVERY math list),
+    // not half of the bare 1.509em row advance.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    const src = "AB";
+    var a = atom.Ast.init(testing.allocator, src);
+    defer a.deinit();
+    try pushCharTokens(&a, src);
+    const size_pt: f32 = 20;
+    const node = try wideAccentNode(&a, accent_row_data, 0x0302, 0, 2);
+    const b = try layout(&list, &a, node, &fm_default, .text, size_pt, .italic);
+    const m = accentMark(&list, b);
+    const base_node = a.child(node, 0);
+    const last = a.child(base_node, 1);
+    const ic = charIc(&a, last, a.node(last), &fm_default, .italic, size_pt);
+    const base_w = list.get(list.children(b)[0].idx).width;
+    const mark_attach = metrics.accentAttach(0x0302) orelse return error.MissingGlyph;
+    // The row ends in a char whose next atom is the mark, so the bare
+    // advance carries NO correction — the helper adds B's 0.025em back.
+    try testing.expectApproxEqAbs(@as(f32, 0.025) * size_pt, ic, 0.01);
+    try testing.expectApproxEqAbs((base_w + ic) / 2 - mark_attach * size_pt, m.x, 0.001);
+}
+
+test "layout: a tiny accent base takes the zero-advance rung and is framed by its ink" {
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    const src = "lM";
+    var a = atom.Ast.init(testing.allocator, src);
+    defer a.deinit();
+    try pushCharTokens(&a, src);
+    const size_pt: f32 = 20;
+    const node = try wideAccentNode(&a, wide_hat_row_data, 0x0302, 0, 1);
+    const b = try layout(&list, &a, node, &fm_default, .text, size_pt, .italic);
+    const m = accentMark(&list, b);
+    const base_w = list.get(list.children(b)[0].idx).width;
+    const geom = (try metrics.horizontalGlyph(&fm_default, 0x0302, base_w / size_pt)) orelse
+        return error.MissingGlyph;
+    // 𝑙 is 2.98pt at the 10pt base — 0.298em, under the ladder's first
+    // AdvanceMeasurement — so the resolver answers with the BASE rung: hmtx 0,
+    // with the whole ink drawn LEFT of the origin. Framing on the advance
+    // would cut all of it away.
+    try testing.expect(geom.advance_em == 0);
+    try testing.expect(geom.ink.left > 0);
+    try testing.expectApproxEqAbs(@as(f32, 0), m.box.width, 0.0001);
+    try testing.expectApproxEqAbs(geom.ink.left * size_pt, m.cd.ink_left, 0.001);
+    try testing.expect(m.cd.horizontal_req > 0);
+    // The mark's own frame is that ink, and it does poke left of the box: the
+    // zero-padded viewBox and pixel buffer have to contain it.
+    var mark_list = draw.DrawList.init(testing.allocator);
+    defer mark_list.deinit();
+    try draw.flatten(&list, list.children(b)[1].idx, src, 0, 0, &mark_list);
+    const mark_ink = mark_list.bounds();
+    try testing.expectApproxEqAbs(-m.cd.ink_left, mark_ink.min_x, 0.001);
+    try testing.expect(mark_ink.min_x < 0);
+    var whole = draw.DrawList.init(testing.allocator);
+    defer whole.deinit();
+    try draw.flatten(&list, b, src, 0, 0, &whole);
+    try testing.expect(whole.bounds().min_x <= m.x - m.cd.ink_left + 0.001);
+}
+
+test "layout: a \\widetilde past the ladder keeps the face's own top rung" {
+    // Both reference engines draw ONE native horizontal variant at every
+    // width: rung 0.932em for `xy`, 1.336em for `abc`, and the 1.916em top
+    // rung — UNSTRETCHED and centred — for `abcd`, `abcde` and `abcdefghij`
+    // alike, at 8pt, 20pt and 60pt and in display and text alike. A
+    // parametric sine wave is the one form no reference engine draws.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    const src = "Mabcdefghij";
+    var a = atom.Ast.init(testing.allocator, src);
+    defer a.deinit();
+    try pushCharTokens(&a, src);
+    const size_pt: f32 = 20;
+    const top = (try metrics.horizontalGlyph(&fm_default, 0x0303, 1e9)) orelse
+        return error.MissingGlyph;
+    var widths: [4]f32 = undefined;
+    for ([_]usize{ 1, 2, 4, 10 }, 0..) |n, i| {
+        const node = try wideAccentNode(&a, wide_tilde_row_data, 0x0303, 0, n);
+        const b = try layout(&list, &a, node, &fm_default, .text, size_pt, .italic);
+        const m = accentMark(&list, b);
+        widths[i] = m.box.width;
+        // ONE char box, the real combining codepoint, and NEVER a stroke.
+        try testing.expectEqual(box.Kind.char, m.box.kind);
+        try testing.expectEqual(@as(u21, 0x0303), m.cd.cp);
+        const geom = (try metrics.horizontalGlyph(&fm_default, 0x0303, m.cd.horizontal_req)) orelse
+            return error.MissingGlyph;
+        // The reserved advance IS the rung's own advance, at every width.
+        try testing.expectApproxEqAbs(geom.advance_em * size_pt, m.box.width, 0.001);
+        try testing.expect(m.box.width <= list.get(list.children(b)[0].idx).width + 0.001);
+    }
+    // The two the ladder covers grow with their argument...
+    try testing.expect(widths[1] > widths[0]);
+    // ... and the two it does NOT both keep the SAME top rung.
+    try testing.expectApproxEqAbs(widths[2], widths[3], 0.001);
+    try testing.expectApproxEqAbs(top.advance_em * size_pt, widths[3], 0.001);
+}
+
+test "layout: a wide accent centres the DRAWN VARIANT's ink" {
+    // Both reference engines paint ONE native size variant and centre the
+    // INK they paint on the argument's TeX width — trailing italic
+    // correction included, the way TeX's fin_mlist appends it. The mark's own
+    // TopAccentAttachment belongs to the ladder's ZERO-ADVANCE rung only, so
+    // subtracting it from a variant parked every wide accent 0.264em + half
+    // its advance to the RIGHT of the reference.
+    const size_pt: f32 = 20;
+    for ([_]struct { cp: u21, marker: u32, src: []const u8 }{
+        .{ .cp = 0x0303, .marker = wide_tilde_row_data, .src = "xy" },
+        .{ .cp = 0x0303, .marker = wide_tilde_row_data, .src = "abcd" },
+        .{ .cp = 0x0303, .marker = wide_tilde_row_data, .src = "abcdefghij" },
+        .{ .cp = 0x0302, .marker = wide_hat_row_data, .src = "xy" },
+        .{ .cp = 0x0302, .marker = wide_hat_row_data, .src = "abcd" },
+        .{ .cp = 0x0302, .marker = wide_hat_row_data, .src = "abcdefghij" },
+    }) |c| {
+        var list = box.BoxList.init(testing.allocator);
+        defer list.deinit();
+        var a = atom.Ast.init(testing.allocator, c.src);
+        defer a.deinit();
+        try pushCharTokens(&a, c.src);
+        const node = try wideAccentNode(&a, c.marker, c.cp, 0, c.src.len);
+        const b = try layout(&list, &a, node, &fm_default, .text, size_pt, .italic);
+        const m = accentMark(&list, b);
+        const base = list.children(b)[0].idx;
+        const base_w = list.get(base).width;
+        const target = (base_w + trailingGroupIc(&list, base, &fm_default, size_pt)) / 2;
+        const geom = (try metrics.horizontalGlyph(&fm_default, c.cp, base_w / size_pt)) orelse
+            return error.MissingGlyph;
+        // A full-advance variant, never the bare combining glyph: that is the
+        // case whose datum the placement reads, and this fixture is not it.
+        try testing.expect(geom.advance_em > 0);
+        try testing.expectEqual(box.Kind.char, m.box.kind);
+        try testing.expectEqual(c.cp, m.cd.cp);
+        try testing.expectApproxEqAbs(geom.advance_em * size_pt, m.box.width, 0.001);
+        // The drawn variant's advance centre lands on the argument's TeX
+        // width: `\widetilde{xy}` puts its tilde at 0.079em, `\widetilde{abcd}`
+        // at 0.029em and the ten-letter argument at 1.477em.
+        try testing.expectApproxEqAbs(target, m.x + m.box.width / 2, 0.001);
+        // ... and NOT where the mark's own combining attachment puts it: the
+        // old rule missed by the whole mark attachment plus half the advance.
+        const mark_attach = metrics.accentAttach(c.cp) orelse return error.MissingGlyph;
+        try testing.expect(@abs(m.x - (target - mark_attach * size_pt)) > 0.2 * size_pt);
+    }
+}
+
+test "layout: a narrow-base extensible accent rides the rung" {
+    // The datum follows the DRAWING, not the command. `x` is past the hat
+    // ladder's first AdvanceMeasurement, so `\widehat{x}` draws the 0.644em
+    // rung variant: its ink centre (0.322em) is what the base's 0.329em
+    // attachment meets. `l` is 0.298em, UNDER that measurement: the resolver
+    // answers with the zero-advance base rung and the mark keeps its MATH
+    // attachment, origin 0.184 + 0.264em, exactly as before.
+    const size_pt: f32 = 20;
+    for ([_]struct { src: []const u8 }{
+        .{ .src = "x" },
+        .{ .src = "l" },
+    }) |c| {
+        var list = box.BoxList.init(testing.allocator);
+        defer list.deinit();
+        var a = atom.Ast.init(testing.allocator, c.src);
+        defer a.deinit();
+        try pushCharTokens(&a, c.src);
+        const node = try wideAccentNode(&a, wide_hat_row_data, 0x0302, 0, c.src.len);
+        const b = try layout(&list, &a, node, &fm_default, .text, size_pt, .italic);
+        const m = accentMark(&list, b);
+        const base = list.children(b)[0].idx;
+        const base_cp = list.charData(list.children(base)[0].idx).cp;
+        const attach = metrics.accentAttach(base_cp) orelse return error.MissingGlyph;
+        const geom = (try metrics.horizontalGlyph(
+            &fm_default,
+            0x0302,
+            list.get(base).width / size_pt,
+        )) orelse return error.MissingGlyph;
+        try testing.expectApproxEqAbs(geom.advance_em * size_pt, m.box.width, 0.001);
+        if (geom.advance_em > 0) {
+            try testing.expectApproxEqAbs(attach * size_pt, m.x + m.box.width / 2, 0.001);
+        } else {
+            const mark_attach = metrics.accentAttach(0x0302) orelse return error.MissingGlyph;
+            try testing.expectApproxEqAbs((attach - mark_attach) * size_pt, m.x, 0.001);
+        }
+    }
+}
+
+test "layout: a single-char base places its wide accent by the variant's ink centre" {
+    // `M` is 0.97em with a TopAccentAttachment of 0.625em — far left of the
+    // glyph's own centre, so it is where a single-character argument and a
+    // multi-character one disagree most. The base's attachment still picks
+    // the TARGET; the drawn variant only supplies the datum its ink is
+    // measured back from, so `\widehat{M}` puts the hat's advance centre on
+    // 0.625em and `\widetilde{M}` on 0.625em too — not at 0.625 + 0.264em.
+    const size_pt: f32 = 20;
+    const src = "M";
+    var a = atom.Ast.init(testing.allocator, src);
+    defer a.deinit();
+    try pushCharTokens(&a, src);
+    const attach = metrics.accentAttach(0x1D440) orelse return error.MissingGlyph;
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    for ([_]struct { cp: u21, marker: u32 }{
+        .{ .cp = 0x0302, .marker = wide_hat_row_data },
+        .{ .cp = 0x0303, .marker = wide_tilde_row_data },
+    }) |c| {
+        const node = try wideAccentNode(&a, c.marker, c.cp, 0, 1);
+        const b = try layout(&list, &a, node, &fm_default, .text, size_pt, .italic);
+        const m = accentMark(&list, b);
+        const base = list.children(b)[0].idx;
+        const geom = (try metrics.horizontalGlyph(
+            &fm_default,
+            c.cp,
+            list.get(base).width / size_pt,
+        )) orelse return error.MissingGlyph;
+        try testing.expect(geom.advance_em > 0);
+        try testing.expectApproxEqAbs(geom.advance_em * size_pt, m.box.width, 0.001);
+        try testing.expectApproxEqAbs(attach * size_pt, m.x + m.box.width / 2, 0.001);
+        const mark_attach = metrics.accentAttach(c.cp) orelse return error.MissingGlyph;
+        try testing.expect(@abs(m.x - (attach - mark_attach) * size_pt) > 0.2 * size_pt);
+    }
+}
+
+test "layout: the radical degree rides RadicalKernBeforeDegree at the current size" {
+    // LuaLaTeX puts the index 0.278em (RadicalKernBeforeDegree) right of the
+    // radical's own origin and widens the construction by NOTHING — the index
+    // rides the radical's left shoulder. A kern evaluated against a 10pt em
+    // is 0.139em here and 0.417em at 60pt, which is the size-invariance the
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    const src = "3x";
+    var a = atom.Ast.init(testing.allocator, src);
+    defer a.deinit();
+    try pushCharTokens(&a, src);
+    const surd = try a.createLeaf(.char, 0, 1, 0x221A);
+    const degree = try a.createLeaf(.char, 0, 1, 0x33);
+    const wrapped = try a.createNode(
+        .script,
+        0,
+        2,
+        &.{ a.node(surd), a.node(degree) },
+        atom.ScriptBits.sup,
+    );
+    const radicand = try a.createLeaf(.char, 1, 1, 0);
+    const row = try a.createNode(
+        .row,
+        0,
+        2,
+        &.{ a.node(wrapped), a.node(radicand) },
+        sqrt_row_data,
+    );
+    for ([_]f32{ 10, 20, 60 }) |size_pt| {
+        const b = try layout(&list, &a, row, &fm_default, .display, size_pt, .italic);
+        const kids = list.children(b);
+        // The degree is the LAST child; the radical keeps its own origin.
+        const deg = kids[kids.len - 1];
+        try testing.expectApproxEqAbs(0.278 * size_pt, deg.x_shift, 0.05 * size_pt);
+        // The construction is NOT widened for the index: it rides the
+        // radical's left shoulder inside its advance.
+        try testing.expectApproxEqAbs(@as(f32, 0), kids[0].x_shift, 0.001);
+    }
+}
+
+test "layout: a fixed-delimiter fraction carries no \\nulldelimiterspace" {
+    // TeX's null-delimiter wrap pads a fraction that has NO delimiters
+    // (`\over`, `\genfrac{}{}`) by \nulldelimiterspace on each side. The
+    // `\binom` family puts REAL parentheses around the same fraction, and both
+    // reference engines draw its parts flush between them: `\tbinom{n}{k}` is
+    // 1.264em wide = 2x0.422 paren + 0.42 parts, with no pad at all.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    var a = atom.Ast.init(testing.allocator, "ab");
+    defer a.deinit();
+    try pushCharTokens(&a, "ab");
+    const num = try a.createLeaf(.char, 0, 1, 0);
+    const den = try a.createLeaf(.char, 1, 1, 0);
+    const fixed = try a.createNode(
+        .fraction,
+        0,
+        2,
+        &.{ a.node(num), a.node(den) },
+        atom.fracData(true, .text, false) | atom.FractionBits.fixed_delim,
+    );
+    const b = try layout(&list, &a, fixed, &fm_default, .text, 20, .italic);
+    const num_box = list.get(list.children(b)[0].idx);
+    const den_box = list.get(list.children(b)[1].idx);
+    // The box IS the parts' width — the delimiters, not a pad, carry the rest.
+    try testing.expectApproxEqAbs(@max(num_box.width, den_box.width), list.get(b).width, 0.001);
+}
+
+test "layout: an environment row strut is LaTeX's \\strutbox" {
+    // amsmath's `\strut@` copies `\strutbox@`, which latex.ltx:12596 builds as
+    // 0.7\baselineskip tall and 0.3\baselineskip deep (`\normallineskiplimit`
+    // is 0pt, so the box is never re-set per size). With \baselineskip =
+    // 1.2·size that is h 0.84·size and d 0.36·size at EVERY size: 8.4/3.6 at
+    // 10pt, 16.8/7.2 at 20pt, 50.4/21.6 at 60pt — the reference \showbox of
+    // `\begin{matrix}a&b\end{matrix}`. The text paren's `(` box is NOT it: at
+    // 0.75em/0.25em every row came out 0.09em taller and 0.11em deeper, the
+    // "loose bottom" under a trailing \hline.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    const src = "ab";
+    var a = atom.Ast.init(testing.allocator, src);
+    defer a.deinit();
+    try pushCharTokens(&a, src);
+    const row = try a.createNode(.row, 0, 2, &.{
+        a.node(try a.createLeaf(.char, 0, 1, 0)),
+        a.node(try a.createLeaf(.char, 1, 1, 0)),
+    }, 0);
+    const env = try a.createNode(.env, 0, 1, &.{a.node(row)}, atom.envData(.array, "cc"));
+    for ([_]f32{ 10, 20, 60 }) |size_pt| {
+        const b = try layout(&list, &a, env, &fm_default, .display, size_pt, .italic);
+        // The ROW box is the strut itself — \vcenter moves the stack but
+        // never re-measures a row — so its own extent is the box amsmath
+        // copies in: 8.4/3.6 at 10pt, 16.8/7.2 at 20pt, 50.4/21.6 at 60pt.
+        const row_box = list.get(list.children(envArray(&list, b))[0].idx);
+        try testing.expectApproxEqAbs(0.84 * size_pt, row_box.height, 0.001);
+        try testing.expectApproxEqAbs(0.36 * size_pt, row_box.depth, 0.001);
+        // The strut's two halves make one \baselineskip, which is the row
+        // pitch of a matrix and the whole height of a one-row array.
+        try testing.expectApproxEqAbs(1.2 * size_pt, row_box.height + row_box.depth, 0.001);
+        try testing.expectApproxEqAbs(1.2 * size_pt, list.get(b).height + list.get(b).depth, 0.001);
     }
 }
 
@@ -7636,14 +7921,6 @@ test "layout: a forced under-limit clears a base that descends" {
     try testing.expect(base.depth > 1.0);
     // The annotation's TOP is below the base's BOTTOM: no ink overlap.
     try testing.expect(ch[1].shift - ann.height >= base.depth);
-    // ... and the clearance is the measured one: the annotation's BASELINE
-    // sits max(under_min, its own height + under_gap) below the base's
-    // bottom edge.
-    try testing.expectApproxEqAbs(
-        @max(limit_under_min, ann.height + limit_under_gap),
-        ch[1].shift - base.depth,
-        0.001,
-    );
     // The result box bounds both, without counting the base twice.
     try testing.expectApproxEqAbs(ch[1].shift + ann.depth, rb.depth, 0.001);
     try testing.expectApproxEqAbs(base.height, rb.height, 0.001);
@@ -7674,13 +7951,8 @@ test "layout: a forced over-limit clears a base that ascends" {
     const base_b = list.get(ch[0].idx);
     const ann = list.get(ch[1].idx);
     try testing.expect(ann.depth > 0);
-    // The limit's BOTTOM sits exactly the over gap above the base's top
-    // (y-down: the limit is at a negative shift, the base's top at −height).
-    try testing.expectApproxEqAbs(
-        -base_b.height - limit_over_gap,
-        ch[1].shift + ann.depth,
-        0.001,
-    );
+    // The annotation's bottom clears the nucleus's top in y-down coordinates.
+    try testing.expect(ch[1].shift + ann.depth < -base_b.height);
 }
 
 test "layout: a scaled big integral draws the base glyph its box was sized for" {
@@ -7934,4 +8206,451 @@ test "layout: \\hline draws one full-width rule per entry and never a row" {
     try testing.expect(row_shifts[0] < rule_shifts[1]);
     try testing.expect(rule_shifts[1] < row_shifts[1]);
     try testing.expect(row_shifts[1] < rule_shifts[2]);
+}
+
+/// One entry of a `\begin{env}` body, in source order: a `\hline` rule leaf
+/// at the given token, or a row whose CELLS are the given char tokens — one
+/// cell per token, one token per source byte, the shape pushCharTokens
+/// builds. An entry list with no rows at all is an environment with no rows.
+const EnvEntry = union(enum) {
+    rule: u32,
+    row: []const u32,
+};
+
+/// A `\begin{kind}{colspec}` environment node whose body is exactly
+/// `entries`: rule leaves and row nodes interleaved in source order, with the
+/// delimiter leaves `open_cp`/`close_cp` bracket them the way parseBegin emits
+/// them (null = none, as a bare `\begin{matrix}` or `\begin{array}`).
+fn envFixture(
+    a: *atom.Ast,
+    kind: atom.EnvKind,
+    colspec: []const u8,
+    open_cp: ?u21,
+    close_cp: ?u21,
+    entries: []const EnvEntry,
+) !u32 {
+    var kids: std.ArrayList(atom.Node) = .empty;
+    defer kids.deinit(a.gpa);
+    if (open_cp) |cp| try kids.append(a.gpa, a.node(try a.createLeaf(.char, 0, 1, cp)));
+    for (entries) |e| {
+        switch (e) {
+            .rule => |tok| try kids.append(a.gpa, a.node(try a.createLeaf(.hline, tok, 1, 0))),
+            .row => |cells| {
+                var nodes: std.ArrayList(atom.Node) = .empty;
+                defer nodes.deinit(a.gpa);
+                for (cells) |tok| {
+                    try nodes.append(a.gpa, a.node(try a.createLeaf(.char, tok, 1, 0)));
+                }
+                const first = if (cells.len == 0) @as(u32, 0) else cells[0];
+                try kids.append(a.gpa, a.node(try a.createNode(
+                    .row,
+                    first,
+                    @intCast(cells.len),
+                    nodes.items,
+                    0,
+                )));
+            },
+        }
+    }
+    if (close_cp) |cp| try kids.append(a.gpa, a.node(try a.createLeaf(.char, 0, 1, cp)));
+    return a.createNode(.env, 0, 1, kids.items, atom.envData(kind, colspec));
+}
+
+/// The array vbox inside an environment box with no delimiter children.
+fn envArray(list: *box.BoxList, env_box: u32) u32 {
+    return list.children(env_box)[0].idx;
+}
+
+test "layout: consecutive \\hline rules stack \\doublerulesep apart and clear the rows" {
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    const src = "abcdefgh";
+    var a = atom.Ast.init(testing.allocator, src);
+    defer a.deinit();
+    try pushCharTokens(&a, src);
+    // The corpus shape: a leading PAIR, two rows, one trailing rule. Two rules
+    // on one boundary are two separate \noalign entries, and latex.ltx's
+    // `\@xhline` (the \futurelet in `\hline`) sees the second one and adds
+    // `\vskip\doublerulesep \vskip-\arrayrulewidth` after the first. Measured
+    // on the exact-font XeLaTeX reference at 20pt: the pair's rule centres sit
+    // 2.0004pt apart and the pair opens the array by 2 × 0.4 + 1.6 = 2.4pt.
+    const env = try envFixture(&a, .array, "cc", null, null, &.{
+        .{ .rule = 0 },
+        .{ .rule = 1 },
+        .{ .row = &.{ 2, 3 } },
+        .{ .row = &.{ 4, 5 } },
+        .{ .rule = 6 },
+    });
+    const env_box = try layout(&list, &a, env, &fm_default, .display, 10, .italic);
+    const array = envArray(&list, env_box);
+    const stack = list.children(array);
+    // Rows first, then the rule entries in source order.
+    try testing.expectEqual(@as(usize, 5), stack.len);
+    const row0 = list.get(stack[0].idx);
+    const row1 = list.get(stack[1].idx);
+    // Three DISTINCT rules, every one \arrayrulewidth thick and spanning the
+    // whole array advance (a bare \array keeps its pads, so no overhang).
+    for (stack[2..]) |cr| {
+        const rb = list.get(cr.idx);
+        try testing.expectEqual(box.Kind.rule, rb.kind);
+        try testing.expectApproxEqAbs(@as(f32, 0.4), rb.height + rb.depth, 0.001);
+        try testing.expectApproxEqAbs(list.get(array).width, rb.width, 0.001);
+    }
+    // \doublerulesep between the two leading rules, so the ink bands clear
+    // each other instead of painting on top of one another.
+    try testing.expectApproxEqAbs(@as(f32, 2.0), stack[3].shift - stack[2].shift, 0.001);
+    try testing.expect(stack[2].shift - 0.4 < stack[3].shift);
+    // The LOWER leading rule is flush with the first row's top edge, the upper
+    // one \doublerulesep − \arrayrulewidth of clear space above it: no rule
+    // ever lands on a row's own strut.
+    try testing.expectApproxEqAbs(stack[0].shift - row0.height, stack[3].shift, 0.001);
+    // The trailing rule hangs directly under the last row's bottom edge: its
+    // own top edge, one \arrayrulewidth above its shift, is that edge.
+    try testing.expectApproxEqAbs(stack[1].shift + row1.depth, stack[4].shift - 0.4, 0.001);
+    // The pair is the array's whole leading overhang and the trailing rule its
+    // whole depth overhang.
+    try testing.expectApproxEqAbs(@as(f32, 2.4), list.get(array).height - (row0.height - stack[0].shift), 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.4), list.get(array).depth - (row1.depth + stack[1].shift), 0.001);
+}
+
+test "layout: an interior \\hline pair opens the row pitch by its own stack" {
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    const src = "abcdef";
+    var a = atom.Ast.init(testing.allocator, src);
+    defer a.deinit();
+    try pushCharTokens(&a, src);
+    // \begin{matrix}a&b\\\hline\hline c&d\end{matrix}: rows stack directly, so
+    // the pitch is \baselineskip plus whatever the rules between them occupy.
+    // Measured at 20pt on XeLaTeX: 26.49pt against a 24.09pt \baselineskip —
+    // 2 × \arrayrulewidth plus one \doublerulesep − \arrayrulewidth of air.
+    const env = try envFixture(&a, .array, "cc", null, null, &.{
+        .{ .row = &.{ 0, 1 } },
+        .{ .rule = 2 },
+        .{ .rule = 3 },
+        .{ .row = &.{ 4, 5 } },
+    });
+    const env_box = try layout(&list, &a, env, &fm_default, .display, 10, .italic);
+    const array = envArray(&list, env_box);
+    const stack = list.children(array);
+    // Rows first, then the rule entries: [row0, row1, rule0, rule1].
+    try testing.expectEqual(@as(usize, 4), stack.len);
+    const row0 = list.get(stack[0].idx);
+    const row1 = list.get(stack[1].idx);
+    // The rows stack directly, so the pitch is row0's own depth plus row1's own
+    // height — whatever the struts make them — plus the pair's stack. The two
+    // rules contribute 2 × \arrayrulewidth and one \doublerulesep − \arrayrulewidth.
+    try testing.expectApproxEqAbs(row0.depth + row1.height + 2.4, stack[1].shift - stack[0].shift, 0.001);
+    // The pair is \doublerulesep apart, and its LAST rule ends flush against
+    // the row below it while the first one sits on the row above's bottom.
+    try testing.expectApproxEqAbs(@as(f32, 2.0), stack[3].shift - stack[2].shift, 0.001);
+    try testing.expectApproxEqAbs(stack[1].shift - row1.height, stack[3].shift, 0.001);
+    try testing.expect(stack[2].shift - 0.4 < stack[3].shift - 0.4);
+    try testing.expect(stack[2].shift - 0.4 >= stack[0].shift + row0.depth);
+}
+
+test "layout: a matrix \\hline overhangs the box by \\arraycolsep, an \\array's does not" {
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    const src = "abcd";
+    var a = atom.Ast.init(testing.allocator, src);
+    defer a.deinit();
+    try pushCharTokens(&a, src);
+    // latex.ltx:16728 makes `\hline` a `\noalign{\hrule}`, and a noalign rule
+    // spans the WHOLE \halign width — the outer \arraycolsep pads included.
+    // amsmath's matrix family cancels those pads from the ADVANCE only
+    // (`\hskip -\arraycolsep` either side of `\array`), so the rule overhangs
+    // the matrix box by \arraycolsep per side. Measured at 20pt: box
+    // 31.5405pt, rule 41.5402pt, first ink 5.0pt left of the box.
+    const rows = [_]EnvEntry{
+        .{ .row = &.{0} },
+        .{ .row = &.{1} },
+    };
+    const bare = try envFixture(&a, .matrix, "", null, null, &rows);
+    const ruled = [_]EnvEntry{
+        .{ .rule = 2 },
+        .{ .row = &.{0} },
+        .{ .row = &.{1} },
+        .{ .rule = 3 },
+    };
+    const ruled_env = try envFixture(&a, .matrix, "", null, null, &ruled);
+    const bare_box = try layout(&list, &a, bare, &fm_default, .display, 10, .italic);
+    const ruled_box = try layout(&list, &a, ruled_env, &fm_default, .display, 10, .italic);
+    const bare_array = envArray(&list, bare_box);
+    const ruled_array = envArray(&list, ruled_box);
+    // The rules change the array's HEIGHT only: the matrix advance is the
+    // plain one, both pads cancelled, and \begin{matrix}a\\b\end{matrix} is
+    // not one point wider than its ruled sibling.
+    try testing.expectApproxEqAbs(
+        list.get(bare_array).width,
+        list.get(ruled_array).width,
+        0.001,
+    );
+    const stack = list.children(ruled_array);
+    try testing.expectEqual(@as(usize, 4), stack.len);
+    for ([_]usize{ 2, 3 }) |i| {
+        const rb = list.get(stack[i].idx);
+        try testing.expectApproxEqAbs(list.get(ruled_array).width + 10.0, rb.width, 0.001);
+        try testing.expectApproxEqAbs(@as(f32, -5.0), stack[i].x_shift, 0.001);
+    }
+    // A bare \begin{array} keeps its pads, so the same rule spans the box
+    // exactly and starts flush at its left edge.
+    const arr_env = try envFixture(&a, .array, "c", null, null, &[_]EnvEntry{
+        .{ .rule = 2 },
+        .{ .row = &.{0} },
+        .{ .rule = 3 },
+    });
+    const arr_box = try layout(&list, &a, arr_env, &fm_default, .display, 10, .italic);
+    const arr_array = envArray(&list, arr_box);
+    const arr_stack = list.children(arr_array);
+    try testing.expectEqual(@as(usize, 3), arr_stack.len);
+    for ([_]usize{ 1, 2 }) |i| {
+        const rb = list.get(arr_stack[i].idx);
+        try testing.expectApproxEqAbs(list.get(arr_array).width, rb.width, 0.001);
+        try testing.expectApproxEqAbs(@as(f32, 0.0), arr_stack[i].x_shift, 0.001);
+    }
+}
+
+test "layout: a row with missing cells keeps the column origins and the array width" {
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    const src = "abc";
+    var a = atom.Ast.init(testing.allocator, src);
+    defer a.deinit();
+    try pushCharTokens(&a, src);
+    // \begin{matrix}a\\a&b\end{matrix}: TeX's \halign pads a short row to the
+    // alignment width, so the row keeps the cell it HAS at column 0's origin
+    // and its row box still spans the whole advance. Measured on XeTeX at
+    // 20pt: the short row's content starts exactly where the long row's first
+    // cell does, at the matrix's flush left edge.
+    //
+    // Both rows open with the SAME cell, so each column is exactly as wide as
+    // that cell and every centering offset is zero — a difference in x_shift
+    // here would be a moved column, not a centered cell.
+    const env = try envFixture(&a, .matrix, "", null, null, &[_]EnvEntry{
+        .{ .row = &.{0} },
+        .{ .row = &.{ 0, 1 } },
+    });
+    // \halign measures a column by each cell's ADVANCE plus the MATH italic
+    // correction of its last char (cellTrailingIc, verified against XeTeX), so
+    // a column is never its bare advance: math-italic `a` (U+1D44E) has no IC
+    // entry, `b` (U+1D44F) adds 0.014em = 0.14pt here. The origins and the
+    // array advance below are measured from the same advance + IC.
+    const full = a.child(env, 1);
+    const col_a = list.get(try charBox(&list, &a, 0x1D44E, .text, 10)).width +
+        cellTrailingIc(&a, a.child(full, 0), &fm_default, .italic, 10);
+    const col_b = list.get(try charBox(&list, &a, 0x1D44F, .text, 10)).width +
+        cellTrailingIc(&a, a.child(full, 1), &fm_default, .italic, 10);
+    const env_box = try layout(&list, &a, env, &fm_default, .display, 10, .italic);
+    const array = envArray(&list, env_box);
+    const stack = list.children(array);
+    try testing.expectEqual(@as(usize, 2), stack.len);
+    const short_row = list.children(stack[0].idx);
+    const full_row = list.children(stack[1].idx);
+    // No phantom cell is invented for the column the short row never reaches.
+    try testing.expectEqual(@as(usize, 1), short_row.len);
+    try testing.expectEqual(@as(usize, 2), full_row.len);
+    // Column 0 is flush at the matrix's left edge (both outer pads cancelled)
+    // and column 1 starts one \arraycolsep pair after column 0's content.
+    try testing.expectApproxEqAbs(@as(f32, 0.0), short_row[0].x_shift, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), full_row[0].x_shift, 0.001);
+    try testing.expectApproxEqAbs(col_a + 10.0, full_row[1].x_shift, 0.001);
+    // The array advance is its columns plus one \arraycolsep pair between
+    // them, and BOTH rows are stretched to it.
+    try testing.expectApproxEqAbs(col_a + 10.0 + col_b, list.get(array).width, 0.001);
+    for (stack) |cr| {
+        try testing.expectApproxEqAbs(list.get(array).width, list.get(cr.idx).width, 0.001);
+    }
+}
+
+test "layout: an environment with no rows draws only its delimiters" {
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    const src = "ab";
+    var a = atom.Ast.init(testing.allocator, src);
+    defer a.deinit();
+    try pushCharTokens(&a, src);
+    // \begin{pmatrix}\end{pmatrix}: no row entry at all, so no array vbox is
+    // fabricated — TeX renders a pair of base-size parens.
+    const pm = try envFixture(&a, .pmatrix, "", '(', ')', &.{});
+    const pm_box = try layout(&list, &a, pm, &fm_default, .display, 10, .italic);
+    const pm_kids = list.children(pm_box);
+    try testing.expectEqual(@as(usize, 2), pm_kids.len);
+    for (pm_kids) |cr| try testing.expectEqual(box.Kind.char, list.get(cr.idx).kind);
+    // A bare environment with no rows is an empty box: zero advance, no
+    // children, and no rule geometry invented for a body that has none.
+    const bare = try envFixture(&a, .array, "c", null, null, &.{});
+    const bare_box = try layout(&list, &a, bare, &fm_default, .display, 10, .italic);
+    try testing.expectEqual(@as(usize, 0), list.children(bare_box).len);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), list.get(bare_box).width, 0.001);
+}
+
+test "layout: a matrix row strut is \\baselineskip" {
+    // LaTeX's `\@array` zeroes \baselineskip and \lineskip inside a matrix,
+    // so the strut alone fixes the baseline distance between two rows: 0.7 +
+    // 0.3 of \baselineskip. Measured 12pt at 10pt and 43.2pt at 36pt; 24pt
+    // at 20pt and 72pt at 60pt close the series, and none of them is the text
+    // paren's 0.75 + 0.25em box this replaced.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    const src = "xy";
+    var a = atom.Ast.init(testing.allocator, src);
+    defer a.deinit();
+    try pushCharTokens(&a, src);
+    for ([_]f32{ 10, 20, 36, 60 }) |size_pt| {
+        const env = try twoRowEnv(&a, .matrix, null);
+        const b = try layout(&list, &a, env, &fm_default, .display, size_pt, .italic);
+        try testing.expectApproxEqAbs(1.2 * size_pt, envRowPitch(&list, b), 0.001);
+    }
+}
+
+test "layout: a \\hline sits flush on the strut" {
+    // \begin{array}{c}\hline a\\\hline\end{array} at 20pt. A rule is a bare
+    // \noalign \hrule: it opens its boundary by its own \arrayrulewidth and
+    // never lands ON a row's strut. The leading rule's own bottom edge IS the
+    // row's top edge, the trailing rule's own top edge IS the row's bottom
+    // edge, and the whole box is the row's 16.8 + 7.2 strut with one 0.4pt
+    // rule above and one below — h 17.4 / d 7.4.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    const src = "abc";
+    var a = atom.Ast.init(testing.allocator, src);
+    defer a.deinit();
+    try pushCharTokens(&a, src);
+    const env = try envFixture(&a, .array, "c", null, null, &.{
+        .{ .rule = 0 },
+        .{ .row = &.{1} },
+        .{ .rule = 2 },
+    });
+    const b = try layout(&list, &a, env, &fm_default, .display, 20, .italic);
+    const array = envArray(&list, b);
+    const ab = list.get(array);
+    try testing.expectApproxEqAbs(@as(f32, 17.4), ab.height, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 7.4), ab.depth, 0.001);
+    const stack = list.children(array);
+    try testing.expectEqual(@as(usize, 3), stack.len);
+    const row = list.get(stack[0].idx);
+    try testing.expectApproxEqAbs(@as(f32, 16.8), row.height, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 7.2), row.depth, 0.001);
+    for (stack[1..]) |cr| {
+        const rb = list.get(cr.idx);
+        try testing.expectEqual(box.Kind.rule, rb.kind);
+        try testing.expectApproxEqAbs(@as(f32, 0.4), rb.height + rb.depth, 0.001);
+        try testing.expectApproxEqAbs(ab.width, rb.width, 0.001);
+    }
+    try testing.expectApproxEqAbs(stack[0].shift - row.height, stack[1].shift, 0.001);
+    try testing.expectApproxEqAbs(stack[0].shift + row.depth, stack[2].shift - 0.4, 0.001);
+}
+
+test "layout: a leading \\hline pair opens by \\arrayrulewidth + \\doublerulesep" {
+    // \begin{array}{c}\hline\hline a\\\hline\end{array} at 20pt. Two rules on
+    // the LEADING boundary are two separate \noalign entries, so latex.ltx's
+    // \@xhline puts \doublerulesep of air between their ink bands and the
+    // boundary opens by \arrayrulewidth + \doublerulesep = 2.4pt: h 18.4 /
+    // d 8.4, the pair 2.0pt apart, and the LOWER of the two the one flush
+    // against the row's top edge.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    const src = "abcd";
+    var a = atom.Ast.init(testing.allocator, src);
+    defer a.deinit();
+    try pushCharTokens(&a, src);
+    const env = try envFixture(&a, .array, "c", null, null, &.{
+        .{ .rule = 0 },
+        .{ .rule = 1 },
+        .{ .row = &.{2} },
+        .{ .rule = 3 },
+    });
+    const b = try layout(&list, &a, env, &fm_default, .display, 20, .italic);
+    const array = envArray(&list, b);
+    const ab = list.get(array);
+    try testing.expectApproxEqAbs(@as(f32, 18.4), ab.height, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 8.4), ab.depth, 0.001);
+    const stack = list.children(array);
+    try testing.expectEqual(@as(usize, 4), stack.len);
+    const row = list.get(stack[0].idx);
+    for (stack[1..]) |cr| {
+        const rb = list.get(cr.idx);
+        try testing.expectEqual(box.Kind.rule, rb.kind);
+        try testing.expectApproxEqAbs(@as(f32, 0.4), rb.height + rb.depth, 0.001);
+    }
+    // The pair is the array's whole leading overhang: one thickness plus one
+    // \doublerulesep above the row's own top edge.
+    try testing.expectApproxEqAbs(@as(f32, 2.4), ab.height + (stack[0].shift - row.height), 0.001);
+    try testing.expectApproxEqAbs(-ab.height, stack[1].shift - 0.4, 0.001);
+    // The two ink bands clear each other instead of painting on top of one
+    // another, and the lower rule is the one that meets the row.
+    try testing.expectApproxEqAbs(@as(f32, 2.0), stack[2].shift - stack[1].shift, 0.001);
+    try testing.expect(stack[1].shift - 0.4 < stack[2].shift);
+    try testing.expectApproxEqAbs(stack[0].shift - row.height, stack[2].shift, 0.001);
+    try testing.expectApproxEqAbs(stack[0].shift + row.depth, stack[3].shift - 0.4, 0.001);
+}
+
+test "layout: an array colspec rule spans the strut" {
+    // latex.ltx's template puts a `|` \vrule INSIDE every row's column box, so
+    // the overlapping rules read as one continuous line that spans each row's
+    // own strut extent exactly — 16.8 + 7.2 = 24pt at 20pt, flush at both
+    // edges, \arrayrulewidth thick across and centred on the array's left edge.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    const src = "abcd";
+    var a = atom.Ast.init(testing.allocator, src);
+    defer a.deinit();
+    try pushCharTokens(&a, src);
+    const env = try envFixture(&a, .array, "|cc", null, null, &.{
+        .{ .row = &.{ 0, 1 } },
+        .{ .row = &.{ 2, 3 } },
+    });
+    const b = try layout(&list, &a, env, &fm_default, .display, 20, .italic);
+    const array = envArray(&list, b);
+    const stack = list.children(array);
+    try testing.expectEqual(@as(usize, 2), stack.len);
+    // The rows stand one \baselineskip apart, so the two rules join into a
+    // single line over both of them.
+    try testing.expectApproxEqAbs(@as(f32, 24.0), stack[1].shift - stack[0].shift, 0.001);
+    for (stack) |cr| {
+        const row = list.get(cr.idx);
+        const kids = list.children(cr.idx);
+        // [cell, cell, rule]: the rule is the template's own column entry.
+        try testing.expectEqual(@as(usize, 3), kids.len);
+        const rb = list.get(kids[2].idx);
+        try testing.expectEqual(box.Kind.rule, rb.kind);
+        try testing.expectApproxEqAbs(@as(f32, 24.0), rb.height + rb.depth, 0.001);
+        try testing.expectApproxEqAbs(row.height, rb.height, 0.001);
+        try testing.expectApproxEqAbs(row.depth, rb.depth, 0.001);
+        try testing.expectApproxEqAbs(@as(f32, 0.4), rb.width, 0.001);
+        try testing.expectApproxEqAbs(@as(f32, -0.2), kids[2].x_shift, 0.001);
+    }
+}
+
+test "layout: \\hline is \\arrayrulewidth thick at every size" {
+    // \arrayrulewidth is a FIXED 0.4pt (article.cls), never scaled with the
+    // font: a rule on a 60pt row is exactly as thick as one on a 10pt row,
+    // and the strut beside it is untouched at every size.
+    var list = box.BoxList.init(testing.allocator);
+    defer list.deinit();
+    const src = "abc";
+    var a = atom.Ast.init(testing.allocator, src);
+    defer a.deinit();
+    try pushCharTokens(&a, src);
+    const env = try envFixture(&a, .array, "c", null, null, &.{
+        .{ .rule = 0 },
+        .{ .row = &.{1} },
+    });
+    for ([_]f32{ 10, 20, 60 }) |size_pt| {
+        const b = try layout(&list, &a, env, &fm_default, .display, size_pt, .italic);
+        const array = envArray(&list, b);
+        const ab = list.get(array);
+        const stack = list.children(array);
+        try testing.expectEqual(@as(usize, 2), stack.len);
+        const row = list.get(stack[0].idx);
+        const rb = list.get(stack[1].idx);
+        try testing.expectEqual(box.Kind.rule, rb.kind);
+        try testing.expectApproxEqAbs(@as(f32, 0.4), rb.height + rb.depth, 0.001);
+        // The rule is the whole overhang, and the row's strut stands whole
+        // under it — nothing of it is eaten by the rule's own thickness.
+        try testing.expectApproxEqAbs(@as(f32, 0.4), ab.height + (stack[0].shift - row.height), 0.001);
+        try testing.expectApproxEqAbs(stack[0].shift - row.height, stack[1].shift, 0.001);
+        try testing.expectApproxEqAbs(1.2 * size_pt, row.height + row.depth, 0.001);
+    }
 }

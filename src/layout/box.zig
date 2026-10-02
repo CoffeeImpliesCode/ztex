@@ -4,7 +4,9 @@
 
 const std = @import("std");
 const atom = @import("ztex.atom");
-
+/// What a laid-out box IS: a run of children, a single glyph, or a piece of
+/// space. The kind decides how `draw.flatten` paints it and which geometry it
+/// contributes; `char` is the only kind with a `CharData` record.
 pub const Kind = enum(u8) {
     /// children laid left→right, baseline-aligned
     hbox,
@@ -22,9 +24,10 @@ pub const Kind = enum(u8) {
     /// because a consumer can tell a script box from a plain row without
     /// inspecting the children.
     script,
+
     /// a STROKED POLYLINE: one connected stroke, leaf — the long
-    /// `\widehat` / `\widetilde` accent. Its geometry lives in the SPARSE
-    /// `polys` side table, read through `BoxList.poly`.
+    /// `\widetilde` accent. Its geometry lives in the SPARSE `polys` side
+    /// table, read through `BoxList.poly`.
     poly,
 };
 
@@ -49,7 +52,6 @@ pub const BigOpForm = enum(u8) {
     base,
     variant,
 };
-
 /// A laid-out box: fixed-size, stored in the BoxList pool.
 ///
 /// Only the SHARED layout header lives here (kind, dimensions, child run,
@@ -63,6 +65,7 @@ pub const BigOpForm = enum(u8) {
 /// Polyline geometry is shaped the same way for the `.poly` kind only: the
 /// box carries an index (`poly_idx`) into the sparse `polys` table, never
 /// the geometry itself.
+///
 pub const Box = struct {
     kind: Kind,
     width: f32,
@@ -98,6 +101,20 @@ pub const Box = struct {
     color: ?atom.Color = null,
 };
 
+/// Vinculum rectangle in points relative to the radical glyph's baseline.
+/// It shares the glyph's paint operation, not a second alpha composition.
+pub const RadicalBar = struct {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+};
+
+/// The char-box side table record: which glyph a `.char` box draws, in which
+/// face, at which size, and which MATH form the layout selected for it —
+/// everything the shared `Box` header does not carry. It is indexed by BOX
+/// index, never by glyph id, and every non-`.char` box holds the default
+/// record. Read and write it through `BoxList.charData`/`charDataPtr`.
 pub const CharData = struct {
     cp: u21 = 0,
     /// effective font style
@@ -124,13 +141,11 @@ pub const CharData = struct {
     /// ±delta/2 with delta = this value for display ops (the .v1 ic — XeTeX
     /// measured) and the base glyph ic for text/script ops. 0 otherwise.
     disp_ic: f32 = 0,
-    /// radical MATH-table variant index (0 = base √, 1–4 = radical.v1–v4).
-    /// Set in layoutSqrt when a vertical variant is selected (the surd's ink
-    /// height must cover the radicand; the base glyph is used when it suffices).
-    /// svg.zig emits data-radical="v1" so the rasterizer resolves the variant
-    /// glyph — the declared font-size alone cannot tell base from variant since
-    /// both draw at the current math size. 0 for every other box.
+    /// MATH variant index (0 = base √, 1–4 = radical.v1–v4).
+    /// All forms draw at the current math size, so size alone cannot select
+    /// the outline. Whole radical assemblies use delim_req instead.
     radical_form: u8 = 0,
+    radical_bar: ?RadicalBar = null,
     /// amsmath FIXED-rule delimiter (`\binom`/`\genfrac-with-delims`)
     /// req_em used to box this delimiter (binomialDelimReqEm(style) — e.g.
     /// 2.392 at display → parenleft.v6, ~1.09 at text → the base paren).
@@ -141,30 +156,27 @@ pub const CharData = struct {
     /// (a display `\binom{n}{k}` needs v6, which the ink-derived extent
     /// undershoots).
     delim_fixed: f32 = 0,
-    /// content-sized `\left`/`\right` fence MATH-table variant index
-    /// (0 = no fence sizing, the layout picked the BASE glyph; 1..7 =
-    /// parenleft.vN etc. — the SMALLEST variant whose asc+desc ink covers
-    /// `req_em`, with 7 as the ceiling when content exceeds every variant).
-    /// Set in layout.layoutDelimChar for paired `\left..\right` fences;
-    /// 0 for every `\big`/fixed/binom box (those carry `delim_fixed`
-    /// instead — the FIXED req from amsmath's fraction-delim rule).
-    /// svg.zig emits `data-delim-form="vN"` so the rasterizer resolves
-    /// the same variant glyph the layout boxed — the declared base
-    /// font-size alone cannot tell a stretched paren apart from a plain
-    /// one (a `\left( \begin{pmatrix} ... \\ ... \\ ... \\ ... \end{pmatrix} \right)`
-    /// at 20pt needs v6+, otherwise the paren is drawn at 20pt — too
-    /// short for 4 rows of content).
+    /// Selected vertical MATH variant (0 = base, 1..7 = variant ladder).
+    /// Content-sized, fixed-level and middle fences retain the same form
+    /// that was measured, so SVG and CPU resolve the identical outline.
     delim_form: u8 = 0,
-    /// For a content-sized `\left`/`\right` fence whose required ink
-    /// EXCEEDS the largest MATH-table variant (e.g. a 4-row pmatrix at
-    /// 20pt needs ~4em > parenleft.v7's 2.99em): the exact required height
-    /// in em of `size_pt`, carried so svg.zig can emit `data-delim-req`
-    /// and the rasterizer build an XeTeX-style GlyphAssembly (top + N
-    /// extenders + bottom) to that height instead of capping at the
-    /// smallest variant (v7), which would leave the fence too short to
-    /// cover the content. 0 when `delim_form`'s variant already covers
-    /// `req_em` — the common, non-exhausted-ladder case.
+    /// Assembly height in em when the variant ladder is exhausted.
+    /// The box is measured from the assembled outline, not the final rung.
     delim_req: f32 = 0,
+    /// Required HORIZONTAL advance for this glyph, in EM: 0 for an ordinary
+    /// glyph, nonzero for the stretchy MATH forms that grow along x — the half
+    /// of an over/under brace (U+23DE / U+23DF) and the wide `\widehat` /
+    /// `\widetilde` accent (U+0302 / U+0303). The codepoint bytes say WHICH
+    /// glyph; this says how wide it must come out, and the shared font
+    /// resolver answers with the face's own horizontal size variant or
+    /// assembly for that request (see `metrics.horizontalGlyph`).
+    ///
+    /// The layout arm that selected the form filled the box width from the
+    /// geometry it got back, so the drawn advance and the reserved box are the
+    /// same number; `flatten` carries the request to the back ends, which
+    /// resolve the SAME form (svg.zig emits it, the rasterizer fills it).
+    /// Existing vertical metadata is untouched: this is a separate axis.
+    horizontal_req: f32 = 0,
 
     /// The DRAWN glyph's real ink overhang past its ADVANCE box, in POINTS at
     /// `size`: how far the ink reaches LEFT of the box origin (a negative
@@ -178,12 +190,8 @@ pub const CharData = struct {
     /// that sized its height and depth — never a second per-glyph lookup, and
     /// never a per-glyph allocation.
     ///
-    /// 0 for any box that draws something other than its `cp`'s own glyph: a
-    /// MATH-table delimiter or radical variant, a display big-op's `.v1` form
-    /// and an assembled fence each paint a DIFFERENT glyph, whose horizontal
-    /// ink is its own variant's and must never borrow the base codepoint's
-    /// bounds. `flatten` enforces that, so a stray value cannot mis-frame a
-    /// variant.
+    /// Delimiter and horizontal forms carry their selected outline's edges.
+    /// Radical and big-op variants do not yet carry a separate edge measurement.
     ink_left: f32 = 0,
     ink_right: f32 = 0,
 };
@@ -195,10 +203,10 @@ pub const PolyPoint = struct {
     dy: f32,
 };
 
-/// The most vertices a `.poly` stroke can have. `\widehat` uses 3 (ONE
-/// apex); `\widetilde` tessellates a full sine period into 4 arcs of up to 6
-/// chords each, so 25 is the ceiling — a fixed array, so a stroke never
-/// allocates and the side-table entry is a constant size.
+/// The most vertices a `.poly` stroke can have. `\widetilde` tessellates a
+/// full sine period into 4 arcs of up to 6 chords each, so 25 is the ceiling —
+/// a fixed array, so a stroke never allocates and the side-table entry is a
+/// constant size.
 pub const max_poly_points: usize = 25;
 
 /// `Box.poly_idx` for a box that owns no stroke record. Real record indices
@@ -208,17 +216,15 @@ pub const no_poly: u32 = std.math.maxInt(u32);
 
 /// The stroke of a `.poly` box: ONE connected polyline through `count`
 /// vertices (`count - 1` straight segments) of constant `width`. This is how
-/// the long `\widehat` / `\widetilde` form is drawn — a single hat with a
-/// single apex, or a smooth single-period wave, spanning its argument —
-/// rather than a run of repeated marks.
+/// the long `\widetilde` form is drawn — a smooth single-period wave spanning
+/// its argument — rather than a run of repeated marks.
 ///
 /// `extend[i]` is how far the stroke passes THROUGH vertex `i`, in points:
 /// the segment before it starts `extend[i]` early and the segment after it
 /// ends `extend[i]` late. That is what makes the painted corners match. Each
 /// segment is emitted as its own butt-capped `Draw.Line`, and two butt-capped
 /// bands meeting at a corner leave a wedge-shaped NOTCH on the outside of
-/// the turn — up to a full miter's reach for a sharp corner like the hat's
-/// apex. Overlapping the two bands by that reach closes it; the ends
+/// the turn. Overlapping the two bands by that reach closes it; the ends
 /// (`extend[0]` and `extend[count-1]`) are 0, so the stroke's outer extent
 /// is still exactly where the box says it is. Layout sets `extend` to the
 /// corner's miter reach, capped at half the shorter adjacent chord.
@@ -230,12 +236,27 @@ pub const Poly = struct {
     extend: [max_poly_points]f32 = @splat(0),
 };
 
+/// The box pool: fixed-size `Box` records, a parallel `ChildRef` run per
+/// parent, a `CharData` side table, and a SPARSE `Poly` table that only
+/// `.poly` boxes index. Indices into it are stable for the life of the pool
+/// and name boxes layout created; `create` takes a box's placements by value,
+/// so every `ChildRef` it records already names a box that existed.
+///
+/// It is SCRATCH storage: `layout.render` builds one per call and drops it
+/// before returning, so a caller owns one only when it drives `layout.layout`
+/// itself.
+///
 /// Do NOT copy a BoxList by value: it owns the `boxes`, `childrefs`, `chars`,
 /// `polys`, and `scratch` arrays and deinits them exactly once. `init`/`deinit`
 /// must be paired 1:1; after `deinit` the list is unusable.
 pub const BoxList = struct {
+    /// The allocator every table here is drawn from; the caller owns it and
+    /// it must outlive this pool.
     gpa: std.mem.Allocator,
+    /// The boxes, in creation order; a box index is a slot in this list.
     boxes: std.ArrayList(Box) = .empty,
+    /// Every box's child placements, appended parent by parent.
+    /// `Box.first_child` is an index in here, not in `boxes`.
     childrefs: std.ArrayList(ChildRef) = .empty,
     /// Char-only box state, parallel to `boxes` (indexed by box index):
     /// `.char` boxes carry their real values, every other kind the default.
@@ -251,10 +272,15 @@ pub const BoxList = struct {
     /// never aliases a live run and the buffer is allocated once.
     scratch: std.ArrayList(ChildRef) = .empty,
 
+    /// An empty pool. Allocates nothing until the first `create`;
+    /// `layout.render` reserves the capacities it expects right after.
     pub fn init(gpa: std.mem.Allocator) BoxList {
         return .{ .gpa = gpa };
     }
 
+    /// Releases every table in the pool. The allocator is not released and the
+    /// source bytes a box's span points at are untouched; the pool is unusable
+    /// afterward, and a second call is a double free.
     pub fn deinit(self: *BoxList) void {
         self.boxes.deinit(self.gpa);
         self.childrefs.deinit(self.gpa);
@@ -264,11 +290,17 @@ pub const BoxList = struct {
         self.* = undefined;
     }
 
+    /// The box at `idx`, by value — a copy of the record, not a reference, so
+    /// it stays valid across later `create` calls. `idx` must be a box index
+    /// this pool produced: the assert is compiled out in ReleaseFast, so an
+    /// index it never issued is an unchecked read there.
     pub fn get(self: *const BoxList, idx: u32) Box {
         std.debug.assert(idx < self.boxes.items.len);
         return self.boxes.items[idx];
     }
 
+    /// A copy of `idx`'s char state. Only meaningful for a `.char` box; every
+    /// other kind holds the default record.
     pub fn charData(self: *const BoxList, idx: u32) CharData {
         std.debug.assert(idx < self.chars.items.len);
         return self.chars.items[idx];
@@ -302,6 +334,9 @@ pub const BoxList = struct {
     /// Append a box plus its contiguous run of child placements (copied into
     /// `childrefs`); returns the box index.
     ///
+    /// `width`/`height`/`depth` are POINTS and `x_shift`/`shift` are points
+    /// relative to the parent's reference point; nothing here rescales them.
+    /// `span` is stored as the two byte offsets, never copied or validated.
     /// Every table is left exactly as it was when any allocation fails, so a
     /// caught `error.OutOfMemory` leaves `chars` the same length as `boxes`,
     /// `childrefs` without an orphan tail, and `polys` untouched.
@@ -343,6 +378,10 @@ pub const BoxList = struct {
         return idx;
     }
 
+    /// Appends a box with no children, so `create`'s `cp`/`style`/`size`
+    /// defaults stand: every kind but `.char` carries the default
+    /// `CharData`. `span` is the source byte range the box came from, stored
+    /// as offsets — the bytes themselves are not copied or checked here.
     pub fn createLeaf(
         self: *BoxList,
         kind: Kind,
@@ -396,7 +435,7 @@ pub const BoxList = struct {
     }
 
     /// The stroke of the `.poly` box at `idx`, BORROWED: the pointer aliases
-    /// the record in `polys`, so reading a stroke costs no 308-byte copy.
+    /// the record in `polys`, so reading a stroke costs no copy.
     ///
     /// Invalidation contract: the returned pointer aliases `polys`
     /// storage. Any `create`/`createPoly` call may reallocate that array and
@@ -513,13 +552,13 @@ test "boxlist: a color scope rides on its own box and no other" {
 test "boxlist: a poly box keeps one connected stroke and its own bounds" {
     var list = BoxList.init(testing.allocator);
     defer list.deinit();
-    // A two-segment hat: ONE apex, not a run of repeated marks, with the
-    // apex's miter reach carried so the two butt-capped bands meet flush.
+    // A two-segment wave with ONE crest, the miter reach carried so the
+    // butt-capped bands at the interior vertex meet flush.
     var stroke: Poly = .{ .count = 3, .width = 0.8 };
     stroke.points[0] = .{ .dx = 0, .dy = 2 };
     stroke.points[1] = .{ .dx = 20, .dy = -18 };
     stroke.points[2] = .{ .dx = 40, .dy = 2 };
-    stroke.extend[1] = 1.3; // the apex; both ENDS stay unextended
+    stroke.extend[1] = 1.3; // the interior vertex; both ENDS stay unextended
     const p = try list.createPoly(stroke, 40, 19, 3, .{ .start = 0, .end = 5 });
     const pb = list.get(p);
     try testing.expectEqual(Kind.poly, pb.kind);
@@ -570,7 +609,8 @@ test "boxlist: only a poly box owns a stroke record" {
 test "boxlist: an out-of-memory unwind leaves every table consistent" {
     // `chars` is indexed by box index and `poly_idx` by record, so a partial
     // append is a corrupt list. Fail EVERY allocation in turn: whatever is
-    // caught, the tables stay in step.
+    // caught, the tables stay in step and no child placement outlives its
+    // parent run.
     var fail_at: usize = 0;
     while (fail_at < 12) : (fail_at += 1) {
         var failing = testing.FailingAllocator.init(testing.allocator, .{

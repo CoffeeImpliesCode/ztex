@@ -1,18 +1,35 @@
 //! ztex.parse — LaTeX math source → superflat atom tree.
 //!
 //! Usable on its own: `parse(gpa, src)` returns an `atom.Ast` you can inspect
-//! or feed to `ztex.layout`.
+//! or feed to `ztex.layout`. This is the only supported route into the module:
+//! `lexer.zig`, `parser.zig` and `error.zig` are private files, and the lexer
+//! and parser are reached through `parse` and their published types, never by
+//! name. The one thing published besides `parse` that a caller outside this
+//! package cannot guess is `err`, the diagnostic channel `parse` writes into.
+//!
+//! The module owns no I/O and no file: it reads the `src` slice it is handed
+//! and keeps it, rather than copying it. The Ast it returns owns every node
+//! and token it built, and one `ast.deinit()` releases them; the allocator is
+//! the caller's and is never freed here.
 
 const std = @import("std");
 const atom = @import("ztex.atom");
 
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
+
+/// The parse-diagnostic module: `Info` (kind + span + message) and the
+/// `lineCol`/`sourceLine` helpers a caller uses to turn a span into a
+/// printable position. Reached here as `ztex.parse.err`.
 pub const err = @import("error.zig");
 
 /// The complete set of command names the parser recognizes (see
 /// parser.supported_commands) — the single external answer to "what commands
-/// does this parser support".
+/// does this parser support". Each name is the bytes after the backslash, so
+/// `\frac` appears as `"frac"`. This is exactly the set `parse` accepts:
+/// every other name fails with `error.UnknownCommand` and
+/// `Kind.unknown_command`. Generated at comptime from the parser's own
+/// dispatch table, so it cannot drift from what the parser does.
 pub const supported_commands = parser.supported_commands;
 
 /// Parse-error context (kind + span + message); see `err.Info`.
@@ -20,13 +37,20 @@ pub const Info = err.Info;
 /// The parse-error kinds; see `err.Kind`.
 pub const Kind = err.Kind;
 
+/// Everything `parse` can fail with: the lexer's and parser's own sets plus
+/// `error.SourceTooLarge`. Every tag except `error.OutOfMemory` carries a
+/// matching `Kind` in `Info` when the caller passed a channel; all but
+/// `error.SourceTooLarge` are SYNTAX failures in `src` — a construct the
+/// module does not accept — and that one is the input-size bound below. All
+/// of them leave nothing allocated: the partially built tree is released
+/// before the error returns.
 pub const Error = lexer.Error || parser.Error || error{
     /// the source exceeds `max_source_bytes` (too long for `Span`'s u32 byte offsets)
     SourceTooLarge,
 };
 
-/// Hard upper bound on `src.len`. `atom.Span` stores byte offsets as u32,
-/// and the lexer's `emit` casts its usize positions with `@intCast`; a
+/// Hard upper bound on `src.len`, in BYTES. `atom.Span` stores byte offsets as
+/// u32, and the lexer's `emit` casts its usize positions with `@intCast`; a
 /// source longer than `maxInt(u32)` bytes would overflow that cast (a
 /// safe-mode panic / a ReleaseFast truncation). The bound is HALF of that
 /// because the node pool grows to ~2× the token count on nested/scripted
@@ -34,6 +58,11 @@ pub const Error = lexer.Error || parser.Error || error{
 /// reject such sources up front with `error.SourceTooLarge` instead.
 /// Realistic math input is orders of magnitude smaller; the bound only
 /// guards the degenerate case.
+///
+/// This is a byte limit, not a codepoint one: a source of multi-byte codepoints
+/// reaches it sooner. It is a hard precondition of `parse` and of every other
+/// entry point in this module, so a caller with input of unknown size should
+/// test it with `sourceTooLong` rather than learn the limit from a failure.
 pub const max_source_bytes: usize = std.math.maxInt(u32) / 2;
 
 /// True when a source of `len` bytes is too long for u32 byte offsets.
@@ -44,10 +73,29 @@ pub fn sourceTooLong(len: usize) bool {
 }
 
 /// Pre-lex and parse `src` into an atom tree. Caller owns the Ast: free with
-/// `ast.deinit()`. `ast.src` aliases the caller's `src` (never copied). On
-/// a parse error, `err_info` (when non-null) is filled with the kind and the
-/// offending byte span before the error is returned; on success it is
-/// untouched.
+/// `ast.deinit()`. `ast.src` aliases the caller's `src` (never copied), so
+/// `src` must stay alive and unmodified for as long as the Ast is read: every
+/// token span and every text leaf indexes into it, and a rewritten byte is
+/// read as the source the caller replaced. Nothing else in the Ast borrows
+/// from `src`, so the nodes may be copied out and kept after `src` is
+/// released, while any token span, `.text` leaf or `Info.span` taken from
+/// them does not survive it.
+///
+/// On a syntax failure `err_info` (when non-null) is filled with the kind and
+/// the offending byte span before the error is returned, and the Ast is
+/// released before the error reaches the caller — a failing call leaves the
+/// caller owning nothing. On success `err_info` is untouched, and so it is on
+/// `error.OutOfMemory`, which has no position in the source: a caller must
+/// not read `err_info` unless it caught a syntax tag. `error.SourceTooLarge`
+/// does fill it, with `Kind.source_too_large`.
+///
+/// A `null` `err_info` skips the diagnostic work entirely and the error
+/// values are unchanged; the channel is a caller-owned out-parameter that is
+/// never retained after the call.
+///
+/// Fails with `error.SourceTooLarge` before any allocation when `src` is past
+/// `max_source_bytes`, with `Kind.source_too_large` and a zero-width span at
+/// offset 0 in `err_info`.
 pub fn parse(gpa: std.mem.Allocator, src: []const u8, err_info: ?*Info) Error!atom.Ast {
     if (sourceTooLong(src.len)) {
         // Zero-width span at offset 0; the whole input is over the bound.

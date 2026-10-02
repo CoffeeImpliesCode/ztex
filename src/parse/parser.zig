@@ -4,12 +4,30 @@
 //! Ast's pool via the duplication protocol (children copied as values before
 //! their parent), so every node's child run is contiguous. Each node records
 //! its token range for O(1) source-provenance.
-
+//!
+//! A private file: a consumer reaches it only through `ztex.parse.parse`,
+//! and `max_nesting` and `supported_commands` are the two names that module
+//! republishes. It borrows the source and the token table it is handed and
+//! never copies either; every node it builds belongs to the caller's Ast and
+//! is released by that Ast's `deinit`.
 const std = @import("std");
 const atom = @import("ztex.atom");
 const lexer = @import("lexer.zig");
 const parse_err = @import("error.zig");
 
+/// Everything the parser can fail with, besides the allocator's own
+/// `error.OutOfMemory` and the `error.ChildCountOverflow` it inherits from
+/// `atom.Error`. Every tag here is a SYNTAX failure — a construct the parser
+/// does not accept — and each carries a matching `Kind` in `Info` when the
+/// caller passed a channel, through the parser's `fail` helper. No allocation
+/// survives any of them beyond the nodes already appended to the Ast, which
+/// the Ast's own `deinit` releases.
+///
+/// The lexer-only kinds (`dangling_escape`, `invalid_utf8`) and
+/// `source_too_large` are NOT in this set: they are returned by
+/// `ztex.parse.lex` and by the source-size check before the parser runs, so
+/// routing one here is a programming error and aborts in every build mode
+/// rather than inventing an error value.
 pub const Error = atom.Error || error{
     UnexpectedRGroup,
     UnexpectedScript,
@@ -121,9 +139,9 @@ const Command = enum {
     mathclose,
     mathpunct,
     mathinner,
-    /// \colon: the colon as PUNCTUATION (plain TeX's `\def\colon
-    /// {\mathpunct{:}}`), unlike a bare `:` which is a relation
+    /// amsmath colon: an ordinary glyph with 2mu before and 6mu after.
     colon,
+    colon_double_equals,
     /// an operator word (\sin \lim \log ...): roman styled run of the name
     opname,
     /// \left ... \right delimited construct
@@ -309,8 +327,7 @@ const cmd_map = std.StaticStringMap(Command).initComptime(&[_]struct { []const u
     .{ "bigint", .op_bigint },
     .{ "bigiint", .op_bigiint },
     .{ "bigiiint", .op_bigiiint },
-    // TeX's class primitives: \mathop and the \mathXXX family, plus \colon
-    // (punctuation, unlike a bare `:`)
+    // TeX class primitives and amsmath's explicitly spaced colon.
     .{ "mathop", .mathop },
     .{ "mathord", .mathord },
     .{ "mathrel", .mathrel },
@@ -320,6 +337,8 @@ const cmd_map = std.StaticStringMap(Command).initComptime(&[_]struct { []const u
     .{ "mathpunct", .mathpunct },
     .{ "mathinner", .mathinner },
     .{ "colon", .colon },
+    .{ "Coloneqq", .colon_double_equals },
+    .{ "Coloneqqs", .colon_double_equals },
     .{ "left", .left },
     .{ "right", .right },
     .{ "big", .big },
@@ -652,20 +671,13 @@ const symbol_map = std.StaticStringMap(u21).initComptime(&[_]struct { []const u8
     .{ "rceil", 0x2309 },
     .{ "therefore", 0x2234 },
     .{ "because", 0x2235 },
-    // The colon family. \colon is NOT here: plain TeX typesets it as
-    // PUNCTUATION (`\def\colon{\mathpunct{:}}`) while a bare `:` is a
-    // relation, so it needs a forced class and lives in cmd_map.
-    // \coloneqq / \Coloneqq are mathtools' `:=` / `::=`; unicode-math spells
-    // the same two symbols \coloneq (U+2254) and \Coloneq (U+2A74) — but
-    // Latin Modern Math has NO U+2A74, so \Coloneqq falls back to the
-    // single-glyph COLON EQUALS U+2254 (it still draws a relation glyph with
-    // relation glue; only the doubled colon is lost). \Colon and \ratio are
-    // unicode-math's U+2237 PROPORTION and U+2236 RATIO.
+    // \colon has explicit amsmath spacing, unlike these relation glyphs.
+    // Native colon-equals glyphs keep the face's own geometry. The double
+    // colon command is composed in dispatch because LM Math lacks U+2A74.
+    // \Colon and \ratio are U+2237 PROPORTION and U+2236 RATIO.
     .{ "coloneqq", 0x2254 },
     .{ "coloneqqs", 0x2254 },
-    .{ "Coloneqq", 0x2254 },
-    .{ "Coloneqqs", 0x2254 },
-    .{ "coloneq", 0x2255 },
+    .{ "coloneq", 0x2254 },
     .{ "Colon", 0x2237 },
     .{ "ratio", 0x2236 },
     .{ "hbar", 0x210F },
@@ -876,6 +888,20 @@ const keep_vertical: u32 = keep_height | keep_depth;
 /// 0-3 the keep mask, bit 5 the kern family, bit 6 the \tag row.
 const smash_row: u32 = 1 << 7;
 
+/// The prime glyphs LM Math supplies: one composite per prime COUNT, on a
+/// 0.2em advance grid — ′ 0.311em, ″ 0.511em, ‴ 0.711em, ⁗ 0.911em, read
+/// from the face's own hmtx, with ink right edges 0.251/0.451/0.651/0.851em.
+/// XeLaTeX typesets a run of n primes as exactly these glyphs — `x''''`,
+/// `x'''''`, `x''''''`, `x'''''''`, `x''''''''` and `x'''''''''` measure
+/// 14.15997 / 18.19748 / 20.47157 / 22.74567 / 25.01976 / 27.29385pt, the
+/// same as `x⁗`, `x⁗′`, `x⁗″`, `x⁗‴`, `x⁗⁗` and `x⁗⁗′` — so a longer run is
+/// quadruples plus a trailing 1..3 composite, never a leaf per prime.
+const prime_cp: u21 = 0x2032;
+const prime_double_cp: u21 = 0x2033;
+const prime_triple_cp: u21 = 0x2034;
+const prime_quad_cp: u21 = 0x2057;
+const prime_composites: u32 = 4;
+
 /// Relation codepoint → its pre-composed negated form, for \not<relation>.
 /// unicode-math's \not command uses the pre-composed glyph when one exists
 /// (verified against the XeTeX reference: \not\in → U+2209, \not\leq →
@@ -912,14 +938,18 @@ const not_cp_map = [_]struct { cp: u21, neg: u21 }{
     .{ .cp = 0x2AB0, .neg = 0x22E1 }, // ⪰ → ⋡ \nsucceq
 };
 
-/// Maximum parse-nesting depth, counted as active `parseRow` frames.
-/// parseRow/parseGroup/parseCommand/parseDelimiter recurse mutually at
-/// ~4 frames per nesting level, so 500 levels ≈ 2K frames — comfortably
-/// inside the default stack — while still admitting any realistic formula.
-/// Deeper input fails with `error.NestingTooDeep` instead of overflowing
-/// the stack (Zig cannot catch a stack overflow, so the host process
-/// would otherwise die).
-pub const max_nesting: u32 = 500;
+/// Maximum parse-nesting depth, counted as active `parseRow` frames, and the
+/// same bound `ztex.atom` publishes as `atom.max_nesting`. parseRow/parseGroup/
+/// parseCommand/parseDelimiter recurse mutually at ~4 frames per nesting
+/// level, so the bound sits comfortably inside the default stack while still
+/// admitting any realistic formula. Deeper input fails with
+/// `error.NestingTooDeep` instead of overflowing the stack (Zig cannot catch a
+/// stack overflow, so the host process would otherwise die).
+///
+/// The value is declared once, in `atom`, and re-exported here as the bound
+/// this parser enforces, so a consumer reading either name reads the same
+/// number. Layout does not read this bound; its own is `atom.max_ast_depth`.
+pub const max_nesting: u32 = atom.max_nesting;
 
 /// Recursive-descent parser over a flat token table.
 /// The `\arraystretch` state the parser carries: the factor in force and
@@ -938,10 +968,37 @@ const Stretch = struct {
     assigned: bool = false,
 };
 
+/// Recursive-descent parser over a flat token table, building the atom pool.
+///
+/// A `Parser` owns NOTHING: `gpa` is the caller's allocator, borrowed for the
+/// life of the parse; `src` and `tokens` are borrowed views; `err_info` is the
+/// caller's out-parameter. Every node the parse builds belongs to the Ast it is
+/// handed, so one `ast.deinit()` after the parse releases them. There is no
+/// `deinit` here.
+///
+/// The mutable fields make one parse single-threaded: a `Parser` is advanced
+/// by its own method calls and two parsers must not share an `ast`, a token
+/// table or an `err_info`. Independent parsers over independent tables and
+/// sources may run on different threads. Nothing caches across parses.
+///
+/// Copying a `Parser` copies a position, not a tree: a copy taken mid-parse
+/// continues from that position over the SAME table and writes into the same
+/// Ast, so the two copies would interleave into one node pool. Give each parse
+/// its own `Parser`.
 pub const Parser = struct {
+    /// The caller's allocator, used for the temporary child lists a construct
+    /// collects before its parent node is created. Borrowed, never freed.
     gpa: std.mem.Allocator,
+    /// The source, borrowed and never copied. Every span this parser reports
+    /// is a byte offset into it, so it must outlive the parse.
     src: []const u8,
+    /// The lexed token table, borrowed. `pos` indexes it; `ztex.parse.lex`
+    /// must not have appended to it after `init`, or the spans stop matching
+    /// the tokens the parse reads.
     tokens: []const atom.Token,
+    /// Index of the next token to consume. The only position state; it is
+    /// restored across a group, a `\left … \right` pair and an environment
+    /// body, each of which saves and hands back the pair it found.
     pos: usize = 0,
     /// 1 while parsing the interior of a \left ... \right pair (parseRow in
     /// .delimited mode): \middle is only valid there (TeX). parseLeftRight
@@ -983,6 +1040,17 @@ pub const Parser = struct {
     /// kind + offending span immediately before any error is returned.
     err_info: ?*parse_err.Info = null,
 
+    /// A parser positioned at the start of `tokens` over `src`.
+    ///
+    /// `tokens` must be the complete token table for `src` and must not be
+    /// appended to while this parser runs: `pos` indexes the slice captured
+    /// here, and a reallocation would leave it walking stale entries. `src`
+    /// and `tokens` are both borrowed, and `err_info` is a caller-owned
+    /// out-parameter filled only on a syntax failure — pass `null` to skip the
+    /// diagnostic work, which changes no error value.
+    ///
+    /// Cannot fail and allocates nothing: every field the parser later needs
+    /// is created by `parse`, not here.
     pub fn init(
         gpa: std.mem.Allocator,
         src: []const u8,
@@ -1099,7 +1167,28 @@ pub const Parser = struct {
         return .{ .start = self.tokens[first].start, .end = self.tokens[last].end };
     }
 
-    /// Parse the whole token table into a row atom (the root).
+    /// Parse the whole token table into a row atom (the root), and return its
+    /// INDEX into `ast.nodes`.
+    ///
+    /// The caller sets `ast.root` from the returned index: this method appends
+    /// to the pool and does not claim any node. It consumes every token, so a
+    /// second call on the same parser starts at end of input and returns an
+    /// empty row rather than reparsing — one parse per `Parser`.
+    ///
+    /// On any error the nodes appended so far STAY in `ast`, because they
+    /// belong to the caller's pool and releasing them here would free memory
+    /// the caller did not hand over. `ztex.parse.parse` therefore releases the
+    /// whole Ast before its error reaches a consumer, so the residue is only
+    /// observable to a caller driving `Parser` directly, which must still run
+    /// `ast.deinit`. The returned index is meaningless on the error path.
+    ///
+    /// Every syntax error also fills `err_info` first (when non-null); a
+    /// `error.OutOfMemory` fills nothing and leaves the residue as described.
+    /// Nests at most `max_nesting` `parseRow` frames and fails with
+    /// `error.NestingTooDeep` rather than overflowing the stack.
+    ///
+    /// Advances `self` — `pos`, `depth` and the parser's saved-scope state —
+    /// and leaves the parser positioned past the consumed tokens.
     pub fn parse(self: *Parser, ast: *atom.Ast) Error!u32 {
         const root = try self.parseRow(ast, .top);
         if (!self.atEnd()) return self.fail(.unexpected_r_group, self.curSpan());
@@ -1319,60 +1408,17 @@ pub const Parser = struct {
         return self.createNode(ast, .row, start_tok, num_tokens, children.items, 0);
     }
 
-    /// Parse one atom (base + optional scripts + trailing primes).
+    /// Parse one atom: a base plus its scripts, primes included.
     ///
-    /// `'` after an atom is TeX's prime (mathcode 0x8000): a superscript
-    /// U+2032. Consecutive primes accumulate into one superscript: `''` →
-    /// U+2033 (double prime), `'''`+ → U+2034. The wrap happens AFTER
-    /// parseScripts so `x_1'` keeps its subscript and gains the prime
-    /// superscript (TeX: a noad carries both), while `x'^2` still errors
-    /// (DoubleScript — TeX's "Double superscript") because the `^2` is left
-    /// as a row-leading script.
-    ///
-    /// A trailing prime on an ALREADY-SCRIPTED atom merges into the SAME
+    /// `'` is LaTeX's ACTIVE prime — `\def\active@math@prime{^\bgroup\prim@s}`
+    /// with `\prim@s{\prime\futurelet\@let@token\pr@m@s}` (latex.ltx) — so it
+    /// is a SUPERSCRIPT of the noad it follows and `\pr@m@s` looks ahead for
+    /// a `^`. parseScripts owns all of it, so an atom is exactly ONE script
+    /// noad over its base: the noad TeX's sub_sup builds, never a script
+    /// stacked on a scripted base.
     fn parseAtom(self: *Parser, ast: *atom.Ast) Error!u32 {
         const base = try self.parseSingleAtom(ast);
-        var result = try self.parseScripts(ast, base);
-        var prime_count: usize = 0;
-        const first_prime_tok: u32 = @intCast(self.pos);
-        while (self.peek()) |t| {
-            if (t.tag != .char) break;
-            if (self.src[t.start] != '\'') break;
-            prime_count += 1;
-            _ = self.advance();
-        }
-        if (prime_count == 0) return result;
-        const cp: u21 = if (prime_count == 1) 0x2032 else if (prime_count == 2) 0x2033 else 0x2034;
-        const prime = try ast.createLeaf(.char, first_prime_tok, @intCast(prime_count), cp);
-        const rn = ast.node(result);
-        const pn = ast.node(prime);
-        if (rn.tag == .script) {
-            // Merge into the existing script: [base, sup?, sub?] — a prime
-            // fills the sup slot. A sup already present is TeX's double
-            // superscript.
-            if ((rn.data & atom.ScriptBits.sup) != 0)
-                return self.fail(.double_script, self.curSpan());
-            const sb = ast.child(result, 0);
-            const sub = ast.child(result, rn.num_children - 1);
-            const children = [_]atom.Node{ ast.node(sb), pn, ast.node(sub) };
-            const num_tokens = (first_prime_tok + @as(u32, @intCast(prime_count))) -
-                ast.node(sb).first_token;
-            result = try self.createNode(
-                ast,
-                .script,
-                ast.node(sb).first_token,
-                num_tokens,
-                &children,
-                atom.ScriptBits.sup | atom.ScriptBits.sub,
-            );
-        } else {
-            const children = [_]atom.Node{ rn, pn };
-            const num_tokens = (first_prime_tok + @as(u32, @intCast(prime_count))) - rn.first_token;
-            result = try self.createNode(ast, .script, rn.first_token, num_tokens, &children, atom.ScriptBits.sup);
-        }
-
-        // After prime merging, any subsequent ^ or _ attaches to the script/base (e.g. x_0'^2 or f'(x))
-        return self.parseScripts(ast, result);
+        return self.parseScripts(ast, base);
     }
 
     /// Parse exactly one base atom (no scripts).
@@ -1408,10 +1454,12 @@ pub const Parser = struct {
         return self.createNode(ast, .group, open_tok, num_tokens, &children, 0);
     }
 
-    /// Attach `^`/`_` scripts to `base`.
+    /// Attach `^`/`_` scripts — and LaTeX's active `'` — to `base`.
     ///
     /// `data` carries presence bits (ScriptBits.sup/sub) so layout does not
-    /// misread a sub-only script (children are [base, sup?, sub?]).
+    /// misread a sub-only script (children are [base, sup?, sub?]). A prime
+    /// fills the sup slot, so one call builds the whole noad TeX's sub_sup
+    /// makes; a second script for a slot it already filled is a duplicate.
     fn parseScripts(self: *Parser, ast: *atom.Ast, base: u32) Error!u32 {
         var sup: ?u32 = null;
         var sub: ?u32 = null;
@@ -1448,6 +1496,61 @@ pub const Parser = struct {
                     continue;
                 }
             }
+            // A prime is LaTeX's active `'`: it FILLS the superscript slot of
+            // the noad it follows (`x_0'` keeps its subscript), a run of
+            // primes is ONE field, and `\pr@m@s` looks ahead — a `^` right
+            // after the run joins that same field, so `x_0'^2` is the one-row
+            // superscript "prime 2" (XeLaTeX measures its height as `x^2`'s;
+            // a script of the scripted base would sit ~5.7pt higher).
+            if (t.tag == .char and self.src[t.start] == '\'') {
+                if (sup != null) return self.fail(.double_script, spanOf(t));
+                const first_tok: u32 = @intCast(self.pos);
+                const run = self.primeRun();
+                self.pos += @as(usize, run);
+                // The field's glyphs are the font's own per-count composites:
+                // one for a run of 1..4 primes, and for a longer run
+                // quadruples plus a trailing 1..3 composite — the exact glyph
+                // sequence XeLaTeX typesets (see `prime_cp`). Each leaf keeps
+                // the token span of the primes it draws.
+                var field: u32 = undefined;
+                if (run <= prime_composites) {
+                    field = try ast.createLeaf(.char, first_tok, run, primeCompositeCp(run));
+                } else {
+                    var parts: std.ArrayList(atom.Node) = .empty;
+                    defer parts.deinit(self.gpa);
+                    try parts.ensureTotalCapacity(self.gpa, @as(usize, run / prime_composites) + 1);
+                    var tok = first_tok;
+                    var left = run;
+                    while (left != 0) {
+                        const drawn: u32 = if (left > prime_composites) prime_composites else left;
+                        try parts.append(self.gpa, .{
+                            .tag = .char,
+                            .first_token = tok,
+                            .num_tokens = drawn,
+                            .first_child = 0,
+                            .num_children = 0,
+                            .data = primeCompositeCp(drawn),
+                        });
+                        tok += drawn;
+                        left -= drawn;
+                    }
+                    field = try self.createNode(ast, .row, first_tok, run, parts.items, 0);
+                }
+                // The lookahead takes ONLY an adjacent `^`: `x'\alpha` leaves
+                // the alpha in the outer row, exactly as TeX's `\egroup` does.
+                if (self.pos < self.tokens.len and self.tokens[self.pos].tag == .sup) {
+                    _ = self.advance(); // consume the '^'
+                    const exp = try self.parseScriptArg(ast);
+                    const end = endOf(ast, exp);
+                    const parts = [_]atom.Node{ ast.node(field), ast.node(exp) };
+                    field = try self.createNode(ast, .row, first_tok, end - first_tok, &parts, 0);
+                    last_tok = end;
+                } else {
+                    last_tok = first_tok + run;
+                }
+                sup = field;
+                continue;
+            }
             if (t.tag == .sup) {
                 if (sup != null) return self.fail(.double_script, spanOf(t));
                 _ = self.advance();
@@ -1470,6 +1573,28 @@ pub const Parser = struct {
         const data = (@as(u32, @intFromBool(sup != null)) * atom.ScriptBits.sup) |
             (@as(u32, @intFromBool(sub != null)) * atom.ScriptBits.sub);
         return self.createNode(ast, .script, base_node.first_token, num_tokens, children.items, data);
+    }
+
+    /// Consecutive `'` tokens at the cursor (≥ 1 — the caller saw one).
+    fn primeRun(self: *const Parser) u32 {
+        var n: usize = 0;
+        while (self.pos + n < self.tokens.len) {
+            const t = self.tokens[self.pos + n];
+            if (t.tag != .char or self.src[t.start] != '\'') break;
+            n += 1;
+        }
+        return @intCast(n);
+    }
+
+    /// The composite glyph drawing a run of 1..prime_composites primes.
+    fn primeCompositeCp(run: u32) u21 {
+        return switch (run) {
+            1 => prime_cp,
+            2 => prime_double_cp,
+            3 => prime_triple_cp,
+            4 => prime_quad_cp,
+            else => unreachable, // a longer run is quadruples plus a tail
+        };
     }
 
     /// The content of one script: a single atom, or a braced group.
@@ -1620,10 +1745,25 @@ pub const Parser = struct {
             .mathpunct => self.mathClass(ast, cmd_tok, .punct),
             .mathinner => self.mathClass(ast, cmd_tok, .inner),
             .colon => blk: {
-                // The glyph is the plain colon; only the class differs from a
-                // bare `:`.
                 const leaf = try ast.createLeaf(.char, cmd_tok, 1, 0x3A);
-                break :blk self.classRow(ast, cmd_tok, .punct, leaf);
+                const ordinary = try self.classRow(ast, cmd_tok, .ord, leaf);
+                const before = try self.space(ast, cmd_tok, 2.0 / 18.0);
+                const after = try self.space(ast, cmd_tok, 6.0 / 18.0);
+                const children = [_]atom.Node{
+                    ast.node(before), ast.node(ordinary), ast.node(after),
+                };
+                const field = try self.createNode(ast, .row, cmd_tok, 1, &children, 0);
+                break :blk self.classRow(ast, cmd_tok, .ord, field);
+            },
+            .colon_double_equals => blk: {
+                const prefix = try self.symbol(ast, cmd_tok, 0x2236);
+                const join = try self.space(ast, cmd_tok, -0.9 / 18.0);
+                const equals = try self.symbol(ast, cmd_tok, 0x2254);
+                const children = [_]atom.Node{
+                    ast.node(prefix), ast.node(join), ast.node(equals),
+                };
+                const field = try self.createNode(ast, .row, cmd_tok, 1, &children, 0);
+                break :blk self.classRow(ast, cmd_tok, .rel, field);
             },
             .opname => self.opname(ast, cmd_tok, name),
             .left => self.parseLeftRight(ast, cmd_tok),
@@ -2215,6 +2355,12 @@ pub const Parser = struct {
                 .r_group => {
                     depth -= 1;
                     if (depth == 0) return @intCast(self.pos - 1);
+                },
+                .command => {
+                    const name = self.src[t.start + 1 .. t.end];
+                    if (!atom.textCommandSupported(name)) {
+                        return self.fail(.unknown_command, spanOf(t));
+                    }
                 },
                 else => {},
             }
@@ -3827,6 +3973,293 @@ test "parser: braced superscript becomes a group child" {
     try testing.expectEqual(.group, ast.node(ast.child(script, 1)).tag);
 }
 
+/// Parse `src` expecting `err`, checking the kind AND the exact byte span of
+/// the offending token.
+fn expectErrorSpan(
+    info: *parse_err.Info,
+    err: Error,
+    src: []const u8,
+    kind: parse_err.Kind,
+    start: usize,
+    end: usize,
+) !void {
+    var ast = atom.Ast.init(testing.allocator, src);
+    defer ast.deinit();
+    try lexer.lex(&ast, info);
+    var p = Parser.init(testing.allocator, src, ast.tokens.items, info);
+    try testing.expectError(err, p.parse(&ast));
+    try testing.expectEqual(kind, info.kind);
+    try testing.expectEqual(@as(u32, @intCast(start)), info.span.start);
+    try testing.expectEqual(@as(u32, @intCast(end)), info.span.end);
+}
+
+// ── primes ──────────────────────────────────────────────────────────────
+// LaTeX makes `'` active: `\def\active@math@prime{^\bgroup\prim@s}` with
+// `\prim@s{\prime\futurelet\@let@token\pr@m@s}` (latex.ltx). Three rules
+// follow, all measured on XeLaTeX/LuaLaTeX + LM Math at \fontsize{10bp}:
+//   * the prime run FILLS the superscript slot of the noad it follows, so
+//     `x_0'` keeps its subscript, and the field draws the font's composite for
+//     that prime COUNT — ′ 9.10110pt, ″ 10.78738pt, ‴ 12.47368pt,
+//     ⁗ 14.15997pt — with a longer run as quadruples plus a trailing 1..3
+//     composite (see `prime_cp`), so no prime is ever clipped or spelled out
+//     leaf by leaf;
+//   * `\pr@m@s` LOOKS AHEAD: a `^` immediately after the run is pulled into
+//     the prime's own field, so `x_0'^2` is ONE superscript row "prime 2"
+//     (ht 8.30939pt — exactly `x^2`'s; a nested script sits ~5.7pt higher),
+//     and `x'^{2}` / `x'^2_0` are that same field;
+//   * any other token ENDS the field, so a later `^`/`_` is a genuine
+//     duplicate: TeX's "Double superscript" (`x'_0^2`, `x^2'`) or
+//     "Double subscript" (`x_0''_1`).
+
+test "parser: prime fills the superscript slot beside a subscript" {
+    var ast = try parseSrc(testing.allocator, "x_0'");
+    defer ast.deinit();
+    const script_idx = ast.child(ast.root, 0);
+    const sn = ast.node(script_idx);
+    try testing.expectEqual(.script, sn.tag);
+    try testing.expect(sn.data & atom.ScriptBits.sup != 0);
+    try testing.expect(sn.data & atom.ScriptBits.sub != 0);
+    try testing.expectEqual(@as(u16, 3), sn.num_children); // base + sup + sub
+    try testing.expectEqual(@as(u32, 0), sn.first_token);
+    try testing.expectEqual(@as(u32, 4), sn.num_tokens); // x _ 0 '
+    try testing.expectEqual(.char, ast.node(ast.child(script_idx, 0)).tag); // x
+    const sup = ast.node(ast.child(script_idx, 1));
+    try testing.expectEqual(.char, sup.tag);
+    try testing.expectEqual(@as(u21, 0x2032), @as(u21, @truncate(sup.data)));
+    try testing.expectEqual(@as(u32, 3), sup.first_token); // the '
+    try testing.expectEqual(@as(u32, 1), sup.num_tokens);
+    const sub = ast.node(ast.child(script_idx, 2));
+    try testing.expectEqual(.char, sub.tag);
+    try testing.expectEqual(@as(u32, 2), sub.first_token); // the 0
+}
+
+/// How many prime MARKS a prime composite draws (0 for anything else). The
+/// semantic count, independent of how a field groups its glyphs.
+fn primeMarks(cp: u21) u32 {
+    return switch (cp) {
+        prime_cp => 1,
+        prime_double_cp => 2,
+        prime_triple_cp => 3,
+        prime_quad_cp => 4,
+        else => 0,
+    };
+}
+
+/// Prime marks in a script's superscript field, whichever node shape holds
+/// it — one composite leaf, or a row of them.
+fn fieldPrimeMarks(ast: *const atom.Ast, idx: u32) u32 {
+    const n = ast.node(idx);
+    return switch (n.tag) {
+        .char => primeMarks(@truncate(n.data)),
+        .row => blk: {
+            var total: u32 = 0;
+            for (0..n.num_children) |i| {
+                total += fieldPrimeMarks(ast, ast.child(idx, i));
+            }
+            break :blk total;
+        },
+        else => 0,
+    };
+}
+
+/// The prime composites of a field, in order, into `out`; returns how many.
+fn fieldPrimeCps(ast: *const atom.Ast, idx: u32, out: []u21) u32 {
+    const n = ast.node(idx);
+    switch (n.tag) {
+        .char => {
+            if (primeMarks(@truncate(n.data)) == 0) return 0;
+            out[0] = @truncate(n.data);
+            return 1;
+        },
+        .row => {
+            var count: u32 = 0;
+            for (0..n.num_children) |i| {
+                count += fieldPrimeCps(ast, ast.child(idx, i), out[count..]);
+            }
+            return count;
+        },
+        else => return 0,
+    }
+}
+
+test "parser: a prime run draws one composite per count and drops no mark" {
+    // LM Math supplies one composite per prime COUNT — ′ 0.311em, ″ 0.511em,
+    // ‴ 0.711em, ⁗ 0.911em (its own hmtx, on a 0.2em grid) — and XeLaTeX
+    // typesets a run of n primes as exactly the glyphs this parser picks:
+    // x'''' 14.15997pt = x⁗, x''''' 18.19748 = x⁗′, x'''''' 20.47157 = x⁗″,
+    // x''''''' 22.74567 = x⁗‴, x'''''''' 25.01976 = x⁗⁗, x''''''''' 27.29385
+    // = x⁗⁗′. The invariant under test is the MARKS drawn: never fewer than
+    // the source wrote, whatever the field's node shape.
+    const cases = [_]struct { src: []const u8, primes: u32 }{
+        .{ .src = "x'", .primes = 1 },
+        .{ .src = "x''", .primes = 2 },
+        .{ .src = "x'''", .primes = 3 },
+        .{ .src = "x''''", .primes = 4 },
+        .{ .src = "x'''''", .primes = 5 },
+        .{ .src = "x''''''''", .primes = 8 },
+        .{ .src = "x'''''''''", .primes = 9 },
+    };
+    for (cases) |c| {
+        var ast = try parseSrc(testing.allocator, c.src);
+        defer ast.deinit();
+        const script_idx = ast.child(ast.root, 0);
+        const sn = ast.node(script_idx);
+        try testing.expectEqual(.script, sn.tag);
+        try testing.expectEqual(@as(u16, 2), sn.num_children); // base + sup
+        try testing.expectEqual(@as(u32, 0), sn.first_token);
+        try testing.expectEqual(@as(u32, c.primes + 1), sn.num_tokens); // x + primes
+        try testing.expectEqual(c.primes, fieldPrimeMarks(&ast, ast.child(script_idx, 1)));
+    }
+}
+
+test "parser: a long prime run is quadruples plus a trailing composite" {
+    // The split is the font's, not an invention: 5 primes are one ⁗ and one ′,
+    // 8 are two ⁗, 9 are two ⁗ and one ′ — the glyph sequences XeLaTeX
+    // measures identical to the plain prime runs. Each leaf spans exactly the
+    // primes it draws, so the spans stay the source's.
+    const cases = [_]struct { src: []const u8, glyphs: []const u21 }{
+        .{ .src = "x'''''", .glyphs = &.{ prime_quad_cp, prime_cp } },
+        .{ .src = "x''''''", .glyphs = &.{ prime_quad_cp, prime_double_cp } },
+        .{ .src = "x'''''''", .glyphs = &.{ prime_quad_cp, prime_triple_cp } },
+        .{ .src = "x''''''''", .glyphs = &.{ prime_quad_cp, prime_quad_cp } },
+        .{ .src = "x'''''''''", .glyphs = &.{ prime_quad_cp, prime_quad_cp, prime_cp } },
+    };
+    for (cases) |c| {
+        var ast = try parseSrc(testing.allocator, c.src);
+        defer ast.deinit();
+        const script_idx = ast.child(ast.root, 0);
+        const sn = ast.node(script_idx);
+        try testing.expectEqual(@as(u32, @intCast(c.src.len)), sn.num_tokens); // x + primes
+        const sup_idx = ast.child(script_idx, 1);
+        var glyphs: [8]u21 = undefined;
+        try testing.expectEqual(@as(u32, @intCast(c.glyphs.len)), fieldPrimeCps(&ast, sup_idx, &glyphs));
+        for (c.glyphs, 0..) |want, i| {
+            try testing.expectEqual(want, glyphs[i]);
+        }
+        // The field starts at the first prime and every leaf spans the primes
+        // it draws, so a reader maps any glyph back to its source quotes.
+        try testing.expectEqual(@as(u32, 1), ast.node(sup_idx).first_token);
+        var marks: u32 = 0;
+        for (c.glyphs) |cp| marks += primeMarks(cp);
+        try testing.expectEqual(marks, fieldPrimeMarks(&ast, sup_idx));
+    }
+}
+
+test "parser: an exponent right after a prime joins the prime's field" {
+    var ast = try parseSrc(testing.allocator, "x_0'^2");
+    defer ast.deinit();
+    const script_idx = ast.child(ast.root, 0);
+    const sn = ast.node(script_idx);
+    try testing.expectEqual(.script, sn.tag);
+    try testing.expect(sn.data & atom.ScriptBits.sup != 0);
+    try testing.expect(sn.data & atom.ScriptBits.sub != 0);
+    try testing.expectEqual(@as(u16, 3), sn.num_children); // base + sup + sub
+    try testing.expectEqual(@as(u32, 0), sn.first_token);
+    try testing.expectEqual(@as(u32, 6), sn.num_tokens); // x _ 0 ' ^ 2
+    const sup_idx = ast.child(script_idx, 1);
+    const sup = ast.node(sup_idx);
+    try testing.expectEqual(.row, sup.tag);
+    try testing.expectEqual(@as(u16, 2), sup.num_children); // prime + exponent
+    try testing.expectEqual(@as(u32, 3), sup.first_token); // the '
+    try testing.expectEqual(@as(u32, 3), sup.num_tokens); // ' ^ 2
+    const prime = ast.node(ast.child(sup_idx, 0));
+    try testing.expectEqual(.char, prime.tag);
+    try testing.expectEqual(@as(u21, 0x2032), @as(u21, @truncate(prime.data)));
+    const exp = ast.node(ast.child(sup_idx, 1));
+    try testing.expectEqual(.char, exp.tag);
+    try testing.expectEqual(@as(u32, 5), exp.first_token); // the 2
+    try testing.expectEqual(@as(u32, 1), exp.num_tokens);
+    const sub = ast.node(ast.child(script_idx, 2));
+    try testing.expectEqual(.char, sub.tag);
+    try testing.expectEqual(@as(u32, 2), sub.first_token); // the 0
+}
+
+test "parser: an absorbed exponent leaves the subscript slot free" {
+    var ast = try parseSrc(testing.allocator, "x'^2_0");
+    defer ast.deinit();
+    const script_idx = ast.child(ast.root, 0);
+    const sn = ast.node(script_idx);
+    try testing.expectEqual(.script, sn.tag);
+    try testing.expect(sn.data & atom.ScriptBits.sup != 0);
+    try testing.expect(sn.data & atom.ScriptBits.sub != 0);
+    try testing.expectEqual(@as(u16, 3), sn.num_children); // base + sup + sub
+    try testing.expectEqual(@as(u32, 0), sn.first_token);
+    try testing.expectEqual(@as(u32, 6), sn.num_tokens); // x ' ^ 2 _ 0
+    const sup = ast.node(ast.child(script_idx, 1));
+    try testing.expectEqual(.row, sup.tag);
+    try testing.expectEqual(@as(u16, 2), sup.num_children);
+    try testing.expectEqual(@as(u32, 1), sup.first_token); // the '
+    try testing.expectEqual(@as(u32, 3), sup.num_tokens); // ' ^ 2
+    const sub = ast.node(ast.child(script_idx, 2));
+    try testing.expectEqual(.char, sub.tag);
+    try testing.expectEqual(@as(u32, 5), sub.first_token); // the 0
+}
+
+test "parser: a braced exponent after a prime joins the same field" {
+    // TeX's `\pr@@@t` swallows the `{` and the closing `\egroup` lands the
+    // field's `2` after the prime: `x'^{2}` measures EXACTLY like `x'^2`
+    // (13.09901pt both, against XeLaTeX). ztex keeps the braces as the group
+    // node it models everywhere else — same box, same span.
+    var ast = try parseSrc(testing.allocator, "x'^{2}");
+    defer ast.deinit();
+    const script_idx = ast.child(ast.root, 0);
+    const sn = ast.node(script_idx);
+    try testing.expectEqual(.script, sn.tag);
+    try testing.expectEqual(@as(u16, 2), sn.num_children); // base + sup
+    try testing.expectEqual(@as(u32, 0), sn.first_token);
+    try testing.expectEqual(@as(u32, 6), sn.num_tokens); // x ' ^ { 2 }
+    const sup_idx = ast.child(script_idx, 1);
+    const sup = ast.node(sup_idx);
+    try testing.expectEqual(.row, sup.tag);
+    try testing.expectEqual(@as(u16, 2), sup.num_children); // prime + group
+    try testing.expectEqual(@as(u32, 1), sup.first_token); // the '
+    try testing.expectEqual(@as(u32, 5), sup.num_tokens); // ' ^ { 2 }
+    const prime = ast.node(ast.child(sup_idx, 0));
+    try testing.expectEqual(.char, prime.tag);
+    try testing.expectEqual(@as(u21, 0x2032), @as(u21, @truncate(prime.data)));
+    const grp_idx = ast.child(sup_idx, 1);
+    const grp = ast.node(grp_idx);
+    try testing.expectEqual(.group, grp.tag);
+    try testing.expectEqual(@as(u32, 3), grp.first_token); // the {
+    try testing.expectEqual(@as(u32, 3), grp.num_tokens); // { 2 }
+    try testing.expectEqual(.row, ast.node(ast.child(grp_idx, 0)).tag);
+    try testing.expectEqual(.char, ast.node(ast.child(ast.child(grp_idx, 0), 0)).tag);
+}
+
+test "parser: a script that does not follow the prime run is a double script" {
+    var info: parse_err.Info = undefined;
+    // `x'_0^2`: the prime's lookahead sees `_`, not `^`, so the prime ends
+    // the field and the later `^` is TeX's "Double superscript".
+    try expectErrorSpan(&info, error.DoubleScript, "x'_0^2", .double_script, 4, 5);
+    // `x^2'`: the superscript slot is already the exponent's.
+    try expectErrorSpan(&info, error.DoubleScript, "x^2'", .double_script, 3, 4);
+}
+
+test "parser: a subscript after a prime run duplicates the subscript" {
+    var info: parse_err.Info = undefined;
+    // TeX reports "Double subscript" here; ztex has one double-script kind,
+    // and the span must name the SECOND `_`, not the run's end.
+    try expectErrorSpan(&info, error.DoubleScript, "x_0''_1", .double_script, 5, 6);
+}
+
+test "parser: a prime does not absorb the atom that follows it" {
+    var ast = try parseSrc(testing.allocator, "f'(x)");
+    defer ast.deinit();
+    const root = ast.node(ast.root);
+    try testing.expectEqual(@as(u16, 4), root.num_children); // f' ( x )
+    const script_idx = ast.child(ast.root, 0);
+    const sn = ast.node(script_idx);
+    try testing.expectEqual(.script, sn.tag);
+    try testing.expectEqual(@as(u16, 2), sn.num_children);
+    try testing.expect(sn.data & atom.ScriptBits.sup != 0);
+    try testing.expect(sn.data & atom.ScriptBits.sub == 0);
+    const sup = ast.node(ast.child(script_idx, 1));
+    try testing.expectEqual(.char, sup.tag);
+    try testing.expectEqual(@as(u21, 0x2032), @as(u21, @truncate(sup.data)));
+    try testing.expectEqual(.char, ast.node(ast.child(ast.root, 1)).tag); // (
+    try testing.expectEqual(.char, ast.node(ast.child(ast.root, 3)).tag); // )
+}
+
 test "parser: all error paths are reported" {
     try testing.expectError(error.MissingArgument, parseSrc(testing.allocator, "\\frac{1}"));
     try testing.expectError(error.MissingScript, parseSrc(testing.allocator, "x^"));
@@ -4490,45 +4923,6 @@ test "parser: a bare \\kern run with no unit reports the run's own span" {
     try testing.expectEqualStrings("2", src[info.span.start..info.span.end]);
 }
 
-// ── supported_commands ──────────────────────────
-
-/// Independent comptime recomputation of the DISTINCT command count across
-/// the four dispatch tables. `supported_commands` is built from these same
-/// tables, so this is the ground truth its length must equal — it keeps the
-/// coverage test from merely echoing the list's own length (a hand-added
-/// entry without a backing table would break the length match).
-const supported_distinct_count: usize = blk: {
-    // O(n²) byte-compare over ~230 names exceeds the default 1000-branch
-    // comptime eval budget.
-    @setEvalBranchQuota(400_000);
-    const tables = [_][]const []const u8{
-        cmd_map.keys(),
-        mathstyle_map.keys(),
-        symbol_map.keys(),
-        delim_map.keys(),
-    };
-    var total: usize = 0;
-    for (tables) |t| total += t.len;
-    var names: [total][]const u8 = undefined;
-    var n: usize = 0;
-    for (tables) |t| for (t) |k| {
-        names[n] = k;
-        n += 1;
-    };
-    var dups: usize = 0;
-    for (0..n) |i| {
-        var seen_before = false;
-        for (0..i) |j| {
-            if (std.mem.eql(u8, names[i], names[j])) {
-                seen_before = true;
-                break;
-            }
-        }
-        if (seen_before) dups += 1;
-    }
-    break :blk total - dups;
-};
-
 test "parser: \\dbinom and \\tbinom are \\binom with a FORCED style" {
     // Both are \genfrac{(}{)}{0pt}{0|1}{n}{d}: a ruleless fraction inside a
     // synthetic paren fence marked as amsmath-delimited, and the ONLY
@@ -4646,83 +5040,6 @@ test "parser: the \\mathXXX family wraps a math field in a class row" {
     }
     try testing.expectError(error.MissingScript, parseSrc(testing.allocator, "\\mathrel"));
     try testing.expectError(error.MissingScript, parseSrc(testing.allocator, "\\mathbin"));
-}
-
-test "parser: \\colon is punctuation while a bare : is a plain char" {
-    // plain TeX: `\def\colon{\mathpunct{:}}`. The GLYPH is the same colon, so
-    // \colon is a class row around a `:` char leaf, while a typed `:` stays a
-    // bare char atom (whose class layout derives from the codepoint).
-    var ast = try parseSrc(testing.allocator, "a\\colon b");
-    defer ast.deinit();
-    const row_idx = ast.child(ast.root, 1);
-    const row = ast.node(row_idx);
-    try testing.expectEqual(.row, row.tag);
-    try testing.expectEqual(atom.classRowData(.punct), row.data);
-    const inner = ast.node(ast.child(row_idx, 0));
-    try testing.expectEqual(.char, inner.tag);
-    try testing.expectEqual(@as(u32, 0x3A), inner.data);
-
-    var plain = try parseSrc(testing.allocator, "a:b");
-    defer plain.deinit();
-    const colon = plain.node(plain.child(plain.root, 1));
-    try testing.expectEqual(.char, colon.tag);
-    try testing.expect(!atom.isClassRow(colon.data));
-}
-
-test "parser: the colon relation family maps to the unicode-math glyphs" {
-    // \coloneqq / \Coloneqq are mathtools' `:=` / `::=`, which unicode-math
-    // spells \coloneq (U+2254) and \Coloneq (U+2A74); Latin Modern Math has no
-    // U+2A74, so \Coloneqq falls back to the single-glyph COLON EQUALS. Every
-    // one of them is a plain char leaf — a relation, classified in layout.
-    const cases = [_]struct { src: []const u8, cp: u21 }{
-        .{ .src = "\\coloneqq", .cp = 0x2254 },
-        .{ .src = "\\coloneqqs", .cp = 0x2254 },
-        .{ .src = "\\Coloneqq", .cp = 0x2254 },
-        .{ .src = "\\Coloneqqs", .cp = 0x2254 },
-        .{ .src = "\\coloneq", .cp = 0x2255 },
-        .{ .src = "\\Colon", .cp = 0x2237 },
-        .{ .src = "\\ratio", .cp = 0x2236 },
-    };
-    for (cases) |c| {
-        var ast = try parseSrc(testing.allocator, c.src);
-        defer ast.deinit();
-        const leaf = ast.node(ast.child(ast.root, 0));
-        try testing.expectEqual(.char, leaf.tag);
-        try testing.expectEqual(c.cp, leaf.data);
-    }
-}
-
-test "parser: supported_commands is exactly the union of the four tables" {
-    // 1. Every table key appears in the list — the tables are the source of
-    // truth, and dropping one from the union fails here.
-    inline for (.{ cmd_map, mathstyle_map, symbol_map, delim_map }) |m| {
-        for (m.keys()) |k| {
-            var found = false;
-            for (supported_commands) |s| {
-                if (std.mem.eql(u8, s, k)) {
-                    found = true;
-                    break;
-                }
-            }
-            try testing.expect(found);
-        }
-    }
-    // 2. Every list entry is backed by at least one table: a hand-written
-    // entry with no backing map fails here (the audit's coverage guard).
-    for (supported_commands) |s| {
-        try testing.expect(
-            cmd_map.has(s) or mathstyle_map.has(s) or symbol_map.has(s) or delim_map.has(s),
-        );
-    }
-    // 3. The list is a true SET: no name repeats (cross-table duplicates
-    // collapse to one entry).
-    for (supported_commands, 0..) |s, i| {
-        for (supported_commands[0..i]) |prev| {
-            try testing.expect(!std.mem.eql(u8, s, prev));
-        }
-    }
-    // 4. Independent count check: length == recomputed distinct union size.
-    try testing.expectEqual(@as(usize, supported_distinct_count), supported_commands.len);
 }
 
 test "parser: command dispatch is unambiguous (collision test)" {
@@ -5160,4 +5477,25 @@ test "parser: \\hline outside an environment or inside a cell is a spanned error
     var p = Parser.init(testing.allocator, ast.src, ast.tokens.items, &info);
     try testing.expectError(error.MisplacedHline, p.parse(&ast));
     try testing.expectEqualStrings("\\hline", ast.src[info.span.start..info.span.end]);
+}
+
+test "parser: unsupported raw text commands report the command span" {
+    const cases = [_]struct { source: []const u8, command: []const u8 }{
+        .{ .source = "\\text{\\alpha}", .command = "\\alpha" },
+        .{ .source = "\\textit{a\\sum b}", .command = "\\sum" },
+        .{ .source = "\\textbf{x\\sqrt{2}}", .command = "\\sqrt" },
+        .{ .source = "\\text{a\\textbf{\\not}}", .command = "\\not" },
+        .{ .source = "\\text{a\\!b}", .command = "\\!" },
+        .{ .source = "\\text{a\\\\b}", .command = "\\\\" },
+    };
+    for (cases) |c| {
+        var info: parse_err.Info = undefined;
+        var ast = atom.Ast.init(testing.allocator, c.source);
+        defer ast.deinit();
+        try lexer.lex(&ast, &info);
+        var p = Parser.init(testing.allocator, ast.src, ast.tokens.items, &info);
+        try testing.expectError(error.UnknownCommand, p.parse(&ast));
+        try testing.expectEqual(.unknown_command, info.kind);
+        try testing.expectEqualStrings(c.command, c.source[info.span.start..info.span.end]);
+    }
 }

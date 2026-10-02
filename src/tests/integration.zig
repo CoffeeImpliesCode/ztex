@@ -1,8 +1,7 @@
 //! ztex.tests.integration — full-pipeline invariants over a LaTeX corpus.
 //!
-//! MicroTeX-style: render a fixed corpus through the public facade and
-//! assert deterministic structural invariants. Golden-string snapshots live
-//! in regression.zig; this module never depends on exact coordinates.
+//! Render a fixed corpus through the public facade and assert structural
+//! and geometry invariants without pinning internal serialization.
 
 const std = @import("std");
 const ztex = @import("ztex");
@@ -226,6 +225,10 @@ test "integration: hline surrounds rows without introducing empty cells" {
             .rect => |r| {
                 try testing.expect(rule_count < rules.len);
                 try testing.expect(r.w > r.h);
+                // \arrayrulewidth is a FIXED 0.4pt: the rule on a leading, an
+                // interior and a trailing boundary is equally thick, and it is
+                // never scaled with the font.
+                try testing.expectApproxEqAbs(@as(f32, 0.4), r.h, 0.001);
                 rules[rule_count] = r.y;
                 rule_count += 1;
             },
@@ -245,6 +248,42 @@ test "integration: hline surrounds rows without introducing empty cells" {
     try testing.expect(first_row < rules[1]);
     try testing.expect(rules[1] < last_row);
     try testing.expect(last_row < rules[2]);
+    // The two rows stand \baselineskip apart — the strut's own 0.7 + 0.3 of it
+    // — plus the one \arrayrulewidth their shared boundary opens up.
+    try testing.expectApproxEqAbs(1.2 * size_pt + 0.4, last_row - first_row, 0.001);
+    // Two rules on ONE boundary are two separate \noalign entries, and
+    // latex.ltx's \@xhline leaves \doublerulesep of clear air between their
+    // ink bands: 2pt apart, each \arrayrulewidth thick.
+    const pair_src = "\\begin{matrix}a\\\\\\hline\\hline b\\end{matrix}";
+    var pair = try ztex.render(testing.allocator, pair_src, .display, size_pt, null);
+    defer pair.deinit();
+    var pair_rules: [2]f32 = undefined;
+    var pair_count: usize = 0;
+    for (pair.items.items) |d| {
+        switch (d) {
+            .rect => |r| {
+                try testing.expect(pair_count < pair_rules.len);
+                try testing.expectApproxEqAbs(@as(f32, 0.4), r.h, 0.001);
+                pair_rules[pair_count] = r.y;
+                pair_count += 1;
+            },
+            .text, .line => {},
+        }
+    }
+    try testing.expectEqual(pair_rules.len, pair_count);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), pair_rules[1] - pair_rules[0], 0.001);
+}
+
+test "integration: matrix rows stand \\baselineskip apart" {
+    // LaTeX's \@array zeroes \baselineskip and \lineskip inside a matrix, so
+    // the row strut alone sets the baseline distance: 0.7 + 0.3 of
+    // \baselineskip, exactly 1.2em — 24pt at this 20pt base. The text
+    // paren's `(` box, whose 0.75 + 0.25em this replaced, put every
+    // neighbouring row 20pt apart instead.
+    const src = "\\begin{matrix}x\\\\x\\end{matrix}";
+    var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
+    defer out.deinit();
+    try testing.expectApproxEqAbs(1.2 * size_pt, try glyphRowGap(&out, src, "x"), 0.001);
 }
 
 test "integration: textit and textbf keep text glyphs in their requested faces" {
@@ -362,11 +401,13 @@ test "integration: scoped frame paint overrides host ink in RGBA and alpha masks
         }
         const rule = top orelse return error.TestUnexpectedResult;
         const bounds = out.bounds();
-        const x: usize = @intFromFloat(@floor(4 + rule.x + rule.w / 2 - bounds.min_x));
-        const y: usize = @intFromFloat(@floor(4 + rule.y + rule.h / 2 - bounds.min_y));
+        // At five pixels per point the 0.4pt frame has a fully covered
+        // interior pixel, so this checks paint precedence, not edge coverage.
+        const x: usize = @intFromFloat(@floor(4 + (rule.x + rule.w / 2 - bounds.min_x) * 5));
+        const y: usize = @intFromFloat(@floor(4 + (rule.y + rule.h / 2 - bounds.min_y) * 5));
         for ([_]ztex.raster.Format{ .rgba32, .alpha8 }) |format| {
             var pixels = try ztex.raster.rasterize(testing.allocator, &ctx, &out, .{
-                .dpi = 72,
+                .dpi = 360,
                 .padding = 4,
                 .format = format,
                 .fg = .{ .r = 0, .g = 0, .b = 255 },
@@ -512,7 +553,7 @@ test "integration: arraystretch ends at its group" {
     try testing.expectApproxEqAbs(try twoRowGap(&plain), baselines[3] - baselines[2], 0.001);
 }
 
-test "integration: a nested environment keeps its horizontal rule inside its cell" {
+test "integration: a nested matrix rule spans its alignment including outer pads" {
     const src = "\\begin{matrix}a&\\begin{matrix}x\\\\\\hline x\\end{matrix}\\\\d\\end{matrix}";
     var out = try ztex.render(testing.allocator, src, .display, size_pt, null);
     defer out.deinit();
@@ -536,13 +577,13 @@ test "integration: a nested environment keeps its horizontal rule inside its cel
     }
     try testing.expectEqual(inner.len, glyph);
     const r = rule orelse return error.TestUnexpectedResult;
-    try testing.expectApproxEqAbs(inner[0].x, r.x, 0.001);
-    try testing.expectApproxEqAbs(inner[1].x, r.x, 0.001);
+    try testing.expectApproxEqAbs(inner[0].x - 5.0, r.x, 0.001);
+    try testing.expectApproxEqAbs(inner[1].x - 5.0, r.x, 0.001);
     try testing.expect(inner[0].y < r.y);
     try testing.expect(inner[1].y > r.y + r.h);
     var plain = try ztex.render(testing.allocator, "x", .display, size_pt, null);
     defer plain.deinit();
-    try testing.expectApproxEqAbs(plain.width, r.w, 0.001);
+    try testing.expectApproxEqAbs(plain.width + 10.0, r.w, 0.001);
 }
 
 // A color scope paints the atoms under it and changes no geometry, so the
@@ -815,4 +856,372 @@ test "integration: a nested body preserves its enclosing cell's stretch assignme
         try glyphRowGap(&out, src, "x"),
         0.001,
     );
+}
+
+fn maskInkWidth(mask: *const ztex.PixelBuffer) u32 {
+    var left = mask.width;
+    var right: u32 = 0;
+    for (0..mask.height) |y| {
+        for (0..mask.width) |x| {
+            if (mask.pixels[y * mask.stride + x] < 128) continue;
+            left = @min(left, @as(u32, @intCast(x)));
+            right = @max(right, @as(u32, @intCast(x)));
+        }
+    }
+    return if (left <= right) right - left + 1 else 0;
+}
+
+test "integration: sans math paints a distinct sans-serif capital I" {
+    var ctx = try ztex.Context.init(testing.allocator);
+    defer ctx.deinit();
+    const opts: ztex.RasterOptions = .{ .dpi = 192, .format = .alpha8 };
+    var serif = try ctx.renderPixels("\\mathrm{I}", .text, 40, opts, null);
+    defer serif.deinit();
+    var sans = try ctx.renderPixels("\\mathsf{I}", .text, 40, opts, null);
+    defer sans.deinit();
+    try testing.expect(maskInkWidth(&sans) < maskInkWidth(&serif));
+}
+
+test "integration: monospace math preserves equal character advances at every size" {
+    var ctx = try ztex.Context.init(testing.allocator);
+    defer ctx.deinit();
+    for ([_]f32{ 8, 20, 60 }) |size| {
+        var static = try ztex.render(testing.allocator, "\\mathtt{AIW012}", .text, size, null);
+        defer static.deinit();
+        var real = try ctx.render("\\mathtt{AIW012}", .text, size, null);
+        defer real.deinit();
+        for ([_]*const ztex.draw.DrawList{ &static, &real }) |list| {
+            var previous: ?f32 = null;
+            var advance: ?f32 = null;
+            for (list.items.items) |item| {
+                if (item != .text) continue;
+                if (previous) |x| {
+                    const distance = item.text.x - x;
+                    if (advance) |expected|
+                        try testing.expectApproxEqAbs(expected, distance, 0.001)
+                    else
+                        advance = distance;
+                }
+                previous = item.text.x;
+            }
+        }
+    }
+}
+
+test "text faces fall back to the same real math Greek outline" {
+    var ctx = try ztex.Context.init(testing.allocator);
+    defer ctx.deinit();
+    const opts: ztex.RasterOptions = .{ .dpi = 192, .padding = 2, .format = .alpha8 };
+    var reference = try ctx.renderPixels("\\mathsf{\\alpha}", .display, 40, opts, null);
+    defer reference.deinit();
+    for ([_][]const u8{
+        "\\mathrm{\\alpha}",
+        "\\text{α}",
+        "\\textit{α}",
+        "\\textbf{α}",
+        "\\textit{\\textbf{α}}",
+    }) |source| {
+        var pixels = try ctx.renderPixels(source, .display, 40, opts, null);
+        defer pixels.deinit();
+        try testing.expectEqual(reference.width, pixels.width);
+        try testing.expectEqual(reference.height, pixels.height);
+        try testing.expectEqualSlices(u8, reference.pixels, pixels.pixels);
+    }
+}
+
+test "amsmath colon keeps two mu before and six mu after in every style" {
+    var ctx = try ztex.Context.init(testing.allocator);
+    defer ctx.deinit();
+    for ([_]ztex.layout.Style{ .display, .text, .script, .script_script }) |style| {
+        for ([_]bool{ false, true }) |font_backed| {
+            var plain = if (font_backed)
+                try ctx.render("0\\mathord{:}0", style, 20, null)
+            else
+                try ztex.render(testing.allocator, "0\\mathord{:}0", style, 20, null);
+            defer plain.deinit();
+            var spaced = if (font_backed)
+                try ctx.render("0\\colon0", style, 20, null)
+            else
+                try ztex.render(testing.allocator, "0\\colon0", style, 20, null);
+            defer spaced.deinit();
+            var reference: [3]ztex.draw.Text = undefined;
+            var actual: [3]ztex.draw.Text = undefined;
+            var ri: usize = 0;
+            var ai: usize = 0;
+            for (plain.items.items) |item| if (item == .text) {
+                try testing.expect(ri < reference.len);
+                reference[ri] = item.text;
+                ri += 1;
+            };
+            for (spaced.items.items) |item| if (item == .text) {
+                try testing.expect(ai < actual.len);
+                actual[ai] = item.text;
+                ai += 1;
+            };
+            try testing.expectEqual(reference.len, ri);
+            try testing.expectEqual(actual.len, ai);
+            const mu = reference[0].size / 18;
+            try testing.expectApproxEqAbs(reference[0].x, actual[0].x, 0.01);
+            try testing.expectApproxEqAbs(reference[1].x + 2 * mu, actual[1].x, 0.01);
+            try testing.expectApproxEqAbs(reference[2].x + 8 * mu, actual[2].x, 0.01);
+        }
+    }
+}
+
+test "integration: a cases radical inherits its cell's text style" {
+    var context = try ztex.Context.init(testing.allocator);
+    defer context.deinit();
+    const source = "\\begin{cases}\\frac{\\frac{a}{b}}{\\frac{c}{d}} & x\\neq 0\\\\" ++
+        "\\sqrt{\\frac{a}{b}} & x=0\\end{cases}";
+    for ([_]bool{ false, true }) |real| {
+        var dl = if (real)
+            try context.render(source, .display, 20, null)
+        else
+            try ztex.render(testing.allocator, source, .display, 20, null);
+        defer dl.deinit();
+        // The exact-font reference's cases block is 60.75pt tall.
+        // An oversized 36pt radical raises the same block to 69.32pt.
+        const bounds = dl.bounds();
+        try testing.expect(bounds.height + bounds.depth < 64);
+    }
+}
+
+test "integration: horizontal braces fit the nucleus before assembling" {
+    var context = try ztex.Context.init(testing.allocator);
+    defer context.deinit();
+    for ([_]bool{ false, true }) |real| {
+        for ([_]ztex.layout.Style{ .display, .text }) |style| {
+            for ([_]f32{ 8, 20, 60 }) |size| {
+                for ([_]struct { base: []const u8, braced: []const u8 }{
+                    .{ .base = "a+b", .braced = "\\overbrace{a+b}" },
+                    .{ .base = "\\frac{a}{b}", .braced = "\\underbrace{\\frac{a}{b}}" },
+                }) |source| {
+                    var base = if (real)
+                        try context.render(source.base, style, size, null)
+                    else
+                        try ztex.render(testing.allocator, source.base, style, size, null);
+                    defer base.deinit();
+                    var braced = if (real)
+                        try context.render(source.braced, style, size, null)
+                    else
+                        try ztex.render(testing.allocator, source.braced, style, size, null);
+                    defer braced.deinit();
+                    // Preserve the nucleus's real ink overhang. A nucleus
+                    // narrower than the 0.492em base brace keeps that glyph.
+                    const limit = @max(base.bounds().width, 0.5 * size);
+                    try testing.expect(braced.bounds().width <= limit + 0.02 * size);
+                }
+            }
+        }
+    }
+}
+
+test "integration: colon-equals relations retain dot count and orientation" {
+    for ([_]struct { source: []const u8, bands: usize }{
+        .{ .source = "\\coloneq", .bands = 2 },
+        .{ .source = "\\Coloneqq", .bands = 3 },
+        .{ .source = "\\Coloneqqs", .bands = 3 },
+    }) |relation| {
+        var pixels = try ztex.renderPixels(testing.allocator, relation.source, .display, 20, .{
+            .dpi = 300,
+            .padding = 2,
+            .format = .alpha8,
+        }, null);
+        defer pixels.deinit();
+        var first_width: usize = 0;
+        var last_width: usize = 0;
+        var count: usize = 0;
+        var previous = false;
+        for (0..pixels.width) |column| {
+            var ink = false;
+            for (0..pixels.height) |row| {
+                if (pixels.pixels[row * pixels.stride + column] > 127) {
+                    ink = true;
+                    break;
+                }
+            }
+            if (ink) {
+                if (!previous) {
+                    count += 1;
+                    last_width = 0;
+                }
+                if (count == 1) first_width += 1;
+                last_width += 1;
+            }
+            previous = ink;
+        }
+        try testing.expectEqual(relation.bands, count);
+        // Colon dots form narrow columns; the equals bars are on the right.
+        try testing.expect(first_width < last_width);
+    }
+}
+
+test "integration: braces and forced limits keep their measured ink gaps" {
+    var context = try ztex.Context.init(testing.allocator);
+    defer context.deinit();
+    // Exact-font XeTeX: the overbrace tips clear a+b; the upper annotation gap
+    // is 0.20em, and a lower n clears the band by about 0.29em at script size.
+    for ([_]struct {
+        source: []const u8,
+        bands: usize,
+        min_gap: f32,
+        max_gap: f32,
+    }{
+        .{ .source = "\\overbrace{a+b}", .bands = 2, .min_gap = 0.04, .max_gap = 0.12 },
+        .{ .source = "\\overbrace{a+b}^{n}", .bands = 3, .min_gap = 0.04, .max_gap = 0.12 },
+        .{
+            .source = "\\underbrace{\\frac{a}{b}}_{n}",
+            .bands = 5,
+            .min_gap = 0.26,
+            .max_gap = 0.34,
+        },
+        .{ .source = "\\overset{n}{a+b}", .bands = 2, .min_gap = 0.17, .max_gap = 0.24 },
+        .{
+            .source = "\\underset{n}{\\frac{a}{b}}",
+            .bands = 4,
+            .min_gap = 0.26,
+            .max_gap = 0.34,
+        },
+    }) |case| {
+        for ([_]bool{ false, true }) |real| {
+            var list = if (real)
+                try context.render(case.source, .display, 20, null)
+            else
+                try ztex.render(testing.allocator, case.source, .display, 20, null);
+            defer list.deinit();
+            var pixels = try ztex.raster.rasterize(
+                testing.allocator,
+                &context,
+                &list,
+                .{ .dpi = 192, .padding = 0, .format = .alpha8 },
+            );
+            defer pixels.deinit();
+            var bands: usize = 0;
+            var last_start: usize = 0;
+            var previous_end: usize = 0;
+            var end: usize = 0;
+            var previous = false;
+            for (0..pixels.height) |row| {
+                var ink = false;
+                for (0..pixels.width) |column| {
+                    if (pixels.pixels[row * pixels.stride + column] > 127) {
+                        ink = true;
+                        break;
+                    }
+                }
+                if (ink) {
+                    if (!previous) {
+                        bands += 1;
+                        last_start = row;
+                        previous_end = end;
+                    }
+                    end = row;
+                }
+                previous = ink;
+            }
+            try testing.expectEqual(case.bands, bands);
+            const gap = @as(f32, @floatFromInt(last_start - previous_end - 1)) / (20 * 192 / 72);
+            try testing.expect(gap >= case.min_gap);
+            try testing.expect(gap <= case.max_gap);
+        }
+    }
+}
+
+test "integration: indexed radicals retain the measured degree kern width" {
+    var context = try ztex.Context.init(testing.allocator);
+    defer context.deinit();
+    const source = "\\sqrt[3]{x+y} + \\sqrt[n]{\\frac{1}{x}}";
+    for ([_]bool{ false, true }) |real| {
+        var list = if (real)
+            try context.render(source, .display, 20, null)
+        else
+            try ztex.render(testing.allocator, source, .display, 20, null);
+        defer list.deinit();
+        // LuaLaTeX's 121.07pt box brackets the index with size-scaled MATH
+        // kerns and rides it on the radical's shoulder; XeTeX's 126.65pt
+        // box hangs it off the ink with 10pt-based kerns. Ink framing
+        // trims the empty shoulder, so compare the advance.
+        try testing.expect(list.width > 119);
+        try testing.expect(list.width < 123);
+    }
+}
+
+test "integration: deeply nested radical assemblies do not add quantization gaps" {
+    var context = try ztex.Context.init(testing.allocator);
+    defer context.deinit();
+    const source = "\\sqrt{1+\\sqrt{1+\\sqrt{1+\\sqrt{1+\\sqrt{1+\\sqrt{1+x}}}}}}";
+    for ([_]bool{ false, true }) |real| {
+        var list = if (real)
+            try context.render(source, .display, 20, null)
+        else
+            try ztex.render(testing.allocator, source, .display, 20, null);
+        defer list.deinit();
+        // Exact-font XeTeX's 69.92pt box includes 0.8pt of empty top kern.
+        // Its ink is 69.12pt; fixed overlap inflated ztex's ink to 74.4pt.
+        const bounds = list.bounds();
+        try testing.expect(bounds.height + bounds.depth > 69);
+        try testing.expect(bounds.height + bounds.depth < 71);
+    }
+}
+
+test "integration: translucent radicals paint each connector once" {
+    var context = try ztex.Context.init(testing.allocator);
+    defer context.deinit();
+    const sources = [_][]const u8{
+        "\\textcolor{#00000080}{\\sqrt{x}}",
+        "\\textcolor{#00000080}{\\sqrt{\\begin{matrix}x\\\\x\\\\x\\\\x\\\\x\\end{matrix}}}",
+    };
+    for (sources) |source| {
+        for ([_]bool{ false, true }) |real| {
+            var list = if (real)
+                try context.render(source, .display, 20, null)
+            else
+                try ztex.render(testing.allocator, source, .display, 20, null);
+            defer list.deinit();
+            for ([_]ztex.raster.Format{ .rgba32, .alpha8 }) |format| {
+                var pixels = try ztex.raster.rasterize(testing.allocator, &context, &list, .{
+                    .dpi = 192,
+                    .format = format,
+                    .bg = null,
+                });
+                defer pixels.deinit();
+                const step: usize = if (format == .rgba32) 4 else 1;
+                var at: usize = if (format == .rgba32) 3 else 0;
+                var maximum: u8 = 0;
+                while (at < pixels.pixels.len) : (at += step) {
+                    const alpha = pixels.pixels[at];
+                    try testing.expect(alpha <= 128);
+                    maximum = @max(maximum, alpha);
+                }
+                try testing.expectEqual(@as(u8, 128), maximum);
+            }
+        }
+    }
+}
+
+test "integration: a narrow radical nucleus preserves the glyph's connecting cap" {
+    var context = try ztex.Context.init(testing.allocator);
+    defer context.deinit();
+    for ([_]bool{ false, true }) |real| {
+        var empty = if (real)
+            try context.render("\\sqrt{}", .display, 20, null)
+        else
+            try ztex.render(testing.allocator, "\\sqrt{}", .display, 20, null);
+        defer empty.deinit();
+        var narrow = if (real)
+            try context.render("\\sqrt{\\hspace{0.01pt}}", .display, 20, null)
+        else
+            try ztex.render(testing.allocator, "\\sqrt{\\hspace{0.01pt}}", .display, 20, null);
+        defer narrow.deinit();
+        const options: ztex.raster.Options = .{ .dpi = 192, .format = .alpha8, .bg = null };
+        var a = try ztex.raster.rasterize(testing.allocator, &context, &empty, options);
+        defer a.deinit();
+        var b = try ztex.raster.rasterize(testing.allocator, &context, &narrow, options);
+        defer b.deinit();
+        try testing.expectEqual(a.width, b.width);
+        try testing.expectEqual(a.height, b.height);
+        for (a.pixels, b.pixels) |left, right| {
+            try testing.expect(@as(u16, right) + 1 >= left);
+        }
+    }
 }

@@ -147,20 +147,21 @@ pub fn main(init: std.process.Init) !void {
     var ctx = try ztex.Context.init(gpa);
     defer ctx.deinit();
 
-    // A parse failure fills `err_info` (kind + span) before returning its
-    // error value. `ctx.render` returns the TYPED facade error set, so we
-    // match it exhaustively: every member except OutOfMemory/InvalidAst is
-    // a parse front-end error whose Info was filled by lex/parse. The two
-    // exceptions are not parse errors — `err_info` stays untouched — so
-    // they propagate as-is.
+    // Only syntax/source-limit errors initialize the diagnostic. Allocation,
+    // argument, AST, and font failures propagate without reading it.
     var err_info: ztex.parse.Info = undefined;
     const dl = ctx.render(src, style, size, &err_info) catch |e| switch (e) {
-        error.OutOfMemory => return e,
-        error.InvalidAst => return e,
+        error.OutOfMemory,
+        error.InvalidArgument,
+        error.InvalidAst,
+        error.InvalidSfnt,
+        error.MissingTable,
+        error.InvalidTable,
+        error.UnsupportedCmap,
+        error.UnsupportedFont,
+        => return e,
         else => {
-            // The arms above handle the only non-parse members, so `else`
-            // is always a parse error whose Info was filled by lex/parse;
-            // the cast just narrows the type for printParseError.
+            // The remaining members are parse errors with a populated Info.
             try printParseError(gpa, io, @errorCast(e), err_info, src);
             std.process.exit(1);
         },
@@ -206,7 +207,11 @@ pub fn main(init: std.process.Init) !void {
         }
         return;
     }
-    const opts: ztex.svg.Options = .{ .padding = pad, .background = bg };
+    const opts: ztex.svg.Options = .{
+        .padding = pad,
+        .background = bg,
+        .fonts = ctx.fonts,
+    };
 
     if (out_path) |path| {
         try ztex.svg.writeFile(gpa, init.io, std.Io.Dir.cwd(), path, &dl, opts);

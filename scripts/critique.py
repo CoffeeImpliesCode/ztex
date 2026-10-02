@@ -11,21 +11,24 @@ truncated glyphs, misplaced scripts) and reports quantitative positions as
 fractions of the image, never vague impressions.
 
 Stage 2 (VERIFY): every vision claim is checked against DETERMINISTIC ground
-truth computed from the ztex SVG and the actual Latin Modern OTF outlines
-(fontTools BoundsPen): per-glyph ink boxes in SVG pt, union ink bbox, per-edge
-clipping overflow, big-op/limit-op centering offsets, pairwise ink-box
-overlaps, and glyphs that render nothing. The geometric verdict is
-AUTHORITATIVE: a vision claim fails the verdict only when geometry confirms
-it; claims geometry contradicts are marked "refuted (vision artifact)" and
-never fail. This stops the loop from chasing vision hallucinations (e.g. a
-"0.05 offset" limit that is geometrically 0.0, or "overlaps" with 1.6pt gaps).
+truth computed from the ztex SVG itself: per-glyph ink boxes in SVG pt, union
+ink bbox, per-edge clipping overflow, big-op/limit-op centering offsets,
+pairwise ink-box overlaps, and glyphs that render nothing. Ink is taken from
+where the document actually paints it — a <text> run from the real Latin
+Modern OTF outline at the declared size (fontTools BoundsPen), a <path> from
+its OWN `d` outline measured exactly (curve extrema included, never a
+control box). The geometric verdict is AUTHORITATIVE: a vision claim fails
+the verdict only when geometry confirms it; claims geometry contradicts are
+marked "refuted (vision artifact)" and never fail. This stops the loop from
+chasing vision hallucinations (e.g. a "0.05 offset" limit that is
+geometrically 0.0, or "overlaps" with 1.6pt gaps).
 
-The PNG is rasterized with PIL from the ztex SVG itself, drawing every
-<text> glyph with the actual Latin Modern OTFs at the declared pt font-size
-(96 dpi, 1pt = 4/3 px). This is the TRUSTWORTHY render on this host:
-resvg/rsvg-convert/ImageMagick all break ztex <text> via font fallback and
-overflow the frame, producing phantom edge clipping that is not in the SVG
-(the SVG carries a ~34pt right margin at -s 48).
+The PNG follows the ACTUAL DOCUMENT. Resolved glyphs, MATH variants and
+assemblies carry their painted outlines as absolute <path> coordinates.
+The rasterizer fills those paths, including filled decoration bands, with
+nonzero winding, the element's own alpha and the document's painter order.
+Nothing is reconstructed from a nominal font metric. An unavailable glyph
+remains a <text> fallback; its appearance depends on the available font.
 
 Vision backend: OpenRouter chat-completions with a vision model
 (OPENROUTER_API_KEY env var). When no key is present, the script still
@@ -47,9 +50,9 @@ Outputs (per run):
 import argparse
 import base64
 import glob
-import io
 import json
 import os
+import math
 import re
 import struct
 import subprocess
@@ -61,24 +64,34 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 from fontTools.pens.boundsPen import BoundsPen
+from fontTools.pens.basePen import BasePen
+from fontTools.svgLib.path import parse_path
 from fontTools.ttLib import TTFont
 
 DEFAULT_VISION_MODEL = "qwen/qwen-2.5-vl-72b-instruct"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_TIMEOUT = 180
 
-# ── PIL rasterizer (trustworthy render on this host) ────────────────────────
+# ── PIL rasterizer (follows the actual document) ────────────────────────────
 # The ztex SVG declares pt lengths (root width/height carry "pt", viewBox is
 # unitless-pt). We rasterize at 96 dpi: every pt → 96/72 = 4/3 px, applied
 # uniformly to the canvas, glyph positions AND font sizes, so a 1pt glyph
-# renders at exactly 4/3 px — the same geometry a browser gives at 96 dpi,
-# but with the real Latin Modern glyph shapes (no font-fallback shifts).
+# renders at exactly 4/3 px — the same geometry a browser gives at 96 dpi.
 PT_TO_PX = 96.0 / 72.0
 # PIL's direct glyph rasterization at 48pt+ renders strokes measurably
 # bolder than mutool's reference raster (per-glyph ink coverage ~+4% at the
 # same px/pt — see rasterize_svg). Supersample 2x and LANCZOS-downscale so
 # the critique compares glyph shapes, not raster antialiasing.
 RASTER_SUPERSAMPLE = 2
+# Scanlines sampled per pixel row when filling a <path>: the horizontal
+# coverage of each span is exact, so 4 rows of samples already antialias the
+# diagonal edges of a stem to under 1/8 of a pixel before the LANCZOS pass.
+PATH_SUB_SCANLINES = 4
+# Maximum chord error, in document pt, when a quadratic/cubic segment is
+# flattened into the polyline the scanline filler walks. 0.01pt is 0.027px at
+# 96 dpi — below the quantization of the raster it feeds, so the filled shape
+# is the outline the document declares.
+PATH_FLATTEN_TOL_PT = 0.01
 
 DEFAULT_FONT_DIR = "/nix/store/wgpnygkr70hxa0vj5ka284cfc65bfzyn-devenv-profile/share/fonts/opentype"
 LM_MATH_FONT = "latinmodern-math.otf"   # math runs (glyphs are math-italic already)
@@ -87,27 +100,11 @@ LM_BOLD_FONT = "lmroman10-bold.otf"      # \mathbf runs
 
 # ── Geometric verifier (deterministic ground truth) ────────────────────────
 BIGOP_GLYPHS = set("∑∫∏⋃⋂⨆∐∮")        # operators that take over/under limits
-# Big-op codepoints whose DISPLAY glyph is a MATH-table .v1 variant (the cmap
-# base glyph is what the SVG/browser shows; XeTeX draws the variant — e.g.
-# summation.v1, integral.v1). The PIL rasterizer and the geometric verifier
-# resolve the variant so the critique render matches XeTeX in width AND
-# height (a single font-size scalar on the base glyph cannot: ∫ base aspect
-# 0.498 vs .v1 0.399). Private-use chars address the variants through PIL
-# (FreeType rasterizes by cmap; a patched font maps each PUA char to the
-# .v1 glyph, drawn at the same size/baseline as the base glyph).
-BIGOP_DISPLAY_CPS = (0x2211, 0x222B, 0x220F, 0x2210, 0x22C3, 0x22C2, 0x2A06, 0x222E)
-BIGOP_PUA_BASE = 0xF000
-BIGOP_PUA = {cp: BIGOP_PUA_BASE + i for i, cp in enumerate(BIGOP_DISPLAY_CPS)}
-# Delimiter codepoints whose STRETCHED form is a MATH-table vertical size
-# variant (parenleft.v1..v7 etc.) — the glyph XeTeX/KaTeX draw for a \left/
-# \right delimiter. ztex emits every delimiter <text> at the BASE math size:
-# the layout sizes the delimiter from the MATH size-variant ladder by the
-# enclosed content's extent (TeX make_delim — see _delimiter_targets and
-# _delimiter_resolution), so the intended size is NOT in the SVG. The
-# rasterizer and the geometric verifier reconstruct it from the SVG geometry.
-# Private-use chars address the variants through PIL exactly like the big-op
-# .v1 glyphs (the patched font maps each PUA char to the variant glyph,
-# drawn at its own size).
+# Delimiter codepoints a STRETCHED \left..\right fence can be built from. The
+# ladder rung, the glyph assembly and the required cover are all already
+# baked into the emitted <path> outline, so nothing here resolves a size —
+# the pairing below only exists so the verifier can tell an intended wrap of
+# the enclosed content from a real ink collision.
 DELIMITER_CPS = (0x0028, 0x0029, 0x005B, 0x005D, 0x007B, 0x007D,
                  0x27E8, 0x27E9, 0x230A, 0x230B, 0x2308, 0x2309,
                  0x007C, 0x2223, 0x2016)
@@ -117,71 +114,7 @@ DELIM_PAIRS = {0x0028: 0x0029, 0x005B: 0x005D, 0x007B: 0x007D,
 DELIM_OPENERS = frozenset(DELIM_PAIRS)
 DELIM_CLOSERS = frozenset(DELIM_PAIRS.values())
 DELIM_OPENER_OF = {close: open_ for open_, close in DELIM_PAIRS.items()}
-# TeX make_delim (tex.web §1114): a \left..\right delimiter must cover
-# max(2·δ·901/1000, 2·δ − \delimitershortfall) of ink, where δ = max(h−a, d+a)
-# of the enclosed content box vs the math axis. \delimitershortfall is the
-# ABSOLUTE 5pt of plain TeX (not 0.1em — the src/layout/layout.zig floor uses
-# 0.1em and over-requires by ~1pt at 30pt: it would draw parenleft.v7 where
-# XeTeX draws .v6). Verified against the XeTeX references: `\left(
-# \frac{x^2+1}{x} \right)` at 30pt (content δ = 37.7pt) → floor 70.4pt →
-# parenleft.v6 (refs' ink 71.5pt), `\left( \frac{a}{b} \right)^2` (δ =
-# 28.4pt) → 51.8pt → .v4 (refs 53.6pt), the EL fraction at 40pt (δ = 45.7pt)
-# → 86.4pt → .v6, `\left( x+\frac{1}{2} \right)` (δ = 32.8pt) → 60.6pt →
-# .v5 (refs' measured variant).
-DELIM_MIN_COVER = 0.901
-DELIM_SHORTFALL_PT = 5.0
-AXIS_HEIGHT_EM = 0.25   # LM Math MATH-axis height (ztex GlueParams.axis_height 2.5/10pt)
-DELIM_PUA_BASE = 0xF100
-DELIM_PUA_SLOTS = 8   # address space per delimiter (slot k -> k-th MATH variant record)
-# \big-family fixed-level recovery (see _delimiter_targets): the layout
-# boxes \big/\Big/\bigg/\Bigg delimiters by their FIXED ladder entry at the
-# BASE size — the level is not in the SVG, so the rasterizer recovers it
-# from the box advance: the x-gap from the open delimiter to the first
-# enclosed content (the layout places the next atom flush at the box edge,
-# no inter-atom glue; a fraction/group adds its internal offset). A pair
-# whose content-driven req contradicts the measured gap is a fixed-level
-# pair. Tolerances in em of the delimiter size (scale with the size).
-DELIM_GAP_TOL_EM = 0.02        # box-advance match tolerance for the level
-DELIM_CONSISTENT_TOL_EM = 0.05  # content-driven variant box must match the gap
-# LM Math brace tip overhang (em of the formula size): how far a stretched
-# brace's tips extend beyond the required cover line (the math axis ∓ delta)
-# once the delimiter is sized to the enclosed array. XeTeX assembles an
-# arbitrary-tall brace from FIXED tip/mid pieces (U+23A7/23A8/23A9) plus
-# { extenders — the tips are drawn at the formula size and stick out a fixed
-# ~0.096em beyond the covered body, so the full extent is NOT capped by the
-# largest ladder entry. Calibrated from the XeTeX 3-row \cases reference
-# (brace extent 124.13pt vs 2·delta 118.38pt → 2·0.096em·30 overhang).
-DELIM_TIP_OVERHANG_EM = 0.096
 
-# Radical codepoints whose STRETCHED form is a MATH-table vertical variant
-# (radical.v1..v4 — NOT a Unicode character the browser can draw). ztex emits
-# the √ <text> at the current math size with data-radical="vN"; the rasterizer
-# and the geometric verifier resolve the variant the same way big-op .v1 and
-# delimiter variants resolve: a patched font maps a PUA char to the variant
-# glyph (radical.vN), drawn at the same size/baseline as the base √ — constant
-# stroke, tall ink, slim width.
-RADICAL_CPS = (0x221A,)  # √ \surd
-RADICAL_PUA_BASE = 0xF200                  # PUA slot for radical variants
-RADICAL_PUA = {i: RADICAL_PUA_BASE + i - 1 for i in range(1, 5)}  # v1..v4
-# Radical assembly pieces (layoutSqrt emits data-radical="v5/v6/v7" for
-# top/ext/bottom pieces). Each PUA maps to a specific LM Math glyph.
-RADICAL_PIECE_PUA = {
-    5: 0xF300,  # top piece → radical.tp
-    6: 0xF301,  # extender   → radical.ex
-    7: 0xF302,  # bottom piece → uni23B7
-}
-# Glyph name mapping for radical assembly pieces: verifier measures these
-# OTF glyph outlines instead of the base √ the browser shows.
-_RADICAL_PIECE_GLYPHS = {
-    5: "radical.tp",   # top hook
-    6: "radical.ex",   # extender (vertical bar)
-    7: "uni23B7",      # bottom foot + bar
-}
-
-
-def _delim_pua(cp, k):
-    """PUA char addressing the k-th (1-based) MATH size variant of a delimiter cp."""
-    return DELIM_PUA_BASE + DELIMITER_CPS.index(cp) * DELIM_PUA_SLOTS + k
 LIMITOP_NAMES = frozenset("""lim liminf limsup injlim projlim max min sup inf
 arg ker dim deg det Pr pr gcd hom exp ln log lg sin cos tan cot sec csc
 arcsin arccos arctan sinh cosh tanh coth""".split())
@@ -405,15 +338,38 @@ def _pt(v):
     return float(str(v).replace("pt", "").strip())
 
 
-def _parse_color(hexcolor):
-    """'#RRGGBB' or '#RRGGBBAA' -> RGB tuple (alpha composited over white)."""
+def _parse_rgba(hexcolor):
+    """'#RRGGBB' / '#RRGGBBAA' -> (r, g, b, a) with a in 0..255."""
     s = hexcolor.lstrip("#")
     if len(s) == 8:
         r, g, b, a = (int(s[i:i + 2], 16) for i in (0, 2, 4, 6))
-        return tuple(round(c * a / 255 + 255 * (255 - a) / 255) for c in (r, g, b))
+        return (r, g, b, a)
     if len(s) == 6:
-        return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
-    return (0, 0, 0)
+        return (*(int(s[i:i + 2], 16) for i in (0, 2, 4)), 255)
+    return (0, 0, 0, 255)
+
+
+def _parse_color(hexcolor):
+    """Fill as an opaque RGB tuple, alpha already composited over white.
+
+    Used for the primitives PIL draws into an RGB canvas in one step (<text>,
+    <rect>, <line>), where the canvas backdrop is the document's own
+    background rect. A <path> is composited with its real alpha instead
+    (see _fill_path), so a translucent run stays translucent over whatever
+    was painted before it."""
+    r, g, b, a = _parse_rgba(hexcolor)
+    return (round(c * a / 255 + 255 * (255 - a) / 255) for c in (r, g, b))
+
+
+def _is_private_use(ch):
+    """True for the layout's synthetic surd placeholders (U+F000..U+F8FF)."""
+    return len(ch) == 1 and 0xF000 <= ord(ch) <= 0xF8FF
+
+
+def _glyph_label(ch):
+    """Report label for one logical glyph: the character itself, or its code
+    point when the run names a private-use placeholder nothing can render."""
+    return f"U+{ord(ch):04X}" if _is_private_use(ch) else ch
 
 
 def _unescape(s):
@@ -424,8 +380,17 @@ def _unescape(s):
 def _parse_svg_primitives(svg):
     """(w_pt, h_pt, elements): the one SVG parse shared by the PIL rasterizer
     and the geometric verifier, so both see identical geometry. elements is a
-    list of (kind, attrs, content) in document order, kind ∈ text/rect/line
-    (text content XML-unescaped; rect/line content '').
+    list of (kind, attrs, content) in document order, kind ∈
+    text/path/rect/line.
+
+    A <path> carries no x/y: its geometry IS the absolute unitless `d` it
+    paints. The logical run it stands for is named by `data-text` (returned
+    as content, XML-unescaped) and anchored at the run's original baseline
+    `data-x`/`data-y`, which the parser normalizes into the same x/y keys a
+    <text> carries so rows, operators and limits see one coordinate system.
+    A radical can split into several paths; its pieces share data-x and
+    font-size and are grouped by _path_runs. Other glyphs use one path.
+    Unlabelled paths are painted decoration bands, not logical glyphs.
     """
     m = re.search(r"<svg\b[^>]*>", svg)
     if not m:
@@ -439,55 +404,206 @@ def _parse_svg_primitives(svg):
             w_pt, h_pt = float(vb[2]), float(vb[3])
     elements = []
     for el in re.finditer(
-            r"<(text|rect|line)\b([^>]*?)(/?)>(.*?)</\1>|<(text|rect|line)\b([^>]*?)/>",
+            r"<(text|path|rect|line)\b([^>]*?)(/?)>(.*?)</\1>|<(text|path|rect|line)\b([^>]*?)/>",
             svg, re.S):
         if el.group(1):
             kind, attrs_raw, content = el.group(1), el.group(2), el.group(4)
         else:
             kind, attrs_raw, content = el.group(5), el.group(6), ""
-        elements.append((kind, _svg_attrs(attrs_raw),
-                         _unescape(content) if kind == "text" else ""))
+        attrs = _svg_attrs(attrs_raw)
+        if kind in ("text", "path"):
+            content = _unescape(content) if kind == "text" else attrs.get("data-text", "")
+        if kind == "path":
+            # The painted outline needs no anchor; the logical run does.
+            attrs["x"] = attrs.get("data-x", "0")
+            attrs["y"] = attrs.get("data-y", "0")
+        elements.append((kind, attrs, content))
     return w_pt, h_pt, elements
 
 
-def _base_math_size(elements):
-    """Largest font-size among glyphs that are never stretched — everything
-    except delimiters, which the layout now emits at the base size too. The
-    em base for MATH-variant sizing; None when there are no such glyphs."""
-    base = None
-    for kind, a, content in elements:
-        if kind != "text" or (len(content) == 1 and ord(content) in DELIMITER_CPS):
+
+class _FlattenPen(BasePen):
+    """Segment pen that turns a path's curves into chords within a tolerance.
+
+    A quadratic's chord error after n segments is the control point's distance
+    from the chord midpoint over 2n², so n follows directly from the tolerance
+    and the drawn edge stays within PATH_FLATTEN_TOL_PT of the curve. The
+    flattened points stay in the path's own coordinates; the filler scales
+    them once, so a path is walked at the resolution it is painted at."""
+
+    def __init__(self, tol):
+        super().__init__(None)
+        self.tol = tol
+        self.contours = []
+        self._cur = []
+
+    def _flush(self):
+        if len(self._cur) > 2:
+            self.contours.append(self._cur)
+        self._cur = []
+
+    def moveTo(self, pt):
+        self._flush()
+        self._cur = [pt]
+
+    def lineTo(self, pt):
+        self._cur.append(pt)
+
+    def closePath(self):
+        self._flush()
+
+    def endPath(self):
+        self._flush()
+
+    def _qCurveToOne(self, p1, p2):
+        p0 = self._cur[-1]
+        dev = math.hypot(p1[0] - (p0[0] + p2[0]) / 2.0, p1[1] - (p0[1] + p2[1]) / 2.0)
+        n = max(1, min(256, int(math.ceil(math.sqrt(dev / (2.0 * self.tol))))))
+        for i in range(1, n + 1):
+            t = i / n
+            u = 1.0 - t
+            self._cur.append((u * u * p0[0] + 2 * u * t * p1[0] + t * t * p2[0],
+                              u * u * p0[1] + 2 * u * t * p1[1] + t * t * p2[1]))
+
+    def _curveToOne(self, p1, p2, p3):
+        p0 = self._cur[-1]
+        dev = (math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+               + math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+               + math.hypot(p3[0] - p2[0], p3[1] - p2[1]))
+        n = max(1, min(256, int(math.ceil(math.sqrt(dev * 3.0 / (4.0 * self.tol))))))
+        for i in range(1, n + 1):
+            t = i / n
+            u = 1.0 - t
+            self._cur.append((
+                u * u * u * p0[0] + 3 * u * u * t * p1[0] + 3 * u * t * t * p2[0] + t * t * t * p3[0],
+                u * u * u * p0[1] + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + t * t * t * p3[1]))
+
+    def arcTo(self, *_args):
+        raise ValueError("path uses an elliptical arc; ztex emits M/L/Q/Z outlines only")
+
+
+def _path_contours(d, tol=PATH_FLATTEN_TOL_PT):
+    """Flatten a path's `d` into closed polylines in the path's own units."""
+    pen = _FlattenPen(tol)
+    parse_path(d, pen)
+    pen.endPath()   # a path that does not end in Z leaves its last contour open
+    return pen.contours
+
+
+def _path_bounds(d):
+    """Exact ink box (x0, y0, x1, y1) of a path's `d`, or None when it is empty.
+
+    BoundsPen walks the real Bézier extrema, so a stem whose control points
+    overshoot contributes its painted extent, not its control box. The path
+    is already in document pt, so the box needs no origin or size."""
+    pen = BoundsPen(None)
+    parse_path(d, pen)
+    return pen.bounds
+
+
+def _fill_path(img, d, rgba, scale):
+    """Fill one <path> onto the RGB canvas in nonzero winding, in painter order.
+
+    Nonzero winding is what keeps a glyph's counters (the hole in an 'o', the
+    enclosed space of a curly brace) open: a contour wound against the one
+    around it cancels, and PIL's polygon filler would not. Coverage is exact
+    per span — a span's overlap with each pixel column is measured, not
+    rounded — and the run's alpha scales the mask, so a translucent outline
+    composites over what was already painted exactly as the document's
+    painter order declares.
+    """
+    w, h = img.size
+    edges = []
+    for contour in _path_contours(d):
+        n = len(contour)
+        for i in range(n):
+            (x0, y0), (x1, y1) = contour[i], contour[(i + 1) % n]
+            x0, y0, x1, y1 = x0 * scale, y0 * scale, x1 * scale, y1 * scale
+            if y0 == y1:
+                continue      # horizontal edge: no crossing to count
+            if y0 < y1:
+                edges.append((y0, y1, x0, (x1 - x0) / (y1 - y0), 1))
+            else:
+                edges.append((y1, y0, x1, (x0 - x1) / (y0 - y1), -1))
+    if not edges:
+        return
+    r0 = max(0, int(math.floor(min(e[0] for e in edges))))
+    r1 = min(h - 1, int(math.ceil(max(e[1] for e in edges))))
+    if r1 < r0:
+        return
+    c0 = max(0, int(math.floor(min(min(e[2], e[2] + (e[1] - e[0]) * e[3]) for e in edges))))
+    c1 = min(w - 1, int(math.ceil(max(max(e[2], e[2] + (e[1] - e[0]) * e[3]) for e in edges))))
+    if c1 < c0:
+        return
+    # Bucket the edges by the pixel rows they cross, so a row only tests the
+    # handful of edges that can reach it instead of every edge in the glyph.
+    buckets = [[] for _ in range(r1 - r0 + 1)]
+    for e in edges:
+        for row in range(max(r0, int(math.floor(e[0]))),
+                         min(r1, int(math.ceil(e[1]))) + 1):
+            buckets[row - r0].append(e)
+    inv = 1.0 / PATH_SUB_SCANLINES
+    mw = c1 - c0 + 1
+    alpha = rgba[3]
+    data = bytearray(mw * (r1 - r0 + 1))
+    for row, bucket in enumerate(buckets):
+        if not bucket:
             continue
-        s = _pt(a.get("font-size", "0"))
-        if base is None or s > base:
-            base = s
-    return base
-
-
-def _display_bigop(attrs):
-    """True when this <text> is a DISPLAY big-op — the MATH-table .v1
-    variant (what XeTeX draws for a display operator).
-
-    The layout (layoutOp) marks display big-ops `data-op="v1"` in the SVG
-    (the box's bigop_form.variant); text/script big-ops are unmarked and
-    draw the CMAP base glyph at their declared size. The marker replaces
-    the old font-size discriminator (`declared size == the pane's base math
-    size`): since the text-op size fix BOTH the display and text \\int are
-    declared at the pane's base size, so the declared size can no longer
-    tell them apart."""
-    return attrs.get("data-op") == "v1"
+        y = r0 + row
+        row_cov = [0.0] * mw
+        for k in range(PATH_SUB_SCANLINES):
+            sy = y + (k + 0.5) * inv
+            xs = sorted((ex + (sy - ey0) * slope, wind)
+                        for ey0, ey1, ex, slope, wind in bucket if ey0 <= sy < ey1)
+            winding = 0
+            for i in range(len(xs) - 1):
+                winding += xs[i][1]
+                if winding == 0:
+                    continue
+                xa = max(xs[i][0], float(c0))
+                xb = min(xs[i + 1][0], float(c1 + 1))
+                if xb <= xa:
+                    continue
+                # Split the span across the columns it crosses and add each
+                # column's exact covered length — the difference array a
+                # rasterizer normally uses cannot express a span that ends on
+                # a column boundary, which is most of them.
+                pa, pb = int(xa), min(int(xb), c1)
+                if pa == pb:
+                    row_cov[pa - c0] += (xb - xa) * inv
+                    continue
+                row_cov[pa - c0] += (pa + 1 - xa) * inv
+                for px in range(pa + 1, pb):
+                    row_cov[px - c0] += inv
+                if xb > pb:
+                    row_cov[pb - c0] += (xb - pb) * inv
+        base = row * mw
+        for i in range(mw):
+            data[base + i] = min(255, max(0, int(row_cov[i] * alpha + 0.5)))
+    mask = Image.frombytes("L", (mw, r1 - r0 + 1), bytes(data))
+    img.paste(rgba[:3], (c0, r0), mask)
 
 
 def rasterize_svg(svg_path, png_path, font_dir=DEFAULT_FONT_DIR, scale=1.0):
-    r"""Faithful PIL raster of a ztex SVG at 96 dpi × scale (1pt = 4/3 px).
+    r"""PIL raster of a ztex SVG at 96 dpi × scale (1pt = 4/3 px), from the
+    document itself.
 
-    ztex emits one <text> per char/run with its BASELINE at y, in pt, naming
-    the Latin Modern faces. Each glyph is drawn with the actual OTF at the
-    declared font-size (anchor "ls" = left-baseline, so the baseline lands on
-    y); fraction bars and stroked decorations (<rect>/<line>) are drawn in
-    painter order too. The result is a true picture of the SVG geometry —
-    unlike resvg/rsvg/ImageMagick on this host, which fall back to wrong
-    fonts and overflow the frame. Deterministic: same SVG + fonts -> same PNG.
+    A <path> is the geometry ztex boxed: an absolute unitless `d` in the same
+    coordinate space as every other primitive. It is filled exactly as
+    declared — nonzero winding, the run's own fill alpha, document painter
+    order — so a tall radical, a display big operator and a stretched fence
+    are painted as the outline the SVG carries, holes and all. Nothing about
+    them is re-derived from a font table or from the space around them, so an
+    error in an emitted outline shows up in the PNG instead of being
+    reconstructed away.
+
+    A <text> run carries its BASELINE at y, in pt, and names the Latin Modern
+    face, so it is drawn with the actual OTF at the declared font-size (anchor
+    "ls" = left-baseline, so the baseline lands on y). Fraction bars and
+    stroked decorations (<rect>/<line>) are drawn in painter order too.
+    PIL draws those runs because resvg/rsvg/ImageMagick break ztex <text> on
+    this host: they fall back to the wrong font and overflow the frame.
+    Deterministic: same SVG + fonts -> same PNG.
 
     The raster is SUPERSAMPLED at 2x (8/3 px/pt) and LANCZOS-downscaled to
     the final 4/3 px/pt: PIL's direct glyph rasterization at 48pt+ looks
@@ -523,142 +639,26 @@ def rasterize_svg(svg_path, png_path, font_dir=DEFAULT_FONT_DIR, scale=1.0):
     dh = h_px * RASTER_SUPERSAMPLE
     img = Image.new("RGB", (dw, dh), "white")
     draw = ImageDraw.Draw(img)
-    # Base math size + which delimiters the layout STRETCHED (their required
-    # ink derived from the enclosed content — see _delimiter_targets). Every
-    # \left..\right delimiter <text> is at the base size, so the intended
-    # MATH variant is resolved from the geometry, not the font-size.
-    base_size = _base_math_size(elements)
-    delim_targets, _spans = _delimiter_targets(elements, w_pt, h_pt, font_dir, base_size)
+    # One pt -> one supersampled pixel: the single factor every primitive is
+    # placed with, so a path's `d` and a glyph's baseline share one space.
+    k = PT_TO_PX * ss
     for kind, a, content in elements:
-        fill = _parse_color(a.get("fill", "#000000"))
         if kind == "text":
-            size_pt = _pt(a.get("font-size", "0"))
-            x_pt, y_pt = _pt(a.get("x", "0")), _pt(a.get("y", "0"))
-            pua = (BIGOP_PUA.get(ord(content))
-                   if len(content) == 1 and _display_bigop(a)
-                   else None)
-            if pua is not None:
-                # DISPLAY big-op (data-op="v1"): draw the MATH-table .v1
-                # display variant (the glyph XeTeX draws) instead of the
-                # cmap base glyph the SVG/browser shows: the patched font
-                # maps the private-use char to the .v1 glyph, rasterized at
-                # the same size and baseline. Unmarked big-ops (text/script
-                # style) fall through and draw the CMAP BASE glyph at their
-                # declared size — the smaller form all other engines use.
-                font = _variant_font(find_lm_font(_lm_font_name(a), font_dir),
-                                     size_pt * PT_TO_PX * ss)
-                content = chr(pua)
-            elif len(content) == 1 and a.get("data-radical"):
-                # Stretchy √ glyph. data-radical="vN" where N = 1..4 selects
-                # a pre-built MATH-table vertical variant (radical.v1..v4);
-                # N = 5..7 selects an assembly piece (top/ext/bottom) drawn
-                # at the same size and baseline. The patched font maps PUA
-                # codepoints to the correct LM Math glyph so the raster draws
-                # XeTeX's shape, not the base √ the browser shows.
-                vi = int(a["data-radical"][1:])
-                if vi in RADICAL_PIECE_PUA:
-                    pua = RADICAL_PIECE_PUA[vi]
-                else:
-                    pua = RADICAL_PUA.get(vi)
-                if pua is not None:
-                    font = _variant_font(find_lm_font(_lm_font_name(a), font_dir),
-                                         size_pt * PT_TO_PX * ss)
-                    content = chr(pua)
-            elif len(content) == 1 and a.get("data-delim-form"):
-                # A \left/\right delimiter sized by content (TeX make_delim,
-                # layoutDelimChar): the layout picked the SMALLEST MATH-table
-                # variant whose asc+desc ink covered the inner box's extent
-                # and tagged it as the 1..7 ladder index. The patched font
-                # maps the PUA char to the same variant glyph the layout
-                # boxed (constant stroke at any size — drawing the BASE
-                # glyph at the declared size would not stretch to cover the
-                # content; scaling it would thicken the stroke). The variant
-                # is drawn at the BASE math size (same as the SVG font-size
-                # — the variant glyph's own hmtx × size gives the box width
-                # the layout reserved).
-                vi = int(a["data-delim-form"][1:])
-                cp_i = ord(content)
-                # The content EXCEEDS the largest MATH-table variant (a 4-row
-                # pmatrix at 20pt needs ~4em > parenleft.v7's 2.99em): the
-                # layout boxed the delimiter by the largest variant (its
-                # width for the following atoms) and carried the exact
-                # required height in data-delim-req. Assemble the XeTeX
-                # GlyphAssembly (top + N extenders + bottom) to that height
-                # — constant stroke, covers the content — instead of drawing
-                # v7, which would be too short.
-                if a.get("data-delim-req") and cp_i in DELIMITER_CPS:
-                    need_pt = float(a["data-delim-req"]) * size_pt
-                    plan = _delimiter_piece_plan(
-                        find_lm_font(_lm_font_name(a), font_dir),
-                        cp_i, size_pt, need_pt)
-                    if plan is not None:
-                        font = _variant_font(find_lm_font(_lm_font_name(a), font_dir),
-                                             size_pt * PT_TO_PX * ss)
-                        for _cp_i, _gname, dy in plan["pieces"]:
-                            draw.text(((x_pt) * PT_TO_PX * ss,
-                                       (y_pt + dy) * PT_TO_PX * ss),
-                                      chr(_cp_i), font=font, fill=fill,
-                                      anchor="ls")
-                        content = ""   # the pieces are drawn; skip the base char
-                        continue
-                if cp_i in DELIMITER_CPS and 1 <= vi <= 7:
-                    pua = _delim_pua(cp_i, vi)
-                    font = _variant_font(find_lm_font(_lm_font_name(a), font_dir),
-                                         size_pt * PT_TO_PX * ss)
-                    content = chr(pua)
-                else:
-                    font = _face_for(a, font_dir, size_pt * PT_TO_PX * ss)
-            elif len(content) == 1 and (x_pt, y_pt, content) in delim_targets:
-                # Stretched delimiter: draw the MATH size VARIANT (constant
-                # stroke). Paired \left..\right delimiters draw at the declared
-                # (base) size; unpaired fences and \big-family levels resolve
-                # their own size — the resolution returns the variant, its draw
-                # size and the baseline shift aligning the variant's ink center
-                # with the base glyph's (both on the MATH axis — shift ≈ 0
-                # for LM Math).
-                spec = delim_targets[(x_pt, y_pt, content)]
-                if spec.get("mode") == "pieces":
-                    # An UNPAIRED cases brace beyond the largest MATH variant:
-                    # draw the GlyphAssembly PIECES (⎧ + N extenders + ⎨ + N
-                    # extenders + ⎩, XeTeX's make_delim assembly) at the base
-                    # size — constant stroke, narrow ink — instead of scaling
-                    # the tallest variant (which thickened the stroke and
-                    # widened the ink ~2.3x). The plan's svg_y offsets are
-                    # relative to this delimiter's baseline. The patched
-                    # font carries the extender glyphs (PUA), the hooks are
-                    # the real U+23A7..U+23A9 cmap chars.
-                    font = _variant_font(find_lm_font(_lm_font_name(a), font_dir),
-                                         size_pt * PT_TO_PX * ss)
-                    for cp_i, _gname, dy in spec["plan"]["pieces"]:
-                        draw.text(((x_pt) * PT_TO_PX * ss,
-                                   (y_pt + dy) * PT_TO_PX * ss),
-                                  chr(cp_i), font=font, fill=fill, anchor="ls")
-                    content = ""   # the pieces are drawn; skip the base char
-                else:
-                    res = _delimiter_resolution(find_lm_font(_lm_font_name(a), font_dir),
-                                                ord(content), size_pt, spec)
-                    if res is not None:
-                        pua, _gname, size_v_pt, shift_pt = res
-                        font = _variant_font(find_lm_font(_lm_font_name(a), font_dir),
-                                             size_v_pt * PT_TO_PX * ss)
-                        content = chr(pua)
-                        y_pt += shift_pt
-                    else:
-                        font = _face_for(a, font_dir, size_pt * PT_TO_PX * ss)
-            else:
-                font = _face_for(a, font_dir, size_pt * PT_TO_PX * ss)
-            draw.text((x_pt * PT_TO_PX * ss, y_pt * PT_TO_PX * ss),
-                      content, font=font, fill=fill, anchor="ls")
+            draw.text((_pt(a.get("x", "0")) * k, _pt(a.get("y", "0")) * k), content,
+                      font=_face_for(a, font_dir, _pt(a.get("font-size", "0")) * k),
+                      fill=tuple(_parse_color(a.get("fill", "#000000"))), anchor="ls")
+        elif kind == "path":
+            _fill_path(img, a["d"], _parse_rgba(a.get("fill", "#000000")), k)
         elif kind == "rect":
-            x = _pt(a.get("x", "0")) * PT_TO_PX * ss
-            y = _pt(a.get("y", "0")) * PT_TO_PX * ss
-            w = _pt(a["width"]) * PT_TO_PX * ss
-            h = _pt(a["height"]) * PT_TO_PX * ss
-            draw.rectangle((x, y, x + w, y + h), fill=fill)
+            x = _pt(a.get("x", "0")) * k
+            y = _pt(a.get("y", "0")) * k
+            w = _pt(a["width"]) * k
+            h = _pt(a["height"]) * k
+            draw.rectangle((x, y, x + w, y + h), fill=tuple(_parse_color(a.get("fill", "#000000"))))
         else:  # line — stroked decoration
-            width = max(1, int(round(_pt(a.get("stroke-width", "1")) * PT_TO_PX * ss)))
-            draw.line([_pt(a[k]) * PT_TO_PX * ss for k in ("x1", "y1", "x2", "y2")],
-                      fill=fill, width=width)
+            width = max(1, int(round(_pt(a.get("stroke-width", "1")) * k)))
+            draw.line([_pt(a[n]) * k for n in ("x1", "y1", "x2", "y2")],
+                      fill=tuple(_parse_color(a.get("stroke", "#000000"))), width=width)
     if dw != w_px or dh != h_px:
         img = img.resize((w_px, h_px), Image.LANCZOS)
     img.save(png_path)
@@ -865,746 +865,20 @@ def _bigop_variant_glyph(tt, cp):
     return None
 
 
-def _delimiter_variants(tt, cp):
-    """Ordered MATH-table vertical size variants (v1.., base excluded) of a
-    delimiter codepoint, or the conventional '<base>.v1', '<base>.v2', ...
-    names when the font has no MATH table. Empty list when the codepoint has
-    no base glyph / no variants (the caller then draws the base glyph).
-    """
-    cmap = tt.getBestCmap()
-    base = cmap.get(cp)
-    if base is None:
-        return []
-    records = []
-    math = tt.get("MATH")
-    if math is not None:
-        mv = math.table.MathVariants
-        try:
-            names = list(mv.VertGlyphCoverage.glyphs)
-        except AttributeError:
-            names = [c.glyphName for c in mv.VertGlyphCoverage]
-        for name, gc in zip(names, mv.VertGlyphConstruction):
-            if name == base and gc.MathGlyphVariantRecord:
-                records = [r.VariantGlyph for r in gc.MathGlyphVariantRecord]
-                break
-    if not records:
-        order = set(tt.getGlyphOrder())
-        i = 1
-        while f"{base}.v{i}" in order:
-            records.append(f"{base}.v{i}")
-            i += 1
-    return [g for g in records if g != base]
 
-
-_ink_em_cache = {}   # (path, glyph_name) -> (ink_height_em, ink_center_em)
-
-
-def _glyph_ink_em(tt, path, gname):
-    """(ink_height_em, ink_center_em) of a glyph from its real OTF outline.
-
-    ink_center_em is the ink-center height ABOVE the baseline (font y up).
-    Glyphs with no ink yield (0.0, 0.0).
-    """
-    key = (path, gname)
-    v = _ink_em_cache.get(key)
-    if v is None:
-        pen = BoundsPen(tt.getGlyphSet())
-        try:
-            tt.getGlyphSet()[gname].draw(pen)
-        except Exception:  # noqa: BLE001 — defensive: treat as no ink
-            v = (0.0, 0.0)
-        else:
-            if not pen.bounds:
-                v = (0.0, 0.0)
-            else:
-                x0, y0, x1, y1 = pen.bounds
-                upem = tt["head"].unitsPerEm
-                v = ((y1 - y0) / upem, (y1 + y0) / 2.0 / upem)
-        _ink_em_cache[key] = v
-    return v
-
-
-_hmtx_advance_cache = {}   # (path, glyph_name) -> advance in em
-
-
-def _hmtx_advance(path, gname):
-    """Horizontal advance (em) of a glyph from the font's hmtx table."""
-    key = (path, gname)
-    v = _hmtx_advance_cache.get(key)
-    if v is None:
-        tt = _tt_font(path)
-        upem = tt["head"].unitsPerEm
-        m = tt["hmtx"].metrics.get(gname)
-        v = (m[0] / upem) if m else 0.0
-        _hmtx_advance_cache[key] = v
-    return v
-
-
-def _delimiter_targets(elements, w_pt, h_pt, font_dir, base_size):
-    r"""(x, y, content) of STRETCHED delimiters -> resolution spec.
-
-    The layout sizes a \left..\right delimiter from the MATH size-variant
-    ladder by the enclosed content's extent, and emits every delimiter
-    <text> at the BASE math size — the intended size is NOT in the SVG.
-    Reconstruct the layout's TeX make_delim floor (tex.web §1114, the same
-    formula src/layout/layout.zig layoutLeftRight runs) from the SVG
-    geometry: pair each delimiter <text> with its matching partner (stack
-    over x-sorted delimiters, honoring TeX nesting), union the ink boxes of
-    the OTHER elements horizontally between the pair (the enclosed content;
-    big-op display variants resolved like the raster draws them), and compute
-    δ = max(h − a, d + a) where h/d are the content extent above/below the
-    delimiter baseline and a = axis height (0.25em). The required ink is
-    max(2·δ·901/1000, 2·δ − \delimitershortfall) with \delimitershortfall =
-    5pt absolute (plain TeX; see DELIM_SHORTFALL_PT): a delimiter is
-    STRETCHED when that floor exceeds its base glyph's ink, and the returned
-    value (em of the delimiter size) is the minimum variant ink the
-    resolution must cover.
-    The keys (x, y, content) come from the <text> attributes, so the
-    rasterizer and the geometric verifier resolve the SAME delimiters.
-
-    FOUR stretched forms are resolved (the spec's "mode" selects the rule
-    in _delimiter_resolution):
-
-    · "pair" — \left..\right with both delimiters present (the current
-      behavior): req = the make_delim floor in em of the delimiter size;
-      the variant is drawn at the declared (base) size.
-
-    · "scaled" — an UNPAIRED \left/\right fence whose partner is a null
-      delimiter (\left. / \right.): the layout (layoutDelimScaled) emits
-      the base glyph at the font-size whose axis-centered ink covers the
-      enclosed content exactly (the SVG's declared font-size IS the scaled
-      size, > the base math size). The target is the base glyph's OWN ink
-      at the declared size; req = target in em of the BASE size; the
-      variant is drawn at target / variant_ink (its "own" size), so the
-      stroke stays constant — drawing the scaled base glyph would thicken
-      it (the "bold brace" defect).
-
-    · "level" — a \big/\Big/\bigg/\Bigg pair: the layout boxes the FIXED
-      ladder entry at the base size (the level lives only in the parse, not
-      the SVG), so the content-driven req is the wrong signal. The raster
-      recovers the level from the box advance — the x-gap from the open
-      delimiter to the first enclosed content (flush at the box edge; the
-      layout places no inter-atom glue) — matched against the variant
-      ladder advances. Fires only when the content-driven resolution
-      contradicts the measured gap (a \left pair's box always agrees).
-    · "level" also covers an UNPAIRED OPENING delimiter emitted at the BASE
-      size with no matching close in the SVG — the amsmath \cases brace. The
-      layout (layoutDelimChar) chose the smallest MATH variant whose ink
-      covers the enclosed rows and flushed the array at that variant's
-      advance, so the x-gap from the opener to its first enclosed cell IS the
-      variant's advance; the level is recovered from that gap and the variant
-      is drawn at the declared (base) size (constant stroke, filling the
-      layout's box). (A \left\{...\right. is emitted by layoutDelimSized as a
-      SCALED glyph and uses the "scaled" form above.)
-
-    Delimiters with no partner at the base size, no enclosed content, or
-    whose base glyph already covers the floor stay out of the map (drawn as
-    the base glyph).
-
-    Returns (targets, spans): targets maps each stretched delimiter key to
-    {"req": float, "mode": "pair"|"scaled"|"level", "level": int|None,
-    "base": float|None}; spans lists each stretched pair as {"open",
-    "close" (the two keys), "lo", "hi"} — the horizontal ink span the pair
-    encloses, for the verifier's intended-wrap exclusions.
-    """
-    delims, others, others_x = [], [], []
-    # Parallel to `others`: the <text> font-size (0 for rect/line boxes) and
-    # BASELINE y (the <text> y; None for rect/line boxes). The paired-fence
-    # extent uses them to tell a fenced fraction's parts (baselines ~0.68em
-    # off the delimiter line, scripts at SCRIPT size) apart from sibling
-    # array rows (row-spacing off the line, base size) — see the row_tol
-    # block below. The unpaired sections read only others/others_x.
-    others_size, others_base = [], []
-    for kind, a, content in elements:
-        if kind != "text":
-            if kind == "rect":
-                x, y = _pt(a.get("x", "0")), _pt(a.get("y", "0"))
-                box = (x, y, x + _pt(a["width"]), y + _pt(a["height"]))
-                if not (box[2] >= 0.95 * w_pt and box[3] >= 0.95 * h_pt):
-                    others.append(box)
-                    others_x.append(x)
-                    others_size.append(0.0)
-                    others_base.append(None)
-            else:
-                sw = _pt(a.get("stroke-width", "1")) / 2.0
-                x1, y1 = _pt(a.get("x1", "0")), _pt(a.get("y1", "0"))
-                x2, y2 = _pt(a.get("x2", "0")), _pt(a.get("y2", "0"))
-                others.append((min(x1, x2) - sw, min(y1, y2) - sw,
-                               max(x1, x2) + sw, max(y1, y2) + sw))
-                others_x.append(min(x1, x2))
-                others_size.append(0.0)
-                others_base.append(None)
-            continue
-        single = len(content) == 1 and ord(content) in DELIMITER_CPS
-        # Delimiter <text>s are boxed as the BASE glyph at the declared size
-        # (never resolved here); every char ink also goes into `others`, so a
-        # nested pair's delimiters count toward its enclosing pair's extent.
-        # Big-op display variants inside resolve from the element's own
-        # data-op marker (the raster draws them that way).
-        boxes = _glyph_ink_boxes(a, content, font_dir)
-        if single:
-            delims.append({"x": _pt(a.get("x", "0")), "y": _pt(a.get("y", "0")),
-                           "cp": ord(content), "size": _pt(a.get("font-size", "0")),
-                           "box": boxes[0],
-                           "fixed_req": float(a["data-fixed-req"])
-                           if a.get("data-fixed-req") else 0.0})
-        for b in boxes:
-            if b:
-                others.append(b)
-                others_x.append(_pt(a.get("x", "0")))
-                others_size.append(_pt(a.get("font-size", "0")))
-                others_base.append(_pt(a.get("y", "0")))
-    stack, pairs = [], []
-    cur_y = None
-    for d in sorted(delims, key=lambda d: (round(d["y"]), d["x"])):
-        ry = round(d["y"])
-        if cur_y is None or ry != cur_y:
-            stack = []   # delimiters never pair across baselines (array rows)
-            cur_y = ry
-        if d["cp"] in DELIM_CLOSERS:
-            found = False
-            for i in range(len(stack) - 1, -1, -1):
-                if (stack[i]["cp"] == DELIM_OPENER_OF[d["cp"]] and
-                        stack[i]["x"] < d["x"]):
-                    pairs.append((stack.pop(i), d))
-                    found = True
-                    break
-            if not found and d["cp"] in DELIM_OPENERS:
-                stack.append(d)
-        elif d["cp"] in DELIM_OPENERS:
-            stack.append(d)
-    matched = set()
-    targets = {}
-    spans = []
-    for o, c in pairs:
-        if not o["box"] or not c["box"] or o["size"] <= 0:
-            continue
-        matched.add((o["x"], o["y"], chr(o["cp"])))
-        matched.add((c["x"], c["y"], chr(c["cp"])))
-        lo, hi = o["box"][2], c["box"][0]
-        # Enclosed content is the ink between the delimiters ON THE SAME
-        # baseline. The x filter alone pulls sibling-array-row glyphs (other
-        # rows share the parens' x), inflating the extent to the whole array
-        # and drawing parenleft.v7 (~3x) instead of the base paren. Only count
-        # boxes whose vertical center sits within ~0.6em of the delimiter line.
-        row_tol = 0.60 * o["size"]
-        inside = [b for b in others if lo < (b[0] + b[2]) / 2.0 < hi
-                  and abs((b[1] + b[3]) / 2.0 - o["y"]) < row_tol]
-        axis = AXIS_HEIGHT_EM * o["size"]
-        # A fence around a FRACTION: the layout centers a \frac on the math
-        # axis and emits its rule as a thin <rect> exactly ON the axis (the
-        # row baseline minus 0.25em). TeX sizes the fence from the fraction's
-        # FULL box — numerator ABOVE the axis + denominator below — but the
-        # display numerator's baseline sits ~0.68em above the delimiter line
-        # (num_up + axis) and its scripts higher, so the row_tol filter clips
-        # them and the fence resolves one rung short (parenleft.v5 instead of
-        # the refs' v6 for `\left( \frac{x^2+1}{x} \right)`; the numerator is
-        # the tail that makes the required ink). When the fence row carries a
-        # fraction rule, extend the extent to the fraction's parts: the part
-        # BASELINES (the <text> y) lie within ~0.75em of the delimiter line
-        # (display num_up + axis ≈ 0.68em, text-style ≈ 0.53em, script-style
-        # ≈ 0.64em), and the parts' scripts are drawn at SCRIPT size (< the
-        # delimiter's font-size) within ~1.35em (the raised superscript).
-        # Sibling ARRAY rows stay excluded — they sit at the row spacing
-        # (≥0.61em even for a tight matrix, 1.2em for \pmod's 4-row array) at
-        # the BASE size and their fraction rules would sit off THIS row's
-        # axis — the giant-paren guard: a fence in one array/cases row must
-        # not absorb sibling rows' glyphs (that is why row_tol exists).
-        frac_tol = 0.75 * o["size"]
-        # Rule-anchored fence extension: collect every rule inside the pair
-        # that's thin (h ≤ 0.15*size, w ≥ 2h) and centered on the pair's
-        # axis ±0.05em. Extending based on rules (not a boolean) bounds the
-        # absorbed content to fractions whose bar sits on THIS fence's axis
-        # — sibling ARRAY rows (fractions at different axis offsets) stay
-        # excluded.
-        qualifying_rules = [b for b, osz in zip(others, others_size)
-                            if osz == 0 and lo < (b[0] + b[2]) / 2.0 < hi
-                            and (b[3] - b[1]) <= 0.15 * o["size"]
-                            and (b[2] - b[0]) >= 2.0 * (b[3] - b[1])
-                            and abs((b[1] + b[3]) / 2.0
-                                    - (o["y"] - axis)) <= 0.05 * o["size"]]
-        if qualifying_rules:
-            rule_centers = [(b[1] + b[3]) / 2.0 for b in qualifying_rules]
-            script_tol = 1.35 * o["size"]
-            for b, base_y, osz in zip(others, others_base, others_size):
-                if not (lo < (b[0] + b[2]) / 2.0 < hi) or base_y is None:
-                    continue
-                anchored = any(abs(base_y - rc) < frac_tol
-                              for rc in rule_centers)
-                within_pair = abs(base_y - o["y"]) < frac_tol
-                # Include script-sized boxes near the fraction bar
-                script_near = (osz > 0 and osz < o["size"]
-                               and any(abs(base_y - rc) < script_tol
-                                       for rc in rule_centers))
-                if anchored or within_pair or script_near:
-                    inside.append(b)
-        extent = _union(inside)
-        if not extent:
-            continue
-        delta = max(o["y"] - axis - extent[1], extent[3] - o["y"] + axis)
-        minh = max(2.0 * delta * DELIM_MIN_COVER,
-                   2.0 * delta - DELIM_SHORTFALL_PT)
-        req_em = minh / o["size"]
-        # amsmath FIXED fraction-delimiter rule (fenced `\binom`/`\genfrac`,
-        # the SVG data-fixed-req marker): the layout boxed these delimiters
-        # by a style-driven fixed req (binomialDelimReqEm), independent of
-        # the content — the ink-derived req undershoots it (the row_tol clips
-        # a stacked `\binom`'s numerator, and the fixed rule is taller than
-        # the ink floor at display). Use the layout's exact req so both the
-        # box and the drawn glyph land on the same variant.
-        if o.get("fixed_req", 0.0) > 0 or c.get("fixed_req", 0.0) > 0:
-            req_em = max(o.get("fixed_req", 0.0), c.get("fixed_req", 0.0))
-        ok = (o["x"], o["y"], chr(o["cp"]))
-        ck = (c["x"], c["y"], chr(c["cp"]))
-        spec = {"req": req_em, "mode": "pair", "level": None, "base": None}
-        # Fixed-level (\big family) recovery: the pair's box advance is the
-        # x-gap from the open delimiter to the first enclosed content (the
-        # layout puts the next atom flush at the box edge). A content-driven
-        # \left pair's box agrees with its variant's advance; a \big pair's
-        # box is the FIXED ladder entry, which contradicts the content-driven
-        # variant — the box wins, and the level is the ladder entry whose
-        # advance matches the gap.
-        if base_size is not None and o["size"] <= base_size + 1e-6:
-            first_x = min((x0 for b, x0 in zip(others, others_x)
-                           if lo < (b[0] + b[2]) / 2.0 < hi), default=None)
-            gap = (first_x - o["x"]) if first_x is not None else None
-            path = find_lm_font(LM_MATH_FONT, font_dir)
-            res = _delimiter_resolution(path, o["cp"], o["size"], spec)
-            consistent = res is not None and gap is not None and (
-                abs(gap - _hmtx_advance(path, res[1]) * o["size"])
-                <= DELIM_CONSISTENT_TOL_EM * o["size"])
-            if not consistent and gap is not None and res is not None:
-                tt = _tt_font(path)
-                variants = _delimiter_variants(tt, o["cp"])
-                best_k, best_err = None, None
-                for k, gname in enumerate(variants):  # k -> ladder level k+1
-                    adv = _hmtx_advance(path, gname)
-                    if adv <= 0:
-                        continue
-                    err = abs(gap - adv * o["size"])
-                    if err <= DELIM_GAP_TOL_EM * o["size"]:
-                        if best_k is None or err < best_err:
-                            best_k, best_err = k + 1, err
-                if best_k is not None:
-                    spec = {"req": req_em, "mode": "level",
-                            "level": best_k, "base": None}
-        targets[ok] = spec
-        targets[ck] = spec
-        # The horizontal span the pair encloses (delimiter ink boxes as the
-        # boundaries), for the verifier's intended-wrap exclusions.
-        spans.append({"open": ok, "close": ck, "lo": lo, "hi": hi})
-    # UNPAIRED stretched fences: a \left/\right delimiter whose partner is a
-    # null delimiter (\left. / \right.) — no partner element in the SVG. The
-    # layout (layoutDelimScaled) emits the base glyph at the font-size whose
-    # axis-centered ink covers the enclosed content exactly, so the declared
-    # font-size (> the base math size) IS the intended height. The target is
-    # the base glyph's own ink at the declared size; resolving the MATH
-    # variant for that target and drawing it at target/variant_ink keeps the
-    # constant stroke (the scaled base glyph would look bold).
-    for d in delims:
-        key = (d["x"], d["y"], chr(d["cp"]))
-        if key in matched or base_size is None or d["size"] <= base_size + 1e-6:
-            continue
-        if not d["box"]:
-            continue
-        target_pt = d["box"][3] - d["box"][1]
-        if target_pt <= 0:
-            continue
-        targets[key] = {"req": target_pt / base_size, "mode": "scaled",
-                        "level": None, "base": base_size}
-    # UNPAIRED OPENING delimiters at the BASE size: an env left-fence typeset
-    # with no closing delimiter in the SVG — the amsmath \cases brace (the
-    # layout's envCloseDelim returns null for cases, so only the open `{` is
-    # emitted). The layout (layoutDelimChar) chose the smallest MATH variant
-    # whose ink covers the enclosed rows and flushed the array at that variant's
-    # advance, so the x-gap from the opener to its first enclosed cell IS the
-    # variant's advance. Recover the level from that gap — mode "level" draws the
-    # variant at the declared (base) size (constant stroke, ink = variant_em ×
-    # size), exactly filling the layout's box. (An unpaired \left\{...\right. is
-    # emitted by layoutDelimSized as a SCALED glyph and is handled above.)
-    for d in delims:
-        key = (d["x"], d["y"], chr(d["cp"]))
-        if key in matched or key in targets:
-            continue
-        if d["cp"] not in DELIM_OPENERS or base_size is None:
-            continue
-        if d["size"] > base_size + 1e-6 or not d["box"]:
-            continue
-        lo = d["box"][2]  # right ink edge of the opening fence
-        first_x = min((x0 for b, x0 in zip(others, others_x)
-                       if (b[0] + b[2]) / 2.0 > lo), default=None)
-        if first_x is None:
-            continue
-        gap = first_x - d["x"]
-        path = find_lm_font(LM_MATH_FONT, font_dir)
-        tt = _tt_font(path)
-        variants = _delimiter_variants(tt, d["cp"])
-        best_k, best_err = None, None
-        for k, gname in enumerate(variants):  # k -> ladder level k+1
-            adv = _hmtx_advance(path, gname)
-            if adv <= 0:
-                continue
-            err = abs(gap - adv * d["size"])
-            if err <= DELIM_GAP_TOL_EM * d["size"]:
-                if best_k is None or err < best_err:
-                    best_k, best_err = k + 1, err
-        if best_k is not None:
-            # The recovered level's ink must cover the array's vertical
-            # extent about the math axis plus the brace tip overhang. If no
-            # ladder variant is tall enough (a tall \cases array: XeTeX
-            # assembles an arbitrary-tall brace from fixed tip/mid pieces +
-            # extenders, so its extent is NOT capped by the largest variant),
-            # fall back to the continuous scaled-base path targeting that
-            # exact extent. Small braces keep the constant-stroke level.
-            axis_y = d["y"] - AXIS_HEIGHT_EM * d["size"]
-            inside = [(b, x0) for b, x0 in zip(others, others_x)
-                      if (b[0] + b[2]) / 2.0 > lo]
-            top = min(b[1] for b, _ in inside)
-            bottom = max(b[3] for b, _ in inside)
-            delta = max(axis_y - top, bottom - axis_y)
-            need_em = 2 * (delta + DELIM_TIP_OVERHANG_EM * d["size"]) / d["size"]
-            best_ink = _glyph_ink_em(tt, path, variants[best_k - 1])[0]
-            if best_ink >= need_em - 1e-6:
-                targets[key] = {"req": gap / d["size"], "mode": "level",
-                                "level": best_k, "base": None}
-            else:
-                # The ladder is exhausted (a tall \cases array): XeTeX
-                # assembles an arbitrary-tall brace from the MATH-table
-                # GlyphAssembly PIECES (fixed hooks + extenders, constant
-                # stroke — the scaled-base fallback thickened the stroke and
-                # widened the ink ~2.3x). The piece plan covers the same
-                # required extent (need_em × base size pt) and keeps the
-                # base glyph's axis-centered placement; delimiters without an
-                # assembly keep the old continuous scaled-base path.
-                plan = _delimiter_piece_plan(path, d["cp"], d["size"],
-                                             need_em * base_size)
-                if plan is not None:
-                    targets[key] = {"req": need_em, "mode": "pieces",
-                                    "level": None, "base": base_size,
-                                    "plan": plan}
-                else:
-                    targets[key] = {"req": need_em, "mode": "scaled",
-                                    "level": None, "base": base_size}
-    return targets, spans
-
-
-def _delimiter_resolution(path, cp, size_pt, spec):
-    r"""MATH-table vertical size variant for a STRETCHED delimiter, or None.
-
-    A delimiter is stretched when the layout's required ink exceeds the base
-    glyph's ink; the layout then draws the SMALLEST MATH size variant whose
-    ink covers it — the largest when none does — so the variants keep a
-    constant stroke, while scaling the base glyph would thicken it ~linearly.
-    XeTeX/KaTeX draw the same variant ladder (parenleft.v1..v7).
-
-    `spec` (from _delimiter_targets) selects the rule:
-      {"req": required ink in em, "mode": "pair"} — a \left..\right pair:
-        variant at the declared (base) size, req in em of `size_pt`;
-      {"req", "mode": "scaled", "base": base_size} — an UNPAIRED fence
-        emitted at a scaled font-size: the target is its own base-glyph ink
-        (req × base_size pt); the variant is drawn at its "own" size
-        (target / variant_ink) so the stroke stays constant and the ink
-        covers the target exactly;
-      {"mode": "level", "level": k} — a \big/\Big/\bigg/\Bigg delimiter:
-        the FIXED ladder entry k (1..7 = MATH .v1..v7) at the declared size.
-
-    Returns (pua_char, variant_glyph_name, variant_size_pt, baseline_shift_pt)
-    — the variant drawn with its ink center aligned to the base glyph's ink
-    center (both sit on the MATH axis, so the shift is 0 for LM Math's
-    parens/braces) — or None when the base glyph covers the requirement (the
-    delimiter is not stretched) or the font has no variant.
-    """
-    cmap = _tt_cmap(path)
-    base = cmap.get(cp)
-    if base is None:
-        return None
-    tt = _tt_font(path)
-    h_b, c_b = _glyph_ink_em(tt, path, base)
-    if h_b <= 0.0:
-        return None
-    variants = _delimiter_variants(tt, cp)
-    if not variants:
-        return None
-    mode = spec.get("mode", "pair")
-    req_em = spec.get("req", 0.0)
-    if mode == "level":
-        k = spec.get("level", 1)
-        if k < 1 or k > len(variants):
-            return None
-        best = variants[k - 1]  # ladder level k = MATH .v(k) = variants[k-1]
-        size_v = size_pt
-    else:
-        if req_em <= h_b + 1e-6:
-            return None
-        best = None
-        for gname in variants:
-            h_v, _c_v = _glyph_ink_em(tt, path, gname)
-            if h_v > 0.0 and h_v >= req_em - 1e-6:
-                best = gname
-                break
-        if best is None:
-            best = max(variants, key=lambda g: _glyph_ink_em(tt, path, g)[0])
-        h_v, c_v = _glyph_ink_em(tt, path, best)
-        if h_v <= 0.0:
-            return None
-        # "scaled" (unpaired fence): draw the variant at target/variant_ink
-        # so its ink equals the target exactly — the constant-stroke size.
-        size_v = (req_em * spec["base"] / h_v) if mode == "scaled" else size_pt
-    h_v, c_v = _glyph_ink_em(tt, path, best)
-    if h_v <= 0.0:
-        return None
-    shift = c_v * size_v - c_b * size_pt  # axis-centering (0 for LM Math)
-    pua = _delim_pua(cp, variants.index(best) + 1)
-    return pua, best, size_v, shift
-
-
-_variant_font_cache = {}   # (path, size_px) -> patched PIL ImageFont
-_variant_tt_bytes = {}     # path -> bytes of the patched font (PUA -> .v1)
-
-
-_piece_plan_cache = {}   # (path, cp, size_pt, v_pt) -> plan dict or None
-
-
-def _assembly_extender_glyphs(tt, cp):
-    """Distinct extender glyphs of cp's MATH GlyphAssembly (part order), or [].
-
-    The brace extender (braceleft.ex) is NOT a Unicode cmap glyph — it is
-    addressed through the patched PUA font (slot 8+ of the delimiter's PUA
-    space, see _variant_font and _delimiter_piece_plan) exactly like the
-    size variants.
-    """
-    cmap = tt.getBestCmap()
-    base = cmap.get(cp)
-    if base is None:
-        return []
-    math = tt.get("MATH")
-    if math is None:
-        return []
-    mv = math.table.MathVariants
-    try:
-        names = list(mv.VertGlyphCoverage.glyphs)
-    except AttributeError:
-        names = [c.glyphName for c in mv.VertGlyphCoverage]
-    for name, gc in zip(names, mv.VertGlyphConstruction):
-        if name == base and gc.GlyphAssembly is not None:
-            seen = []
-            for p in gc.GlyphAssembly.PartRecords:
-                if (getattr(p, "PartFlags", 0) & 1) and p.glyph not in seen:
-                    seen.append(p.glyph)
-            return seen
-    return []
-
-
-def _delimiter_piece_plan(path, cp, size_pt, v_pt):
-    """XeTeX-style GlyphAssembly plan for a STRETCHED delimiter, or None.
-
-    When the required ink exceeds the LARGEST MATH size variant, XeTeX stops
-    using the variant ladder and ASSEMBLES the delimiter from the MATH
-    table's VertGlyphConstruction parts (TeX make_delim with extenders):
-    the top hook + N extenders + middle piece + N extenders + bottom hook,
-    stacked with connector overlaps. LM Math's braceleft assembly is
-    ⎩(uni23A9) + { extenders (braceleft.ex) + ⎨(uni23A8) + extenders +
-    ⎧(uni23A7) — the same Unicode brace pieces (U+23A7..U+23AA) XeTeX draws.
-
-    Reproduces XeTeX's algorithm (xetex-math.c build_opentype_assembly,
-    verified against the xelatex PDF of the 3-row \\cases at 30pt, which
-    stacks ⎧/⎨/⎩ + two braceleft.ex at origin spacings 19.796/42.271/
-    19.796/19.855pt):
-      · the extender count n is the smallest count whose assembly height
-        s_max(n) covers the required v — each extender position repeats n
-        times and s_max = Σ over parts of (FullAdvance − min(startConn,
-        prevEnd, MinConnectorOverlap)) (min_o = MathVariants
-        MinConnectorOverlap, 20 for LM Math);
-      · each part stacks at its INK height (glyph bbox; the brace pieces
-        all have depth 0) minus a glue whose natural width is −oo
-        (oo = min(startConn, prevEnd)) and stretch oo − min(oo, min_o);
-      · the glues stretch by glue_set = clamp((v − nat)/str, 0, 1), so at
-        the required v the stacked ink extent comes out EXACTLY v — the
-        same 124.6pt cover the old scaled-v7 fallback produced — while
-        every piece keeps its constant stroke and narrow width (the hooks'
-        0.355em ink vs the scaled v7's 0.608em × 1.38: the "bold, 2.3x
-        wider brace" defect).
-
-    Returns {"pieces": [(codepoint, glyph_name, svg_y)], "box": (y0, y1)}
-    — svg_y is the piece baseline in SVG pt (y down) RELATIVE to the
-    delimiter baseline; box is the union ink (y down, relative) — or None
-    when the font has no assembly for cp (the caller falls back to the
-    scaled-variant draw).
-    """
-    key = (path, cp, size_pt, v_pt)
-    plan = _piece_plan_cache.get(key)
-    if plan is not None or key in _piece_plan_cache:
-        return plan
-    _piece_plan_cache[key] = None
-    tt = _tt_font(path)
-    cmap = _tt_cmap(path)
-    base = cmap.get(cp)
-    if base is None:
-        return None
-    math = tt.get("MATH")
-    if math is None:
-        return None
-    mv = math.table.MathVariants
-    try:
-        names = list(mv.VertGlyphCoverage.glyphs)
-    except AttributeError:
-        names = [c.glyphName for c in mv.VertGlyphCoverage]
-    ga = None
-    for name, gc in zip(names, mv.VertGlyphConstruction):
-        if name == base and gc.GlyphAssembly is not None:
-            ga = gc.GlyphAssembly
-            break
-    if ga is None:
-        return None
-    upem = tt["head"].unitsPerEm
-    min_o = getattr(mv, "MinConnectorOverlap", None) or 0
-    parts = []   # (glyph, startConn, endConn, fullAdvance, is_extender)
-    for p in ga.PartRecords:
-        parts.append((p.glyph, p.StartConnectorLength, p.EndConnectorLength,
-                      p.FullAdvance, bool(getattr(p, "PartFlags", 0) & 1)))
-    heights = []   # ink heights in font units (all brace pieces: depth 0)
-    for gname, _st, _en, _fu, _ex in parts:
-        h_em, _c = _glyph_ink_em(tt, path, gname)
-        heights.append(h_em * upem)
-    v_units = v_pt * upem / size_pt
-    # Smallest extender count whose assembly height covers v (XeTeX's first
-    # pass: n starts at 0 — an extender contributes nothing at n = 0).
-    n = -1
-    while True:
-        n += 1
-        s_max, prev = 0, 0
-        for i, (_g, st, en, full, ext) in enumerate(parts):
-            for _ in range(n if ext else 1):
-                o = min(st, prev, min_o)
-                s_max += full - o
-                prev = en
-        if s_max >= v_units or not any(p[4] for p in parts):
-            break
-    # The stacked part list with per-part glue (natural −oo, stretch).
-    stack = []   # (glyph, height_units, glue_natural_units, stretch_units)
-    prev = 0
-    for i, (gname, st, en, _fu, ext) in enumerate(parts):
-        for _ in range(n if ext else 1):
-            oo = min(st, prev)
-            o = min(oo, min_o)
-            stack.append((gname, heights[i], -oo, oo - o))
-            prev = en
-    nat = sum(h + g for _g, h, g, _s in stack)
-    str_total = sum(s for _g, _h, _gl, s in stack)
-    g = 0.0
-    if str_total > 0 and v_units > nat:
-        g = min((v_units - nat) / str_total, 1.0)
-    # Baseline offsets (pt, y up) from the BOTTOM piece's baseline: the
-    # XeTeX vlist stacks each piece above the previous at h_prev + glue.
-    glue = [gl + st * g for _g, _h, gl, st in stack]
-    yb = [0.0]
-    for i in range(1, len(stack)):
-        yb.append(yb[i - 1] + (stack[i - 1][1] + glue[i]) * size_pt / upem)
-    extent = yb[-1] + stack[-1][1] * size_pt / upem
-    # SVG y (down) of each piece baseline relative to the delimiter
-    # baseline: the stack's ink center lands on the base glyph's ink center
-    # (c_b × size above the baseline — the same axis-centering the scaled
-    # variant draw uses, so the brace keeps the current 124.6pt cover).
-    _h_b, c_b = _glyph_ink_em(tt, path, base)
-    shift_up = c_b * size_pt - extent / 2.0
-    # Codepoints to draw: the hooks/middle are real Unicode (U+23A7..U+23A9
-    # in the cmap); the extender glyphs (braceleft.ex) live only in the MATH
-    # table, so they are addressed through the patched PUA font (slot 8+ of
-    # this delimiter's PUA space — see _variant_font).
-    pua_slot = DELIM_PUA_BASE + DELIMITER_CPS.index(cp) * DELIM_PUA_SLOTS
-    ext_pua = {g: pua_slot + DELIM_PUA_SLOTS + i
-               for i, g in enumerate(_assembly_extender_glyphs(tt, cp))}
-    pieces = []
-    for i, (gname, _h_u, _gl, _st) in enumerate(stack):
-        cp_i = next((c for c, gn in cmap.items() if gn == gname), None)
-        if cp_i is None:
-            cp_i = ext_pua.get(gname)
-        if cp_i is not None:
-            pieces.append((cp_i, gname, -shift_up - yb[i]))
-    plan = {"pieces": pieces, "box": (-shift_up - extent, -shift_up)}
-    _piece_plan_cache[key] = plan
-    return plan
-
-
-def _variant_font(path, size_px):
-    """PIL font drawing the MATH variants: big-op .v1 display glyphs AND the
-    delimiter size variants.
-
-    The base font is patched in memory (fontTools): a private-use codepoint
-    per operator / delimiter variant is mapped to the variant glyph name in
-    the cmap, so FreeType rasterizes the ACTUAL variant at the requested
-    size — the glyph shape XeTeX draws, positioned by the baseline the
-    caller picks (big ops: the base glyph's baseline; stretched delimiters:
-    the base baseline plus the centering shift from _delimiter_resolution).
-    Cached per (path, size_px); the patched bytes are built once per font.
-    """
-    key = (path, size_px)
-    f = _variant_font_cache.get(key)
-    if f is None:
-        raw = _variant_tt_bytes.get(path)
-        if raw is None:
-            tt = TTFont(path)
-            mapping = {}
-            for cp, pua in BIGOP_PUA.items():
-                gname = _bigop_variant_glyph(tt, cp)
-                if gname:
-                    mapping[pua] = gname
-            for cp in DELIMITER_CPS:
-                for k, gname in enumerate(_delimiter_variants(tt, cp), start=1):
-                    mapping[_delim_pua(cp, k)] = gname
-                # GlyphAssembly extender glyphs (slot 8+): the piece-
-                # assembled brace draw (\cases beyond the largest variant)
-                # stacks braceleft.ex extenders between the hooks — they are
-                # not Unicode cmap glyphs, so they need PUA addresses too.
-                for i, gname in enumerate(_assembly_extender_glyphs(tt, cp)):
-                    mapping[_delim_pua(cp, DELIM_PUA_SLOTS + i)] = gname
-            # Radical vertical variants: map PUA chars to radical.v1..v4 so
-            # the PIL raster draws the variant the layout requested (the
-            # data-radical="vN" attribute — not the base √ the browser shows).
-            radical_gnames = [f"radical.v{vi}" for vi in range(1, 5)]
-            for vi, gname in enumerate(radical_gnames, start=1):
-                if gname in tt.getGlyphOrder():
-                    mapping[RADICAL_PUA[vi]] = gname
-            # Radical assembly pieces (data-radical="v5/v6/v7"): map the
-            # layout's piece PUA chars to the actual MATH-table assembly
-            # glyphs so the raster draws the constant-stroke vertical radical
-            # matching XeTeX's make_radical assembly, not the pre-built
-            # variant shape.
-            radical_piece_gnames = {
-                5: "radical.tp",  # top hook
-                6: "radical.ex",  # extender (vertical bar)
-                7: "uni23B7",     # bottom foot + bar
-            }
-            for piece_vi, gname in radical_piece_gnames.items():
-                if piece_vi in RADICAL_PIECE_PUA and gname in tt.getGlyphOrder():
-                    mapping[RADICAL_PIECE_PUA[piece_vi]] = gname
-            for table in tt["cmap"].tables:
-                if table.isUnicode():
-                    table.cmap.update(mapping)
-            buf = io.BytesIO()
-            tt.save(buf)
-            raw = buf.getvalue()
-            _variant_tt_bytes[path] = raw
-        f = ImageFont.truetype(io.BytesIO(raw), size_px)
-        _variant_font_cache[key] = f
-    return f
-
-
-def _glyph_ink_boxes(attrs, content, font_dir, delim_targets=None):
+def _text_ink_boxes(attrs, content, font_dir):
     """Per-char ink boxes (SVG pt: [x0, y0, x1, y1], y down) for a <text>.
 
     Uses the real OTF outlines via BoundsPen at the declared font-size and
-    baseline (anchor "ls": pen origin at x,y, font y up). A char with no
-    ink (missing glyph / empty outline) yields None. Multi-char content
-    advances by hmtx widths, matching the PIL raster. DISPLAY big-ops
-    (data-op="v1" in the attrs) resolve the MATH .v1 variant — the SAME
-    ink the PIL raster draws; unmarked (text/script) big-ops keep the cmap
-    base glyph. delim_targets
-    (the map from _delimiter_targets, keyed by (x, y, content)) lets a
-    STRETCHED delimiter resolve its MATH size variant from the LAYOUT's
-    intended height — the verifier then measures the SAME variant ink the
-    PIL raster draws (variant at the declared size + shifted baseline), not
-    the base glyph the SVG text declares.
+    baseline (anchor "ls": pen origin at x,y, font y up), advancing by hmtx
+    widths exactly as the PIL raster does. A char with no ink (missing glyph /
+    empty outline) yields None.
+
+    A <text> run now always means the cmap base glyph at the declared size:
+    every stretched form — a tall radical, a display big operator, a
+    stretched fence — is a <path>, and its ink is measured from that outline
+    (see _path_bounds). There is no MATH variant left to resolve here and
+    nothing to infer from the geometry around the run.
     """
     name = _lm_font_name(attrs)
     path = find_lm_font(name, font_dir)
@@ -1620,61 +894,6 @@ def _glyph_ink_boxes(attrs, content, font_dir, delim_targets=None):
     cx = ex
     for ch in content:
         gname = cmap.get(ord(ch)) if len(ch) == 1 else None
-        # Big ops draw the MATH .v1 display variant ONLY when the SVG marks
-        # them data-op="v1" (DISPLAY ops — the PIL rasterizer does the
-        # same), so the verifier measures the SAME ink the raster draws:
-        # the variant's outline and hmtx advance, at the declared font-size.
-        # Unmarked (text/script) big-ops keep the cmap base glyph (the
-        # raster draws the base glyph for them too).
-        if (len(ch) == 1 and ord(ch) in BIGOP_PUA
-                and _display_bigop(attrs)):
-            vname = _bigop_variant_glyph(font, ord(ch))
-            if vname:
-                gname = vname
-        # Radical variants: when the SVG marks data-radical="vN" the verifier
-        # measures the MATH vertical variant (radical.vN) — the SAME glyph
-        # the PIL raster draws — not the base √ the browser renders. The
-        # variant draws at the declared font-size (same as the SVG says), so
-        # scale_ch stays `scale`.
-        elif (len(ch) == 1 and attrs.get("data-radical")):
-            vi = int(attrs["data-radical"][1:])
-            if vi in RADICAL_PIECE_PUA:
-                # Assembly piece: map the piece index to the LM Math glyph
-                # name (top/ext/bottom) so the verifier measures the
-                # assembly piece ink, not the base √ or a .notdef.
-                gname = _RADICAL_PIECE_GLYPHS.get(vi)
-            else:
-                vname = f"radical.v{vi}"
-                if vname in font.getGlyphOrder():
-                    gname = vname
-        scale_ch, shift = scale, 0.0
-        if len(ch) == 1 and ord(ch) in DELIMITER_CPS and delim_targets:
-            # Stretched delimiter: the raster draws the MATH size variant at
-            # the resolved size with a shifted baseline — measure that ink.
-            spec = delim_targets.get((ex, ey, ch))
-            if spec is not None and spec.get("mode") == "pieces":
-                # The unpaired cases brace draws the GlyphAssembly PIECES
-                # (constant-stroke ⎧⎨⎩ + extenders) — the union of their ink
-                # boxes at the plan's baselines is what the raster draws.
-                subs = []
-                for _cp_i, pname, dy in spec["plan"]["pieces"]:
-                    pen = BoundsPen(gs)
-                    try:
-                        gs[pname].draw(pen)
-                    except Exception:  # noqa: BLE001 — defensive
-                        pen = None
-                    if pen is None or not pen.bounds:
-                        continue
-                    xmin, ymin, xmax, ymax = pen.bounds
-                    subs.append((ex + xmin * scale, ey + dy - ymax * scale,
-                                 ex + xmax * scale, ey + dy - ymin * scale))
-                boxes.append(_union(subs))
-                continue
-            if spec is not None:
-                res = _delimiter_resolution(path, ord(ch), size, spec)
-                if res is not None:
-                    _pua, gname, size_v, shift = res
-                    scale_ch = size_v / font["head"].unitsPerEm
         pen = None
         if gname is not None:
             pen = BoundsPen(gs)
@@ -1687,9 +906,9 @@ def _glyph_ink_boxes(attrs, content, font_dir, delim_targets=None):
             cx += size * 0.5
             continue
         xmin, ymin, xmax, ymax = pen.bounds
-        boxes.append((cx + xmin * scale_ch, ey + shift - ymax * scale_ch,
-                      cx + xmax * scale_ch, ey + shift - ymin * scale_ch))
-        cx += font["hmtx"][gname][0] * scale_ch
+        boxes.append((cx + xmin * scale, ey - ymax * scale,
+                      cx + xmax * scale, ey - ymin * scale))
+        cx += font["hmtx"][gname][0] * scale
     return boxes
 
 
@@ -1702,25 +921,82 @@ def _union(boxes):
             max(b[2] for b in real), max(b[3] for b in real))
 
 
+def _text_run(attrs, content, font_dir):
+    """One <text> run: the cmap glyphs it draws, as ink boxes in document pt."""
+    return {
+        "kind": "text", "content": content,
+        "x": _pt(attrs.get("x", "0")), "y": _pt(attrs.get("y", "0")),
+        "size": _pt(attrs.get("font-size", "0")), "font_name": _lm_font_name(attrs),
+        "boxes": _text_ink_boxes(attrs, content, font_dir),
+    }
+
+
+def _path_runs(paths):
+    """One logical glyph per <path> group, in document order.
+
+    ztex emits a stretched radical as three <path> pieces (top, extenders,
+    bottom) that share the surd's data-x and font-size but each carry their own
+    data-y, and each piece deliberately overlaps the one above it. Measured as
+    three glyphs, that overlap would be reported as a defect and the surd would
+    be split across three baseline rows. Only consecutive SURD pieces at the
+    same x and size are grouped; ordinary outlines at equal x and size may
+    be distinct numerator and denominator glyphs. The first piece supplies
+    the logical baseline and content.
+
+    Returns [{"content", "x", "y", "size", "boxes", "surd"}]; `boxes` holds one
+    exact ink box per part, so the union still spans the whole assembly.
+    """
+    runs, group = [], []
+    for attrs, content in paths:
+        part = {"x": _pt(attrs["x"]), "y": _pt(attrs["y"]),
+                "size": _pt(attrs.get("font-size", "0")), "box": _path_bounds(attrs["d"])}
+        joined_surd = (group and content == group[0]["content"] and
+                       (content == "√" or _is_private_use(content)) and
+                       (part["x"], part["size"]) == (group[0]["x"], group[0]["size"]))
+        if group and not joined_surd:
+            runs.append(group)
+            group = []
+        group.append(part)
+        part["content"] = content
+    if group:
+        runs.append(group)
+    return [{"kind": "path", "content": g[0]["content"], "x": g[0]["x"], "y": g[0]["y"],
+             "size": g[0]["size"], "font_name": None,
+             "surd": g[0]["content"] == "√" or _is_private_use(g[0]["content"]),
+             "boxes": [p["box"] for p in g]}
+            for g in runs]
+
+
 def _svg_geometry_elements(svg_path, font_dir):
     """Parse a ztex SVG into geometry primitives (all coords in SVG pt, y down).
 
-    Returns (w_pt, h_pt, texts, rects, lines, delim_targets, delim_spans):
-      texts: [{"content", "x", "y", "size", "font_name", "boxes": [pt box|None per char], "box": union|None}]
+    Returns (w_pt, h_pt, runs, rects, lines, fence_spans):
+      runs:  [{"content", "x", "y", "size", "font_name", "kind", "boxes",
+               "box", "surd"}] in document order — one entry per logical
+              glyph, whether it arrived as a <text> run or as the <path>
+              outline ztex drew for it. `boxes` is a per-char (text) or
+              per-part (path) ink box list, `box` their union.
       rects: [{"box": [...], "background": bool}]   # background = fills the canvas
-      lines: [{"box": [...]}]                       # stroked decorations, stroke-width included
-      delim_targets / delim_spans: the stretched-delimiter map + spans from
-      _delimiter_targets (the verifier measures the variant ink for the
-      flagged delimiters, and compute_geometry excludes their intended
-      wrap-around intersections with the enclosed content).
+      lines: [{"box": [...]}]                       # stroked or filled decoration bands
+      fence_spans: [{"open", "close", "lo", "hi"}]  — the horizontal ink span
+              each stretched fence pair wraps, from the painted
+              outlines, so compute_geometry can tell that intended adjacency
+              from a real ink collision.
     """
     svg = Path(svg_path).read_text(errors="replace")
     w_pt, h_pt, elements = _parse_svg_primitives(svg)
-    texts, rects, lines = [], [], []
-    texts_raw = []
+    runs, rects, lines, pending = [], [], [], []
     for kind, a, content in elements:
-        if kind == "text":
-            texts_raw.append((a, content))
+        if kind == "path" and content:
+            pending.append((a, content))
+            continue
+        if pending:   # a run of paths is one logical glyph; close it here
+            runs.extend(_path_runs(pending))
+            pending = []
+        if kind == "path":
+            lines.append({"box": _path_bounds(a["d"])})
+        elif kind == "text":
+            runs.append(_text_run(a, content, font_dir))
         elif kind == "rect":
             x, y = _pt(a.get("x", "0")), _pt(a.get("y", "0"))
             box = (x, y, x + _pt(a.get("width", "0")), y + _pt(a.get("height", "0")))
@@ -1731,28 +1007,53 @@ def _svg_geometry_elements(svg_path, font_dir):
             x2, y2 = _pt(a.get("x2", "0")), _pt(a.get("y2", "0"))
             lines.append({"box": (min(x1, x2) - sw, min(y1, y2) - sw,
                                   max(x1, x2) + sw, max(y1, y2) + sw)})
-    # Base math size + stretched-delimiter map (same rules as rasterize_svg,
-    # so the verifier measures the SAME variant ink the PIL raster draws).
-    base_size = _base_math_size(elements)
-    delim_targets, delim_spans = _delimiter_targets(
-        elements, w_pt, h_pt, font_dir, base_size)
-    for a, content in texts_raw:
-        boxes = _glyph_ink_boxes(a, content, font_dir, delim_targets)
-        texts.append({
-            "content": content, "x": _pt(a.get("x", "0")), "y": _pt(a.get("y", "0")),
-            "size": _pt(a.get("font-size", "0")), "font_name": _lm_font_name(a),
-            "boxes": boxes, "box": _union(boxes),
-        })
-    return w_pt, h_pt, texts, rects, lines, delim_targets, delim_spans
+    if pending:
+        runs.extend(_path_runs(pending))
+    # Document order is the painter's order, and it is the order every ink
+    # box, clip check and overlap below is measured in.
+    for r in runs:
+        r["box"] = _union(r["boxes"])
+    return w_pt, h_pt, runs, rects, lines, _fence_spans(runs)
 
 
-def _cluster_rows(texts):
-    """Group text elements into rows by baseline y (tolerance ROW_BASELINE_TOL_PT).
+def _fence_spans(runs):
+    """Spans a stretched \\left..\\right fence pair wraps around its content.
+
+    Pairing uses only what the document painted: the two runs of a pair are
+    <path> outlines whose data-text is the delimiter codepoint, and their
+    actual ink boxes give the inner edges the enclosed content sits between.
+    A fence whose partner is a null delimiter is emitted with no outline at
+    all, so an unpaired fence wraps nothing and yields no span.
+    """
+    fences = [r for r in runs
+              if r["kind"] == "path" and r["box"] and len(r["content"]) == 1
+              and ord(r["content"]) in DELIMITER_CPS]
+    spans, stack, cur_y = [], [], None
+    for f in sorted(fences, key=lambda r: (round(r["y"]), r["x"])):
+        y = round(f["y"])
+        if cur_y is None or y != cur_y:
+            stack = []   # fences never pair across baselines (array rows)
+            cur_y = y
+        cp = ord(f["content"])
+        if cp in DELIM_CLOSERS:
+            for i in range(len(stack) - 1, -1, -1):
+                if stack[i]["cp"] == DELIM_OPENER_OF[cp] and stack[i]["x"] < f["x"]:
+                    o = stack.pop(i)
+                    spans.append({"open": o, "close": f,
+                                  "lo": o["box"][2], "hi": f["box"][0]})
+                    break
+        elif cp in DELIM_OPENERS:
+            stack.append({"cp": cp, "x": f["x"], "box": f["box"]})
+    return spans
+
+
+def _cluster_rows(runs):
+    """Group runs into rows by baseline y (tolerance ROW_BASELINE_TOL_PT).
 
     Returns rows sorted top→bottom, each {"baseline", "items": [...], "box": union|None}.
     """
     rows = []
-    for t in sorted(texts, key=lambda t: t["y"]):
+    for t in sorted(runs, key=lambda t: t["y"]):
         for r in rows:
             if abs(r["baseline"] - t["y"]) <= ROW_BASELINE_TOL_PT:
                 r["items"].append(t)
@@ -1767,6 +1068,11 @@ def _cluster_rows(texts):
 
 def _find_operators(rows):
     """Detect big-op glyphs (∑ ∫ ∏ ⋃ ⋂ ⨆ ∐) and TeX limit-op runs (lim/max/...).
+
+    Both forms of a big operator are found the same way, from the logical
+    glyph: a <path> run is named by its data-text, so a DISPLAY operator the
+    layout drew as an outline is detected exactly like the <text> one a
+    text/script operator produces.
 
     A limit-op run is a maximal run of roman-family letters on one row whose
     lowercase text is a known TeX operator name ("lim", "max", ...). Math
@@ -1784,13 +1090,15 @@ def _find_operators(rows):
                             "row": row, "elements": [t]})
                 i += 1
             elif (t["font_name"] != LM_MATH_FONT and len(t["content"]) == 1
-                  and t["content"].isalpha()):
+                  and t["content"].isalpha()
+                  and (t["kind"] == "text" or t["content"].isascii())):
                 run = [t]
                 j = i + 1
                 while j < len(items):
                     u = items[j]
                     if (u["font_name"] != LM_MATH_FONT and len(u["content"]) == 1
-                            and u["content"].isalpha()):
+                            and u["content"].isalpha()
+                            and (u["kind"] == "text" or u["content"].isascii())):
                         run.append(u)
                         j += 1
                     else:
@@ -1931,65 +1239,101 @@ def _limit_stagger(op, font_dir):
     """TeX make_op limit placement for one operator: (box center, stagger pt).
 
     For a BIG-OP glyph the expected over/under-limit center is the op's BOX
-    center (the base glyph's hmtx advance / 2 from its declared x) ±
-    delta/2, where delta = the glyph's MATH-table italic correction at the
-    declared size (TeX make_op: over-limit +delta/2, under-limit −delta/2;
-    LM ∫/∮ 0.332em, all other big-ops 0). A limit-op WORD (\\lim etc.) also
-    uses delta 0 but its ink center already equals its box center, so the
-    caller falls back to the old ink-center check. Returns (box_cx,
-    stagger_pt) or None when the geometry is unavailable.
+    center ± delta/2, where delta = the drawn form's MATH-table italic
+    correction at the declared size (TeX make_op: over-limit +delta/2,
+    under-limit −delta/2; LM ∫/∮ 0.332em on the base glyph, 0.591em on the
+    display .v1, all other big-ops 0). A limit-op WORD (\\lim etc.) uses delta
+    0 and its ink center already equals its box center, so the caller falls
+    back to the ink-center check. Returns (box_cx, stagger_pt) or None when the
+    geometry is unavailable.
+
+    The metrics are the INTENDED ones, and they are read from the form the run
+    actually draws: a DISPLAY big operator reaches this verifier as a <path>
+    (the layout boxed the MATH .v1 variant), and the box it reserved is that
+    variant's advance, not the base glyph's. Comparing the painted outline
+    against the base advance instead would invent an offset that is not a
+    defect, so the variant is resolved by codepoint and the comparison stays
+    honest. \\bigint and friends draw the base glyph at a larger font-size and
+    stay <text>, which is why the two forms need different metrics.
     """
     if op.get("kind") != "bigop":
         return None
     t = op["elements"][0]
-    cp = ord(t["content"])
-    if cp not in BIGOP_PUA:
+    if t["content"] not in BIGOP_GLYPHS:
         return None
-    path = find_lm_font(t["font_name"], font_dir)
+    cp = ord(t["content"])
+    path = find_lm_font(LM_MATH_FONT, font_dir)
     if not path:
         return None
     font = _tt_font(path)
     gname = _tt_cmap(path).get(cp)
     if gname is None:
         return None
+    if t["kind"] == "path":
+        gname = _bigop_variant_glyph(font, cp) or gname
     upem = font["head"].unitsPerEm
     box_cx = t["x"] + font["hmtx"][gname][0] * t["size"] / upem / 2.0
     return box_cx, _math_italic_correction(font, gname) * t["size"] / 2.0
 
 
+def _ink_entries(runs):
+    """One ink box per reportable glyph, in document order.
+
+    A <text> run contributes one entry per character, so a clipped or empty
+    glyph is named. A <path> run contributes exactly one entry: its parts are
+    ONE logical glyph and they deliberately overlap each other (a radical
+    stacks pieces that overlap by a third of an em), so measuring the parts
+    apart would report the glyph's own construction as a collision. The entry
+    carries the run's union box — the extent a critic sees — and `surd`, which
+    marks the layout's private-use surd placeholders.
+    """
+    entries = []
+    for r in runs:
+        rid = ("run", id(r))
+        at = f"@{r['x']:.1f},{r['y']:.1f}"
+        if r["kind"] == "path":
+            entries.append({"id": rid, "label": _glyph_label(r["content"]),
+                            "at": at, "box": r["box"], "surd": r["surd"]})
+        else:
+            for ch, b in zip(r["content"], r["boxes"]):
+                entries.append({"id": rid, "label": ch, "at": at, "box": b, "surd": False})
+    return entries
+
+
 def compute_geometry(svg_path, font_dir=DEFAULT_FONT_DIR):
     """Deterministic geometric ground truth for one ztex SVG, in pt.
 
-    Every ink box comes from the real Latin Modern OTF outlines at the
-    declared font-size/baseline — identical geometry to the PIL raster.
-    Returns a JSON-safe dict; "defect_count" is the authoritative verdict.
+    Every ink box comes from the document: a <path> from its own outline, a
+    <text> run from the real Latin Modern OTF outline at the declared size and
+    baseline — the same geometry the PIL raster paints. Returns a JSON-safe
+    dict; "defect_count" is the authoritative verdict.
     """
-    w_pt, h_pt, texts, rects, lines, delim_targets, delim_spans = _svg_geometry_elements(svg_path, font_dir)
-    rows = _cluster_rows(texts)
+    w_pt, h_pt, runs, rects, lines, fence_spans = _svg_geometry_elements(svg_path, font_dir)
+    rows = _cluster_rows(runs)
     bars = [r for r in rects if not r["background"]]
     ops = _associate_limits(_find_operators(rows), rows, bars)
+    entries = _ink_entries(runs)
 
-    # ── ink bbox: every char box + non-background rect + line ──────────────
-    ink_boxes = [b for t in texts for b in t["boxes"] if b]
+    # ── ink bbox: every glyph box + non-background rect + line ─────────────
+    ink_boxes = [e["box"] for e in entries if e["box"]]
     ink_boxes += [r["box"] for r in bars] + [ln["box"] for ln in lines]
     ink_bbox = _union(ink_boxes)
 
     # ── edge clipping: max ink overflow past [0,w]x[0,h] per edge ──────────
     clip_pt = {"top": 0.0, "bottom": 0.0, "left": 0.0, "right": 0.0}
     clipped = []
-    for t in texts:
-        for ch, b in zip(t["content"], t["boxes"]):
-            if not b:
-                continue
-            over = {"top": -b[1], "bottom": b[3] - h_pt, "left": -b[0], "right": b[2] - w_pt}
-            bad = {e: v for e, v in over.items() if v > CLIP_EPS_PT}
-            for edge, v in bad.items():
-                if v > clip_pt[edge]:
-                    clip_pt[edge] = v
-            if bad:
-                clipped.append({"element": f"{ch}@{t['x']:.1f},{t['y']:.1f}",
-                                "edges": sorted(bad),
-                                "overflow_pt": {e: round(bad[e], 3) for e in sorted(bad)}})
+    for e in entries:
+        b = e["box"]
+        if not b:
+            continue
+        over = {"top": -b[1], "bottom": b[3] - h_pt, "left": -b[0], "right": b[2] - w_pt}
+        bad = {edge: v for edge, v in over.items() if v > CLIP_EPS_PT}
+        for edge, v in bad.items():
+            if v > clip_pt[edge]:
+                clip_pt[edge] = v
+        if bad:
+            clipped.append({"element": f"{e['label']}{e['at']}", "edges": sorted(bad),
+                            "overflow_pt": {edge: round(bad[edge], 3) for edge in sorted(bad)}})
     for box in [r["box"] for r in bars] + [ln["box"] for ln in lines]:
         over = {"top": -box[1], "bottom": box[3] - h_pt, "left": -box[0], "right": box[2] - w_pt}
         for edge, v in over.items():
@@ -2007,14 +1351,15 @@ def compute_geometry(svg_path, font_dir=DEFAULT_FONT_DIR):
     # display ∫/∮ .v1's right-skewed ink (its ink center sits ~5pt right of
     # the box center, so its under-limit '2' measures ~10pt off the ink
     # center while sitting exactly at −delta/2 of the box center). Compare
-    # each limit against the op's BOX center (base-glyph advance / 2) plus
-    # the expected stagger; a limit-op word (\lim etc.) has delta 0 and
-    # keeps the old ink-center check.
+    # each limit against the box the layout reserved — the drawn form's
+    # advance / 2 from the run's x — plus the expected stagger (see
+    # _limit_stagger for which form's metrics apply); a limit-op word (\lim
+    # etc.) has delta 0 and keeps the old ink-center check.
     bigop_limits, operators = [], []
     for op in ops:
         limits = op.get("limits", {})
         operators.append({"label": op["label"], "has_limits": bool(limits)})
-        box_cx, stagger = _limit_stagger(op, font_dir)
+        box_cx, stagger = _limit_stagger(op, font_dir) or (None, 0.0)
         for side in ("above", "below"):
             lim = limits.get(side)
             if not lim:
@@ -2036,28 +1381,25 @@ def compute_geometry(svg_path, font_dir=DEFAULT_FONT_DIR):
             })
 
     # ── pairwise ink-box overlaps ──────────────────────────────────────────
-    boxes = []
-    for ti, t in enumerate(texts):
-        for ch, b in zip(t["content"], t["boxes"]):
-            boxes.append({"id": ("text", id(t)), "label": ch, "box": b})
+    boxes = list(entries)
     for ri, r in enumerate(bars):
-        boxes.append({"id": ("rect", ri), "label": "fraction bar", "box": r["box"]})
+        boxes.append({"id": ("rect", ri), "label": "fraction bar", "box": r["box"], "surd": False})
     for li, ln in enumerate(lines):
-        boxes.append({"id": ("line", li), "label": "line", "box": ln["box"]})
+        boxes.append({"id": ("line", li), "label": "line", "box": ln["box"], "surd": False})
     # intended overlaps: a limit touching its operator, a radical over its
-    # radicand, and a big op's own attached BESIDE scripts. TeX attaches a
-    # nolimits op's scripts at variant_advance −/+ its italic correction,
-    # which for the ∫/∮ .v1 lands INSIDE the variant ink bbox (sub at 0.408em,
-    # ink ends at 0.943em) — the XeTeX reference render has exactly this
-    # ∫↔sub bbox intersection (measured on the ref raster), so op↔own-script
-    # bbox intersections are intended adjacency, not defects. A script is the
-    # op's own when it is script-sized (< op size, so beside scripts and never
-    # the full-size following term), horizontally overlapping the op's ink
-    # span, and vertically adjacent to the op's ink box.
+    # radicand, a fence wrapping its content, and a big op's own attached
+    # BESIDE scripts. TeX attaches a nolimits op's scripts at variant_advance
+    # −/+ its italic correction, which for the ∫/∮ .v1 lands INSIDE the variant
+    # ink bbox (sub at 0.408em, ink ends at 0.943em) — the XeTeX reference
+    # render has exactly this ∫↔sub bbox intersection (measured on the ref
+    # raster), so op↔own-script bbox intersections are intended adjacency, not
+    # defects. A script is the op's own when it is script-sized (< op size, so
+    # beside scripts and never the full-size following term), horizontally
+    # overlapping the op's ink span, and vertically adjacent to the op's box.
     excluded_ids = set()
     excluded_reason = {}
     for op in ops:
-        op_ids = {("text", id(t)) for t in op["elements"]}
+        op_ids = {("run", id(t)) for t in op["elements"]}
         if op["kind"] == "bigop":
             op_size = max((t["size"] for t in op["elements"]), default=0.0)
             for row in rows:
@@ -2072,52 +1414,45 @@ def compute_geometry(svg_path, font_dir=DEFAULT_FONT_DIR):
                             and t["box"][3] >= op["box"][1] - LIMIT_TOUCH_TOL_PT):
                         continue
                     for a in op_ids:
-                        pair = frozenset((a, ("text", id(t))))
+                        pair = frozenset((a, ("run", id(t))))
                         excluded_ids.add(pair)
                         excluded_reason[pair] = "op's attached beside script"
         for side in ("above", "below"):
             lim = op.get("limits", {}).get(side)
             if not lim:
                 continue
-            lim_ids = {("text", id(t)) for t in lim["items"]}
+            lim_ids = {("run", id(t)) for t in lim["items"]}
             for a in op_ids:
                 for b in lim_ids:
                     pair = frozenset((a, b))
                     excluded_ids.add(pair)
                     excluded_reason[pair] = "limit touching its operator"
-    # A STRETCHED delimiter legitimately WRAPS its enclosed content: the
-    # variant ink surrounds the content and may graze it (the LM variant
-    # glyphs' ink is wider than the content span — measured sub-0.5pt
-    # slivers on `\lfloor \frac{1}{2} \rfloor`, present in the XeTeX
-    # reference render too), so delimiter↔enclosed-content intersections
-    # are intended adjacency, like a radical over its radicand.
-    delim_ids = {}
-    for t in texts:
-        if len(t["content"]) == 1 and (t["x"], t["y"], t["content"]) in delim_targets:
-            delim_ids[(t["x"], t["y"], t["content"])] = ("text", id(t))
-    for sp in delim_spans:
-        oid, cid = delim_ids.get(sp["open"]), delim_ids.get(sp["close"])
-        if not oid or not cid:
-            continue
+    # A STRETCHED fence legitimately WRAPS its enclosed content: the drawn
+    # outline surrounds the content and may graze it (the LM variant glyphs'
+    # ink is wider than the content span — measured sub-0.5pt slivers on
+    # `\lfloor \frac{1}{2} \rfloor`, present in the XeTeX reference render
+    # too), so fence↔enclosed-content intersections are intended adjacency,
+    # like a radical over its radicand. The spans come from the painted fence
+    # outlines (see _fence_spans): no intent is read from a marker attribute.
+    for sp in fence_spans:
         lo, hi = sp["lo"], sp["hi"]
         enclosed = set()
-        for t in texts:
-            tid = ("text", id(t))
-            if tid in (oid, cid):
+        for e in entries:
+            if e["id"] in (("run", id(sp["open"])), ("run", id(sp["close"]))):
                 continue
-            if any(b and lo < (b[0] + b[2]) / 2.0 < hi for b in t["boxes"]):
-                enclosed.add(tid)
+            if e["box"] and lo < (e["box"][0] + e["box"][2]) / 2.0 < hi:
+                enclosed.add(e["id"])
         for ri, r in enumerate(bars):
             if lo < (r["box"][0] + r["box"][2]) / 2.0 < hi:
                 enclosed.add(("rect", ri))
         for li, ln in enumerate(lines):
             if lo < (ln["box"][0] + ln["box"][2]) / 2.0 < hi:
                 enclosed.add(("line", li))
-        for did in (oid, cid):
+        for did in (("run", id(sp["open"])), ("run", id(sp["close"]))):
             for eid in enclosed:
                 pair = frozenset((did, eid))
                 excluded_ids.add(pair)
-                excluded_reason[pair] = "delimiter wrapping its content"
+                excluded_reason[pair] = "fence wrapping its content"
     overlaps = []
     for i in range(len(boxes)):
         for j in range(i + 1, len(boxes)):
@@ -2138,9 +1473,11 @@ def compute_geometry(svg_path, font_dir=DEFAULT_FONT_DIR):
             if pair in excluded_ids:
                 reason = excluded_reason[pair]
             else:
+                # A surd covers the radicand that follows it: the radical bar
+                # reaches over it, so the ink boxes meet by design.
                 acx = (A["box"][0] + A["box"][2]) / 2.0
                 bcx = (B["box"][0] + B["box"][2]) / 2.0
-                if (A["label"] == "√" and bcx > acx) or (B["label"] == "√" and acx > bcx):
+                if (A["surd"] and bcx > acx) or (B["surd"] and acx > bcx):
                     reason = "radical over its radicand"
             smaller = min((ax1 - ax0) * (ay1 - ay0), (bx1 - bx0) * (by1 - by0))
             overlaps.append({
@@ -2150,9 +1487,9 @@ def compute_geometry(svg_path, font_dir=DEFAULT_FONT_DIR):
             })
     overlaps.sort(key=lambda o: -o["area_pt2"])
 
-    # ── glyph completeness: chars that render nothing ──────────────────────
-    empty_glyphs = [{"element": f"{ch}@{t['x']:.1f},{t['y']:.1f}", "char": ch}
-                    for t in texts for ch, b in zip(t["content"], t["boxes"]) if b is None]
+    # ── glyph completeness: glyphs that paint nothing ──────────────────────
+    empty_glyphs = [{"element": f"{e['label']}{e['at']}", "char": e["label"]}
+                    for e in entries if e["box"] is None]
 
     # ── geometric defects (authoritative) ──────────────────────────────────
     offcenter = [o for o in bigop_limits
@@ -2175,7 +1512,7 @@ def compute_geometry(svg_path, font_dir=DEFAULT_FONT_DIR):
         "clipping_pt": clip_pt, "clipped": clipped,
         "bigop_limits": bigop_limits, "operators": operators,
         "overlaps": overlaps, "empty_glyphs": empty_glyphs,
-        "glyph_count": sum(len(t["boxes"]) for t in texts),
+        "glyph_count": len(entries),
         "defects": {
             "clipped_edges": clipped_edges,
             "offcenter_limits": offcenter,
