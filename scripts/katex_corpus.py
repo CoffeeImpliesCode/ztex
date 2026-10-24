@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """KaTeX screenshotter corpus as a ztex differential battery.
 
-Loads ~/projects/katex/test/screenshotter/ss_data.yaml (126 formulas), renders
-each through the ztex binary, and reports parse SUPPORTED / FAILED per entry
-with the error class, plus a summary. This is the feature-parity regression
-battery: every roadmap feature should move entries from FAILED to SUPPORTED.
+Loads KaTeX's test/screenshotter/ss_data.yaml, renders each formula through the
+ztex binary, and reports parse support or an error class with a summary.
 
 Usage:
     python3 scripts/katex_corpus.py [--ztex PATH] [--out notes/katex-corpus.md]

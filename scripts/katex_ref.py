@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """KaTeX reference renderer for ztex's --ref comparison images.
 
-Pipeline (see notes/katex-reference.md for the full writeup):
+Pipeline:
 
   1. formula  --(katex CLI, nix-installed)-->  HTML span tree
   2. HTML     --(CSS/box model, see below)-->  per-glyph geometry (x, y, size, font)
