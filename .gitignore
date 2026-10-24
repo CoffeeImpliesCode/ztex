@@ -7,6 +7,7 @@
 .zig-cache/
 zig-out/
 zig-pkg/
+.zig-global-cache/
 
 # tooling artifacts
 codedb.snapshot
@@ -19,4 +20,7 @@ local:
 *.svg.tmp
 result-bin
 __pycache__/
+*.pyc
+.ruff_cache/
+result*
 /agent-notes
