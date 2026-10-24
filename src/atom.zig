@@ -295,7 +295,7 @@ pub const ClassBits = struct {
 
 /// The `data` of a class-override row (one child: the wrapped field).
 pub inline fn classRowData(cls: MathClass) u32 {
-    return ClassBits.marker | (@as(u32, @intFromEnum(cls)) << ClassBits.class_shift);
+    return ClassBits.marker | (@as(u32, @backingInt(cls)) << ClassBits.class_shift);
 }
 
 /// Whether a `.row` node's `data` carries a class override.
@@ -305,7 +305,7 @@ pub inline fn isClassRow(data: u32) bool {
 
 /// The class a class-override row reports on BOTH sides of its content.
 pub inline fn classRowClass(data: u32) MathClass {
-    return @enumFromInt((data >> ClassBits.class_shift) & ClassBits.class_mask);
+    return @fromBackingInt(@intCast((data >> ClassBits.class_shift) & ClassBits.class_mask));
 }
 
 /// Math environment kinds, packed into an `.env` node's `data` low bits.
@@ -349,7 +349,7 @@ pub const EnvBits = struct {
 /// bits name no kind is refused by `layout.render`, which checks the field
 /// before this `@enumFromInt` can trap on it.
 pub inline fn envKind(data: u32) EnvKind {
-    return @enumFromInt(data & EnvBits.kind_mask);
+    return @fromBackingInt(@intCast(data & EnvBits.kind_mask));
 }
 
 /// Number of array colspec nibbles packed in `data` (0 for non-array envs).
@@ -369,7 +369,7 @@ pub inline fn envColSpec(data: u32, i: usize) ?u32 {
 /// string of l/c/r/| chars; unknown chars count as centered). The spec is
 /// truncated to `max_spec_cols` slots.
 pub inline fn envData(kind: EnvKind, colspec: []const u8) u32 {
-    var data: u32 = @intFromEnum(kind);
+    var data: u32 = @backingInt(kind);
     const n = @min(colspec.len, EnvBits.max_spec_cols);
     data |= @as(u32, @intCast(n)) << EnvBits.count_shift;
     for (colspec[0..n], 0..) |b, i| {
@@ -418,7 +418,7 @@ pub const FractionBits = struct {
 /// Encode fraction `data` from the line flag, the optional forced style
 /// (\dfrac → .display, \tfrac → .text), and \cfrac's parts-at-display flag.
 pub inline fn fracData(line: bool, forced: ?MathStyle, parts_display: bool) u32 {
-    const code: u32 = if (forced) |f| @as(u32, @intFromEnum(f)) + 1 else 0;
+    const code: u32 = if (forced) |f| @as(u32, @backingInt(f)) + 1 else 0;
     return @intFromBool(line) |
         (code << FractionBits.forced_shift) |
         (@as(u32, @intFromBool(parts_display)) << 5);
@@ -433,7 +433,7 @@ pub inline fn fracLine(data: u32) bool {
 pub inline fn fracForcedStyle(data: u32) ?MathStyle {
     const code = (data >> FractionBits.forced_shift) & FractionBits.forced_mask;
     if (code == 0) return null;
-    return @enumFromInt(code - 1);
+    return @fromBackingInt(@intCast(code - 1));
 }
 
 /// \cfrac flag: lay out BOTH parts in display style (amsmath's continued

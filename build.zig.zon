@@ -2,11 +2,15 @@
     .name = .ztex,
     .version = "0.0.0",
     .fingerprint = 0x306a39845d94d271, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zg = .{
-            .url = "https://codeberg.org/atman/zg/archive/v0.16.2.tar.gz",
-            .hash = "zg-0.16.2-oGqU3HqftgI6rwFS90ypwfjgToH8Pz829OKuFURlm773",
+            .url = "git+https://codeberg.org/atman/zg?ref=refs/pull/108/head#2c888c632754ef0f16e17595a6d9bd2f852ef7af",
+            .hash = "zg-0.18.0-oGqU3MDboAKAOyNrpklU8sgEVTGZR0JxxYCcQdjJMDYw",
+        },
+        .translate_c = .{
+            .url = "https://codeberg.org/ziglang/translate-c/archive/2.0.2.tar.gz",
+            .hash = "translate_c-2.0.2-Q_BUWvBNBwBgPKQJPblip6M7AHNK_IPNPmyv4rSIQMQc",
         },
     },
     .paths = .{

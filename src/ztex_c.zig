@@ -514,12 +514,12 @@ export fn ztex_context_create(
     allocator: ?*const CAllocator,
     out_context: ?*?*Context,
 ) c_int {
-    const desc = allocator orelse return @intFromEnum(Status.invalid_argument);
-    const out = out_context orelse return @intFromEnum(Status.invalid_argument);
-    const alloc_fn = desc.alloc orelse return @intFromEnum(Status.invalid_argument);
-    const dealloc_fn = desc.dealloc orelse return @intFromEnum(Status.invalid_argument);
+    const desc = allocator orelse return @backingInt(Status.invalid_argument);
+    const out = out_context orelse return @backingInt(Status.invalid_argument);
+    const alloc_fn = desc.alloc orelse return @backingInt(Status.invalid_argument);
+    const dealloc_fn = desc.dealloc orelse return @backingInt(Status.invalid_argument);
     const block: u32 = @intCast(@sizeOf(Context));
-    const raw = alloc_fn(desc.user, block) orelse return @intFromEnum(Status.out_of_memory);
+    const raw = alloc_fn(desc.user, block) orelse return @backingInt(Status.out_of_memory);
     const self: *Context = @ptrCast(@alignCast(raw));
     // Written before the first allocation through the context, so the
     // allocator the pipeline receives points into storage that outlives it.
@@ -527,10 +527,10 @@ export fn ztex_context_create(
     self.clearFailure();
     self.inner = ztex.Context.init(self.gpa()) catch {
         dealloc_fn(desc.user, raw, block);
-        return @intFromEnum(Status.out_of_memory);
+        return @backingInt(Status.out_of_memory);
     };
     out.* = self;
-    return @intFromEnum(Status.ok);
+    return @backingInt(Status.ok);
 }
 
 /// Destroy a context: the pipeline's embedded Latin Modern faces, its glyph
@@ -583,23 +583,23 @@ export fn ztex_render_svg(
     out_capacity: u32,
     out_length: ?*u32,
 ) c_int {
-    const self = context orelse return @intFromEnum(Status.invalid_argument);
+    const self = context orelse return @backingInt(Status.invalid_argument);
     const len_out = out_length orelse
-        return @intFromEnum(self.fail(.invalid_argument, "out_length must not be NULL"));
+        return @backingInt(self.fail(.invalid_argument, "out_length must not be NULL"));
     self.clearFailure();
     var args: Args = undefined;
     const invalid = readArgs(self, &args, latex, latex_length, style, size_pt);
-    if (invalid != .ok) return @intFromEnum(invalid);
+    if (invalid != .ok) return @backingInt(invalid);
     var info: ztex.parse.Info = undefined;
     var list = self.inner.render(args.src, args.style, args.size_pt, &info) catch |e|
-        return @intFromEnum(self.renderFailed(e, info, args.src));
+        return @backingInt(self.renderFailed(e, info, args.src));
     defer list.deinit();
     var opts = svgOptions(options);
     opts.fonts = self.inner.fonts;
     const text = ztex.svg.render(self.gpa(), &list, opts) catch |e|
-        return @intFromEnum(self.renderFailed(e, info, args.src));
+        return @backingInt(self.renderFailed(e, info, args.src));
     defer self.gpa().free(text);
-    return @intFromEnum(self.emit(text, out, out_capacity, len_out));
+    return @backingInt(self.emit(text, out, out_capacity, len_out));
 }
 
 /// Render one formula to a pixel buffer in the caller's buffer. Ownership,
@@ -633,31 +633,31 @@ export fn ztex_render_raster(
     out_width: ?*u32,
     out_height: ?*u32,
 ) c_int {
-    const self = context orelse return @intFromEnum(Status.invalid_argument);
+    const self = context orelse return @backingInt(Status.invalid_argument);
     const len_out = out_length orelse
-        return @intFromEnum(self.fail(.invalid_argument, "out_length must not be NULL"));
+        return @backingInt(self.fail(.invalid_argument, "out_length must not be NULL"));
     const width_out = out_width orelse
-        return @intFromEnum(self.fail(.invalid_argument, "out_width must not be NULL"));
+        return @backingInt(self.fail(.invalid_argument, "out_width must not be NULL"));
     const height_out = out_height orelse
-        return @intFromEnum(self.fail(.invalid_argument, "out_height must not be NULL"));
+        return @backingInt(self.fail(.invalid_argument, "out_height must not be NULL"));
     self.clearFailure();
     var args: Args = undefined;
     const invalid = readArgs(self, &args, latex, latex_length, style, size_pt);
-    if (invalid != .ok) return @intFromEnum(invalid);
+    if (invalid != .ok) return @backingInt(invalid);
     if (options) |o| {
-        if (!std.math.isFinite(o.dpi) or o.dpi <= 0) return @intFromEnum(
+        if (!std.math.isFinite(o.dpi) or o.dpi <= 0) return @backingInt(
             self.fail(.invalid_argument, "dpi must be a positive finite number"),
         );
-        if (!std.math.isFinite(o.scale) or o.scale <= 0) return @intFromEnum(
+        if (!std.math.isFinite(o.scale) or o.scale <= 0) return @backingInt(
             self.fail(.invalid_argument, "scale must be a positive finite number"),
         );
     }
-    const raster = rasterOptions(options) orelse return @intFromEnum(
+    const raster = rasterOptions(options) orelse return @backingInt(
         self.fail(.invalid_argument, "unknown pixel format code"),
     );
     var info: ztex.parse.Info = undefined;
     var pix = self.inner.renderPixels(args.src, args.style, args.size_pt, raster, &info) catch |e|
-        return @intFromEnum(self.renderFailed(e, info, args.src));
+        return @backingInt(self.renderFailed(e, info, args.src));
     defer pix.deinit();
     const status = self.emit(pix.pixels, out, out_capacity, len_out);
     // Only an outcome that reports a size reports a frame. `.ok` drew it and
@@ -672,7 +672,7 @@ export fn ztex_render_raster(
         },
         else => {},
     }
-    return @intFromEnum(status);
+    return @backingInt(status);
 }
 
 /// Copy the text of the last failure on `context` into `buffer`, always
@@ -694,18 +694,18 @@ export fn ztex_last_error(
     capacity: u32,
     out_length: ?*u32,
 ) c_int {
-    const self = context orelse return @intFromEnum(Status.invalid_argument);
-    const len_out = out_length orelse return @intFromEnum(Status.invalid_argument);
+    const self = context orelse return @backingInt(Status.invalid_argument);
+    const len_out = out_length orelse return @backingInt(Status.invalid_argument);
     len_out.* = @intCast(self.err_len);
-    if (self.err_len == 0) return @intFromEnum(Status.ok);
+    if (self.err_len == 0) return @backingInt(Status.ok);
     // Argument misuse here is reported without touching the stored text: a
     // caller that misreads its own error must still be able to read it.
-    const buf = buffer orelse return @intFromEnum(Status.invalid_argument);
-    if (capacity == 0) return @intFromEnum(Status.invalid_argument);
+    const buf = buffer orelse return @backingInt(Status.invalid_argument);
+    if (capacity == 0) return @backingInt(Status.invalid_argument);
     const n: usize = @min(self.err_len, capacity - 1);
     @memcpy(buf[0..n], self.err_text[0..n]);
     buf[n] = 0;
-    return @intFromEnum(Status.ok);
+    return @backingInt(Status.ok);
 }
 
 // zwanzig-enable: identifier-style
@@ -825,7 +825,7 @@ test "c abi: render_svg writes an <svg document into the caller's buffer" {
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         null,
         &buf,
@@ -852,11 +852,11 @@ test "c abi: render_raster fills the caller's pixel buffer" {
     var width: u32 = 0;
     var height: u32 = 0;
     // A size query: no buffer at all, just the size the caller must provide.
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.buffer_too_small)), ztex_render_raster(
+    try testing.expectEqual(@as(c_int, @backingInt(Status.buffer_too_small)), ztex_render_raster(
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         &opts,
         null,
@@ -872,7 +872,7 @@ test "c abi: render_raster fills the caller's pixel buffer" {
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         &opts,
         bytes.ptr,
@@ -913,7 +913,7 @@ test "c abi: the ink color crosses as 0xRRGGBBAA, alpha last" {
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         &opts,
         &buf,
@@ -953,7 +953,7 @@ test "c abi: the alpha mask format is one byte per pixel" {
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         &opts,
         bytes.ptr,
@@ -977,14 +977,14 @@ test "c abi: a malformed formula reports the parse failure and names it" {
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         null,
         &buf,
         @intCast(buf.len),
         &len,
     );
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.parse_error)), status);
+    try testing.expectEqual(@as(c_int, @backingInt(Status.parse_error)), status);
     var msg: [err_text_max]u8 = undefined;
     const text = try f.lastError(&msg);
     try testing.expect(std.mem.startsWith(u8, text, "parse error: Missing argument"));
@@ -1003,14 +1003,14 @@ test "c abi: a too-small buffer is refused, never partially filled" {
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         null,
         &small,
         @intCast(small.len),
         &len,
     );
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.buffer_too_small)), status);
+    try testing.expectEqual(@as(c_int, @backingInt(Status.buffer_too_small)), status);
     // The caller learns the exact size it must provide...
     try testing.expect(len > small.len);
     // ...and got no bytes at all, not even a NUL.
@@ -1021,7 +1021,7 @@ test "c abi: a too-small buffer is refused, never partially filled" {
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         null,
         exact.ptr,
@@ -1040,22 +1040,22 @@ test "c abi: bad arguments are refused before any rendering" {
     var len: u32 = 0;
     const cap: u32 = @intCast(buf.len);
     // No context, and no room to report the size.
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.invalid_argument)), ztex_render_svg(
+    try testing.expectEqual(@as(c_int, @backingInt(Status.invalid_argument)), ztex_render_svg(
         null,
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         null,
         &buf,
         cap,
         &len,
     ));
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.invalid_argument)), ztex_render_svg(
+    try testing.expectEqual(@as(c_int, @backingInt(Status.invalid_argument)), ztex_render_svg(
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         null,
         &buf,
@@ -1063,7 +1063,7 @@ test "c abi: bad arguments are refused before any rendering" {
         null,
     ));
     // An unknown style code, and a size that is not a usable point size.
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.invalid_argument)), ztex_render_svg(
+    try testing.expectEqual(@as(c_int, @backingInt(Status.invalid_argument)), ztex_render_svg(
         f.ctx(),
         src.ptr,
         @intCast(src.len),
@@ -1074,11 +1074,11 @@ test "c abi: bad arguments are refused before any rendering" {
         cap,
         &len,
     ));
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.invalid_argument)), ztex_render_svg(
+    try testing.expectEqual(@as(c_int, @backingInt(Status.invalid_argument)), ztex_render_svg(
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         0,
         null,
         &buf,
@@ -1086,11 +1086,11 @@ test "c abi: bad arguments are refused before any rendering" {
         &len,
     ));
     // A NULL source is only an empty formula, never a non-empty one.
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.invalid_argument)), ztex_render_svg(
+    try testing.expectEqual(@as(c_int, @backingInt(Status.invalid_argument)), ztex_render_svg(
         f.ctx(),
         null,
         3,
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         null,
         &buf,
@@ -1111,11 +1111,11 @@ test "c abi: raster options are validated, and NULL means the defaults" {
     var height: u32 = 0;
     // A C caller who writes `{0}` gets dpi 0, which is not a resolution.
     const zeroed = std.mem.zeroes(RasterOptions);
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.invalid_argument)), ztex_render_raster(
+    try testing.expectEqual(@as(c_int, @backingInt(Status.invalid_argument)), ztex_render_raster(
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         &zeroed,
         null,
@@ -1128,11 +1128,11 @@ test "c abi: raster options are validated, and NULL means the defaults" {
     try testing.expect(std.mem.indexOf(u8, try f.lastError(&msg), "dpi") != null);
     // An unknown pixel format is refused rather than silently defaulted.
     const bad: RasterOptions = .{ .dpi = 96, .format = 7 };
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.invalid_argument)), ztex_render_raster(
+    try testing.expectEqual(@as(c_int, @backingInt(Status.invalid_argument)), ztex_render_raster(
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         &bad,
         null,
@@ -1142,11 +1142,11 @@ test "c abi: raster options are validated, and NULL means the defaults" {
         &height,
     ));
     // NULL options render at the pipeline's defaults (96 dpi).
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.buffer_too_small)), ztex_render_raster(
+    try testing.expectEqual(@as(c_int, @backingInt(Status.buffer_too_small)), ztex_render_raster(
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         null,
         null,
@@ -1168,11 +1168,11 @@ test "c abi: a negative SVG padding is refused before a document is built" {
     var len: u32 = 0xdeadbeef;
     // The document this used to report as a success declared a negative
     // frame: `width="-1988pt"` over a viewBox of "0 0 -1988 …".
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.invalid_argument)), ztex_render_svg(
+    try testing.expectEqual(@as(c_int, @backingInt(Status.invalid_argument)), ztex_render_svg(
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         &opts,
         &out,
@@ -1193,7 +1193,7 @@ test "c abi: a negative SVG padding is refused before a document is built" {
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         &fine,
         &doc,
@@ -1222,11 +1222,11 @@ test "c abi: a raster frame the 32-bit size cannot describe is refused unallocat
     // 2 * 2^31 pixels of margin is one past the largest u32: the frame has no
     // 32-bit width, and computing it used to abort on the overflow.
     const huge_margin: RasterOptions = .{ .dpi = 96, .padding = 2147483648 };
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.output_too_large)), ztex_render_raster(
+    try testing.expectEqual(@as(c_int, @backingInt(Status.output_too_large)), ztex_render_raster(
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         &huge_margin,
         &out,
@@ -1238,11 +1238,11 @@ test "c abi: a raster frame the 32-bit size cannot describe is refused unallocat
     // A resolution that is finite, positive and enormous frames an equally
     // unrepresentable image: 1e30 dpi is 1.4e28 px per point.
     const huge_dpi: RasterOptions = .{ .dpi = 1e30 };
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.output_too_large)), ztex_render_raster(
+    try testing.expectEqual(@as(c_int, @backingInt(Status.output_too_large)), ztex_render_raster(
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         &huge_dpi,
         &out,
@@ -1260,11 +1260,11 @@ test "c abi: a raster frame the 32-bit size cannot describe is refused unallocat
     try testing.expect(std.mem.indexOf(u8, try f.lastError(&msg), "32-bit") != null);
     // The same allocator still renders an ordinary formula, so the statuses
     // above came from the frame and not from a starving allocator.
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.buffer_too_small)), ztex_render_raster(
+    try testing.expectEqual(@as(c_int, @backingInt(Status.buffer_too_small)), ztex_render_raster(
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         null,
         null,
@@ -1295,11 +1295,11 @@ test "c abi: an rgba payload past the 32-bit length ABI is refused unallocated" 
     var probe_len: u32 = 0;
     var probe_width: u32 = 0;
     var probe_height: u32 = 0;
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.buffer_too_small)), ztex_render_raster(
+    try testing.expectEqual(@as(c_int, @backingInt(Status.buffer_too_small)), ztex_render_raster(
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         null,
         null,
@@ -1316,11 +1316,11 @@ test "c abi: an rgba payload past the 32-bit length ABI is refused unallocated" 
     var len: u32 = 123;
     var width: u32 = 123;
     var height: u32 = 123;
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.output_too_large)), ztex_render_raster(
+    try testing.expectEqual(@as(c_int, @backingInt(Status.output_too_large)), ztex_render_raster(
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         &hostile,
         &out,
@@ -1344,11 +1344,11 @@ test "c abi: an rgba payload past the 32-bit length ABI is refused unallocated" 
     try testing.expect(std.mem.indexOf(u8, try f.lastError(&msg), "32-bit") != null);
     // The same context still renders an ordinary formula, so the status above
     // came from the frame and not from an allocator that ran out.
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.buffer_too_small)), ztex_render_raster(
+    try testing.expectEqual(@as(c_int, @backingInt(Status.buffer_too_small)), ztex_render_raster(
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         null,
         null,
@@ -1366,11 +1366,11 @@ test "c abi: last_error truncates to the caller's buffer" {
     defer f.destroy();
     const src: [:0]const u8 = "\\nosuchcommand";
     var len: u32 = 0;
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.parse_error)), ztex_render_svg(
+    try testing.expectEqual(@as(c_int, @backingInt(Status.parse_error)), ztex_render_svg(
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         null,
         null,
@@ -1400,7 +1400,7 @@ test "c abi: last_error truncates to the caller's buffer" {
         f.ctx(),
         ok.ptr,
         @intCast(ok.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         null,
         &buf,
@@ -1422,18 +1422,18 @@ test "c abi: destroying the context gives every byte back" {
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         null,
         &buf,
         @intCast(buf.len),
         &len,
     ));
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.buffer_too_small)), ztex_render_raster(
+    try testing.expectEqual(@as(c_int, @backingInt(Status.buffer_too_small)), ztex_render_raster(
         f.ctx(),
         src.ptr,
         @intCast(src.len),
-        @intFromEnum(Style.display),
+        @backingInt(Style.display),
         20,
         null,
         null,
@@ -1447,7 +1447,7 @@ test "c abi: destroying the context gives every byte back" {
     try testing.expectEqual(@as(usize, 0), f.counted.state.live);
     // Both halves of the surface tolerate a NULL handle.
     ztex_context_destroy(null);
-    try testing.expectEqual(@as(c_int, @intFromEnum(Status.invalid_argument)), ztex_last_error(
+    try testing.expectEqual(@as(c_int, @backingInt(Status.invalid_argument)), ztex_last_error(
         null,
         null,
         0,
@@ -1456,9 +1456,9 @@ test "c abi: destroying the context gives every byte back" {
 }
 
 test "c abi: every status code has its own name" {
-    inline for (@typeInfo(Status).@"enum".fields) |field| {
-        const code: c_int = @intCast(field.value);
-        try testing.expectEqualStrings(field.name, std.mem.span(ztex_status_name(code)));
+    inline for (@typeInfo(Status).@"enum".field_names) |name| {
+        const code: c_int = @intCast(@backingInt(@field(Status, name)));
+        try testing.expectEqualStrings(name, std.mem.span(ztex_status_name(code)));
     }
     try testing.expectEqualStrings("unknown status", std.mem.span(ztex_status_name(1234)));
 }

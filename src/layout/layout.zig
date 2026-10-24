@@ -367,7 +367,7 @@ fn layoutInner(
             fm,
             style,
             size_pt,
-            combineStyle(current_style, @enumFromInt(n.data)),
+            combineStyle(current_style, @fromBackingInt(@intCast(n.data))),
             cramped,
         ),
         // \color{red}… and \textcolor{red}{…}: a paint scope. The child
@@ -399,7 +399,7 @@ fn layoutInner(
         // cramped bit clears (forced styles are uncramped — the classic
         // escape from a denominator's cramped textstyle).
         .mathstyle => blk: {
-            const ms: Style = @enumFromInt(n.data);
+            const ms: Style = @fromBackingInt(@intCast(n.data));
             const gl = metrics.glue(fm);
             break :blk layoutInner(
                 list,
@@ -566,7 +566,7 @@ const glue_table = blk: {
 fn roleOfCp(cp: u21) Role {
     // Comptime LUT for ASCII codepoints (< 128)
     const ascii_roles = comptime blk: {
-        var lut: [128]Role = [_]Role{.ord} ** 128;
+        var lut: [128]Role = @splat(.ord);
         const bin = [_]u21{ 0x2B, 0x2D };
         const rel = [_]u21{ 0x3D, 0x3C, 0x3E, 0x3A };
         const open = [_]u21{ 0x28, 0x5B, 0x7B };
@@ -834,9 +834,9 @@ inline fn quadEm(_: Style) f32 {
 
 /// Glue units (0-3) between two adjacent atoms in the current style.
 fn glueUnits(l: Role, r: Role, style: Style) u8 {
-    const i: usize = @intFromEnum(l);
-    const j: usize = @intFromEnum(r);
-    return glue_table[i][j][@intFromEnum(style)];
+    const i: usize = @backingInt(l);
+    const j: usize = @backingInt(r);
+    return glue_table[i][j][@backingInt(style)];
 }
 
 /// Scale a 10pt-base metric to the current size.
@@ -4120,7 +4120,7 @@ fn opTailIc(
         // beside italic tail (TeX appends delta only when the op is NOT
         // limits). \displaylimits/\nolimits keep the default/beside tail.
         if ((n.data & atom.LimitsBits.mask) == atom.LimitsBits.force) return 0;
-        const op: atom.BigOp = @enumFromInt(n.data & atom.LimitsBits.value_mask);
+        const op: atom.BigOp = @fromBackingInt(@intCast(n.data & atom.LimitsBits.value_mask));
         if (bigOpLimits(op)) return 0;
         const base_adv = metrics.bigOpInk(op, false).advance;
         const disp_adv = metrics.bigOpInk(op, true).disp_advance;
@@ -4172,7 +4172,7 @@ fn layoutScript(
     const forced_limits = op_bits == atom.LimitsBits.force;
     const forced_beside = op_bits == atom.LimitsBits.force_beside;
     const default_limits = if (base_u_atom.tag == .op)
-        bigOpLimits(@enumFromInt(base_u_atom.data & atom.LimitsBits.value_mask))
+        bigOpLimits(@fromBackingInt(@intCast(base_u_atom.data & atom.LimitsBits.value_mask)))
     else if (base_u_atom.tag == .opname)
         (base_u_atom.data & atom.LimitsBits.value_mask) != 0
     else
@@ -4221,7 +4221,7 @@ fn layoutScript(
             // sup at the base advance, sub at advance − base ic (∫ 0.665 /
             // 0.333em — see below).
             // The text ∑ (ic 0) puts both scripts at the advance 1.056em.
-            const op: atom.BigOp = @enumFromInt(base_u_atom.data & atom.LimitsBits.value_mask);
+            const op: atom.BigOp = @fromBackingInt(@intCast(base_u_atom.data & atom.LimitsBits.value_mask));
             const ink = metrics.bigOpInk(op, style == .display);
             if (style == .display and !bigOpLimits(op)) {
                 const base_adv = metrics.bigOpInk(op, false).advance;
@@ -4729,7 +4729,7 @@ fn layoutOp(
 ) !u32 {
     const n = ast.node(idx);
     const span = ast.span(idx);
-    const op: atom.BigOp = @enumFromInt(n.data & atom.LimitsBits.value_mask);
+    const op: atom.BigOp = @fromBackingInt(@intCast(n.data & atom.LimitsBits.value_mask));
     const cp = bigOpCodepoint(op);
     const display = style == .display;
     const ink = metrics.bigOpInk(op, display);
@@ -4843,7 +4843,7 @@ fn layoutMathChoice(
     cstyle: atom.CharStyle,
 ) !u32 {
     const branch: Style = style; // branch i is set at style i
-    const child = ast.child(idx, @intFromEnum(branch));
+    const child = ast.child(idx, @backingInt(branch));
     const gl = metrics.glue(fm);
     return layoutInner(
         list,
@@ -4915,7 +4915,7 @@ fn denomLastCharScale(
             },
             .mathstyle => {
                 if (n.num_children == 0) return scale;
-                const ms: Style = @enumFromInt(n.data);
+                const ms: Style = @fromBackingInt(@intCast(n.data));
                 scale *= styleScale(gl, ms) / styleScale(gl, style);
                 style = ms;
                 u = ast.child(u, 0);
@@ -5196,7 +5196,7 @@ fn layoutText(
     // outer face is restored when the inner run ends, while a bare `\text{…}`
     // inside an italic formula stays roman and a math alphabet
     // (`\mathbf{\mathbb R}`) is untouched. See `combineStyle`.
-    const base_style: atom.CharStyle = combineStyle(cstyle, @enumFromInt(n.data));
+    const base_style: atom.CharStyle = combineStyle(cstyle, @fromBackingInt(@intCast(n.data)));
     // The run's bytes are the INSIDE of the braces that frame it: the parser's
     // textFace leaf always spans the balanced group it opened, so the span's
     // first and last bytes are that group's `{` and `}`. Stripping them
@@ -5934,7 +5934,7 @@ test "layout: big operator limits in display style become a vbox" {
     defer a.deinit();
     try a.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
     try a.pushToken(.{ .tag = .char, .start = 1, .end = 2 });
-    const op = try a.createLeaf(.op, 0, 0, @intFromEnum(atom.BigOp.sum));
+    const op = try a.createLeaf(.op, 0, 0, @backingInt(atom.BigOp.sum));
     const sup = try a.createLeaf(.char, 0, 1, 0); // 'a'
     const sub = try a.createLeaf(.char, 1, 1, 0); // 'b'
     const children = [_]atom.Node{ a.node(op), a.node(sup), a.node(sub) };
@@ -5960,7 +5960,7 @@ test "layout: big operator beside scripts in text style is a script box" {
     defer a.deinit();
     try a.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
     try a.pushToken(.{ .tag = .char, .start = 1, .end = 2 });
-    const op = try a.createLeaf(.op, 0, 0, @intFromEnum(atom.BigOp.sum));
+    const op = try a.createLeaf(.op, 0, 0, @backingInt(atom.BigOp.sum));
     const sup = try a.createLeaf(.char, 0, 1, 0);
     const children = [_]atom.Node{ a.node(op), a.node(sup) };
     const script = try a.createNode(.script, 0, 1, &children, atom.ScriptBits.sup);
@@ -5975,7 +5975,7 @@ test "layout: \\limits forces over/under in TEXT style (TeX applies \\limits in 
     defer a.deinit();
     try a.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
     try a.pushToken(.{ .tag = .char, .start = 1, .end = 2 });
-    const op = try a.createLeaf(.op, 0, 0, @intFromEnum(atom.BigOp.sum) | atom.LimitsBits.force);
+    const op = try a.createLeaf(.op, 0, 0, @backingInt(atom.BigOp.sum) | atom.LimitsBits.force);
     const sub = try a.createLeaf(.char, 1, 1, 0);
     const children = [_]atom.Node{ a.node(op), a.node(sub) };
     const script = try a.createNode(.script, 0, 2, &children, atom.ScriptBits.sub);
@@ -5996,7 +5996,7 @@ test "layout: \\nolimits forces beside scripts in DISPLAY style" {
     defer a.deinit();
     try a.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
     try a.pushToken(.{ .tag = .char, .start = 1, .end = 2 });
-    const op = try a.createLeaf(.op, 0, 0, @intFromEnum(atom.BigOp.sum) | atom.LimitsBits.force_beside);
+    const op = try a.createLeaf(.op, 0, 0, @backingInt(atom.BigOp.sum) | atom.LimitsBits.force_beside);
     const sup = try a.createLeaf(.char, 0, 1, 0);
     const children = [_]atom.Node{ a.node(op), a.node(sup) };
     const script = try a.createNode(.script, 0, 1, &children, atom.ScriptBits.sup);
@@ -6016,7 +6016,7 @@ test "layout: \\limits on \\int in display style becomes a limits vbox" {
     defer a.deinit();
     try a.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
     try a.pushToken(.{ .tag = .char, .start = 1, .end = 2 });
-    const op = try a.createLeaf(.op, 0, 0, @intFromEnum(atom.BigOp.int) | atom.LimitsBits.force);
+    const op = try a.createLeaf(.op, 0, 0, @backingInt(atom.BigOp.int) | atom.LimitsBits.force);
     const sub = try a.createLeaf(.char, 1, 1, 0);
     const children = [_]atom.Node{ a.node(op), a.node(sub) };
     const script = try a.createNode(.script, 0, 2, &children, atom.ScriptBits.sub);
@@ -6062,7 +6062,7 @@ test "layout: text yields one char box per grapheme" {
     try a.pushToken(.{ .tag = .char, .start = 2, .end = 3 });
     try a.pushToken(.{ .tag = .char, .start = 3, .end = 4 });
     try a.pushToken(.{ .tag = .r_group, .start = 4, .end = 5 });
-    const t = try a.createLeaf(.text, 0, 5, @intFromEnum(atom.CharStyle.roman));
+    const t = try a.createLeaf(.text, 0, 5, @backingInt(atom.CharStyle.roman));
     const b = try layout(&list, &a, t, &fm_default, .text, 10, .italic);
     const tb = list.get(b);
     try testing.expectEqual(.hbox, tb.kind);
@@ -6081,7 +6081,7 @@ test "layout: text with a CJK char uses the DisplayWidth fallback" {
     try a.pushToken(.{ .tag = .l_group, .start = 0, .end = 1 });
     try a.pushToken(.{ .tag = .char, .start = 1, .end = 4 });
     try a.pushToken(.{ .tag = .r_group, .start = 4, .end = 5 });
-    const t = try a.createLeaf(.text, 0, 3, @intFromEnum(atom.CharStyle.roman));
+    const t = try a.createLeaf(.text, 0, 3, @backingInt(atom.CharStyle.roman));
     const b = try layout(&list, &a, t, &fm_default, .text, 10, .italic);
     const tb = list.get(b);
     try testing.expectEqual(.hbox, tb.kind);
@@ -6122,7 +6122,7 @@ fn textRunLeaf(a: *atom.Ast, face: atom.CharStyle) !u32 {
         i += 1;
         try a.pushToken(.{ .tag = tag, .start = start, .end = @intCast(i) });
     }
-    return a.createLeaf(.text, 0, @intCast(a.tokens.items.len), @intFromEnum(face));
+    return a.createLeaf(.text, 0, @intCast(a.tokens.items.len), @backingInt(face));
 }
 
 test "layout: a partial text-face nest draws bold, bold italic, bold and restores" {
@@ -6244,8 +6244,15 @@ test "layout: a text run's interword space is the face it is drawn in" {
 test "layout: an overdeep raw text leaf is invalid" {
     var list = box.BoxList.init(testing.allocator);
     defer list.deinit();
-    const open = "\\textit{" ** (atom.max_text_nesting + 8);
-    const run = open ++ "x" ++ "}" ** (atom.max_text_nesting + 8);
+    const depth = atom.max_text_nesting + 8;
+    const open = comptime blk: {
+        var bytes: [depth * "\\textit{".len]u8 = undefined;
+        for (0..depth) |i| {
+            @memcpy(bytes[i * "\\textit{".len ..][0.."\\textit{".len], "\\textit{");
+        }
+        break :blk bytes;
+    };
+    const run = open ++ "x" ++ @as([depth]u8, @splat('}'));
     var a = atom.Ast.init(testing.allocator, "{" ++ run ++ "}");
     defer a.deinit();
     const leaf = try textRunLeaf(&a, .roman);
@@ -6309,7 +6316,7 @@ test "layout: styled wraps a char with the declared style" {
     defer a.deinit();
     try a.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
     const c = try a.createLeaf(.char, 0, 1, 0);
-    const st = try a.createNode(.styled, 0, 1, &.{a.node(c)}, @intFromEnum(atom.CharStyle.roman));
+    const st = try a.createNode(.styled, 0, 1, &.{a.node(c)}, @backingInt(atom.CharStyle.roman));
     const b = try layout(&list, &a, st, &fm_default, .text, 10, .italic);
     const cb = list.get(b);
     try testing.expectEqual(.char, cb.kind);
@@ -6475,11 +6482,11 @@ test "layout: mathstyle wrapper forces style and rescales size" {
     try a.pushToken(.{ .tag = .char, .start = 0, .end = 1 });
     const c = try a.createLeaf(.char, 0, 1, 0);
     // \scriptstyle in display context: content shrinks to script size (7pt)
-    const ms1 = try a.createNode(.mathstyle, 0, 1, &.{a.node(c)}, @intFromEnum(atom.MathStyle.script));
+    const ms1 = try a.createNode(.mathstyle, 0, 1, &.{a.node(c)}, @backingInt(atom.MathStyle.script));
     const b1 = try layout(&list, &a, ms1, &fm_default, .display, 10, .italic);
     try testing.expectApproxEqAbs(@as(f32, 7.0), list.charData(b1).size, 0.01);
     // \displaystyle in a script context: content grows back to text size (10pt)
-    const ms2 = try a.createNode(.mathstyle, 0, 1, &.{a.node(c)}, @intFromEnum(atom.MathStyle.display));
+    const ms2 = try a.createNode(.mathstyle, 0, 1, &.{a.node(c)}, @backingInt(atom.MathStyle.display));
     const b2 = try layout(&list, &a, ms2, &fm_default, .script, 7, .italic);
     try testing.expectApproxEqAbs(@as(f32, 10.0), list.charData(b2).size, 0.01);
 }
@@ -7123,7 +7130,7 @@ test "layout: the big operators box by their measured font ink" {
     defer a.deinit();
     try a.pushToken(.{ .tag = .char, .start = 0, .end = 5 });
     for (cases) |c| {
-        const leaf = try a.createLeaf(.op, 0, 1, @intFromEnum(c.op));
+        const leaf = try a.createLeaf(.op, 0, 1, @backingInt(c.op));
         for ([_]struct { style: Style, display: bool }{
             .{ .style = .text, .display = false },
             .{ .style = .display, .display = true },
@@ -7164,7 +7171,7 @@ test "layout: the plain operators still draw at the current size" {
     defer a.deinit();
     try a.pushToken(.{ .tag = .char, .start = 0, .end = 2 });
     for (cases) |c| {
-        const leaf = try a.createLeaf(.op, 0, 1, @intFromEnum(c.op));
+        const leaf = try a.createLeaf(.op, 0, 1, @backingInt(c.op));
         const b = try layout(&list, &a, leaf, &fm_default, .display, 10, .italic);
         try testing.expectApproxEqAbs(10, list.charData(b).size, 0.0001);
     }
@@ -7308,7 +7315,7 @@ fn tagNode(a: *atom.Ast, start: u32) !u32 {
         digit_tok,
         1,
         &.{a.node(arg)},
-        @intFromEnum(atom.CharStyle.roman),
+        @backingInt(atom.CharStyle.roman),
     );
     return a.createNode(.row, start, 7, &.{a.node(styled)}, tag_row_data);
 }
@@ -7987,7 +7994,7 @@ test "layout: a scaled big integral draws the base glyph its box was sized for" 
             var a = atom.Ast.init(testing.allocator, "op");
             defer a.deinit();
             try a.pushToken(.{ .tag = .char, .start = 0, .end = 2 });
-            const op = try a.createLeaf(.op, 0, 1, @intFromEnum(c.op));
+            const op = try a.createLeaf(.op, 0, 1, @backingInt(c.op));
             const b = try layout(&list, &a, op, &fm_default, .display, size_pt, .italic);
             const cd = list.charData(b);
             try testing.expectApproxEqAbs(size_pt * c.scale, cd.size, 0.001);

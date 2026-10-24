@@ -1297,7 +1297,7 @@ pub const Parser = struct {
 
                             &children_one,
 
-                            @intFromEnum(ms),
+                            @backingInt(ms),
                         );
                         const cn = ast.node(node);
                         try children.append(self.gpa, cn);
@@ -1618,7 +1618,7 @@ pub const Parser = struct {
                 const rn = ast.node(rest);
                 const num_tokens = (rn.first_token + rn.num_tokens) - cmd_tok;
                 const children = [_]atom.Node{ast.node(rest)};
-                return self.createNode(ast, .mathstyle, cmd_tok, num_tokens, &children, @intFromEnum(ms));
+                return self.createNode(ast, .mathstyle, cmd_tok, num_tokens, &children, @backingInt(ms));
             }
         }
         return self.parseSingleAtom(ast);
@@ -2001,7 +2001,7 @@ pub const Parser = struct {
     }
 
     fn op(_: *Parser, ast: *atom.Ast, cmd_tok: u32, which: atom.BigOp) Error!u32 {
-        return ast.createLeaf(.op, cmd_tok, 1, @intFromEnum(which));
+        return ast.createLeaf(.op, cmd_tok, 1, @backingInt(which));
     }
 
     fn style(self: *Parser, ast: *atom.Ast, cmd_tok: u32, s: atom.CharStyle) Error!u32 {
@@ -2009,7 +2009,7 @@ pub const Parser = struct {
         const inode = ast.node(inner);
         const num_tokens = (inode.first_token + inode.num_tokens) - cmd_tok;
         const children = [_]atom.Node{ast.node(inner)};
-        return self.createNode(ast, .styled, cmd_tok, num_tokens, &children, @intFromEnum(s));
+        return self.createNode(ast, .styled, cmd_tok, num_tokens, &children, @backingInt(s));
     }
 
     /// `\frac` (line, no force), `\dfrac`/`\tfrac` (line + forced style), or
@@ -2332,7 +2332,7 @@ pub const Parser = struct {
         // just past the closing `}`, so whatever follows the run is the next
         // atom of the enclosing row.
         const close_tok = try self.scanBracedGroup(open_tok);
-        return ast.createLeaf(.text, open_tok, close_tok - open_tok + 1, @intFromEnum(face));
+        return ast.createLeaf(.text, open_tok, close_tok - open_tok + 1, @backingInt(face));
     }
 
     /// The token index of the `}` closing the group that opens at
@@ -2500,7 +2500,7 @@ pub const Parser = struct {
             an.first_token,
             an.num_tokens,
             &[_]atom.Node{an},
-            @intFromEnum(atom.CharStyle.roman),
+            @backingInt(atom.CharStyle.roman),
         );
         const sn = ast.node(styled);
         const children = [_]atom.Node{sn};
@@ -3163,7 +3163,7 @@ pub const Parser = struct {
         const leaf = try ast.createLeaf(.space, cmd_tok, 1, atom.emToFixed(value));
         const ln = ast.node(leaf);
         const children = [_]atom.Node{ln};
-        const data = kern_row_data | @intFromEnum(unit);
+        const data = kern_row_data | @backingInt(unit);
         return self.createNode(ast, .row, cmd_tok, 1, &children, data);
     }
 
@@ -3595,7 +3595,7 @@ test "parser: \\limits sets the force bit on the preceding op" {
     try testing.expectEqual(atom.LimitsBits.force, op.data & atom.LimitsBits.force);
     try testing.expectEqual(@as(u32, 0), op.data & atom.LimitsBits.force_beside);
     // the BigOp enum still decodes from the masked data
-    try testing.expectEqual(atom.BigOp.int, @as(atom.BigOp, @enumFromInt(op.data & atom.LimitsBits.value_mask)));
+    try testing.expectEqual(atom.BigOp.int, @as(atom.BigOp, @fromBackingInt(@intCast(op.data & atom.LimitsBits.value_mask))));
 }
 
 test "parser: \\nolimits sets the force-beside bit on the preceding op" {
@@ -3606,7 +3606,7 @@ test "parser: \\nolimits sets the force-beside bit on the preceding op" {
     try testing.expectEqual(.op, op.tag);
     try testing.expectEqual(atom.LimitsBits.force_beside, op.data & atom.LimitsBits.force_beside);
     try testing.expectEqual(@as(u32, 0), op.data & atom.LimitsBits.force);
-    try testing.expectEqual(atom.BigOp.sum, @as(atom.BigOp, @enumFromInt(op.data & atom.LimitsBits.value_mask)));
+    try testing.expectEqual(atom.BigOp.sum, @as(atom.BigOp, @fromBackingInt(@intCast(op.data & atom.LimitsBits.value_mask))));
 }
 
 test "parser: \\displaylimits restores the op default (no override bits)" {
@@ -3842,7 +3842,7 @@ test "parser: style switches wrap the rest of the group in mathstyle" {
     try testing.expectEqual(@as(u16, 1), root.num_children);
     const ms = ast.node(ast.child(ast.root, 0));
     try testing.expectEqual(.mathstyle, ms.tag);
-    try testing.expectEqual(@as(u32, @intFromEnum(atom.MathStyle.display)), ms.data);
+    try testing.expectEqual(@as(u32, @backingInt(atom.MathStyle.display)), ms.data);
     // the wrapped child is a row of BOTH atoms (rest-of-group semantics)
     const inner = ast.node(ast.child(ast.child(ast.root, 0), 0));
     try testing.expectEqual(.row, inner.tag);
@@ -3854,7 +3854,7 @@ test "parser: textstyle sum keeps limits inside the wrapper" {
     defer ast.deinit();
     const ms = ast.node(ast.child(ast.root, 0));
     try testing.expectEqual(.mathstyle, ms.tag);
-    try testing.expectEqual(@as(u32, @intFromEnum(atom.MathStyle.text)), ms.data);
+    try testing.expectEqual(@as(u32, @backingInt(atom.MathStyle.text)), ms.data);
     const inner = ast.node(ast.child(ast.child(ast.root, 0), 0));
     try testing.expectEqual(.row, inner.tag);
     try testing.expectEqual(@as(u16, 2), inner.num_children); // \sum_{i=1}^{n}, x_i
@@ -3876,7 +3876,7 @@ test "parser: braced style switch in a script field wraps the group's row" {
     try testing.expectEqual(.row, inner_row.tag);
     const ms = ast.node(ast.child(ast.child(ast.child(ast.child(ast.root, 0), 1), 0), 0));
     try testing.expectEqual(.mathstyle, ms.tag);
-    try testing.expectEqual(@as(u32, @intFromEnum(atom.MathStyle.display)), ms.data);
+    try testing.expectEqual(@as(u32, @backingInt(atom.MathStyle.display)), ms.data);
 }
 
 test "parser: unbraced style switch in a script field wraps the single atom" {
@@ -3886,7 +3886,7 @@ test "parser: unbraced style switch in a script field wraps the single atom" {
     try testing.expectEqual(.script, script.tag);
     const sup = ast.node(ast.child(ast.child(ast.root, 0), 1));
     try testing.expectEqual(.mathstyle, sup.tag);
-    try testing.expectEqual(@as(u32, @intFromEnum(atom.MathStyle.display)), sup.data);
+    try testing.expectEqual(@as(u32, @backingInt(atom.MathStyle.display)), sup.data);
     // the wrapped child is the single atom '2' (the rest of the row is outside)
     const inner = ast.node(ast.child(ast.child(ast.child(ast.root, 0), 1), 0));
     try testing.expectEqual(.char, inner.tag);
@@ -3902,7 +3902,7 @@ test "parser: empty braced style switch parses as an empty mathstyle group" {
     try testing.expectEqual(.row, num_row.tag);
     const ms = ast.node(ast.child(ast.child(ast.child(ast.root, 0), 0), 0));
     try testing.expectEqual(.mathstyle, ms.tag);
-    try testing.expectEqual(@as(u32, @intFromEnum(atom.MathStyle.display)), ms.data);
+    try testing.expectEqual(@as(u32, @backingInt(atom.MathStyle.display)), ms.data);
 }
 
 test "parser: horizontal space commands carry em widths" {
@@ -3927,7 +3927,7 @@ test "parser: text becomes a roman text leaf" {
     defer ast.deinit();
     const txt = ast.node(ast.child(ast.root, 0));
     try testing.expectEqual(.text, txt.tag);
-    try testing.expectEqual(@as(u32, @intFromEnum(atom.CharStyle.roman)), txt.data);
+    try testing.expectEqual(@as(u32, @backingInt(atom.CharStyle.roman)), txt.data);
 }
 
 test "parser: style commands set CharStyle data" {
@@ -3945,7 +3945,7 @@ test "parser: style commands set CharStyle data" {
         defer ast.deinit();
         const st = ast.node(ast.child(ast.root, 0));
         try testing.expectEqual(.styled, st.tag);
-        try testing.expectEqual(@as(u32, @intFromEnum(c.style)), st.data);
+        try testing.expectEqual(@as(u32, @backingInt(c.style)), st.data);
         try testing.expectEqual(@as(u16, 1), st.num_children);
     }
 }
@@ -4818,7 +4818,7 @@ test "parser: \\tag is a row of the braced argument in a roman scope" {
     const styled_idx = ast.child(tag_node, 0);
     const styled = ast.node(styled_idx);
     try testing.expectEqual(.styled, styled.tag);
-    try testing.expectEqual(@intFromEnum(atom.CharStyle.roman), styled.data);
+    try testing.expectEqual(@backingInt(atom.CharStyle.roman), styled.data);
     // The argument keeps its OWN token span, so its glyph aliases the real
     // source bytes instead of a synthesized copy.
     const arg = ast.node(ast.child(styled_idx, 0));
@@ -4979,7 +4979,7 @@ test "parser: the big operators parse to .op leaves with their BigOp" {
         defer ast.deinit();
         const op = ast.node(ast.child(ast.root, 0));
         try testing.expectEqual(.op, op.tag);
-        try testing.expectEqual(@as(u32, @intFromEnum(c.which)), op.data);
+        try testing.expectEqual(@as(u32, @backingInt(c.which)), op.data);
         // A big operator takes scripts like any atom (\bigwedge_{i}).
         var buf: [32]u8 = undefined;
         const scripted_src = try std.fmt.bufPrint(&buf, "{s}_{{i}}", .{c.src});
@@ -5265,7 +5265,7 @@ test "parser: \\text / \\textit / \\textbf are one raw text leaf in the requeste
         const leaf = ast.node(firstAtom(&ast));
         try testing.expectEqual(.text, leaf.tag);
         try testing.expectEqual(@as(u16, 0), leaf.num_children);
-        try testing.expectEqual(@as(u32, @intFromEnum(c.style)), leaf.data);
+        try testing.expectEqual(@as(u32, @backingInt(c.style)), leaf.data);
         // The span is the run's OWN braces: the command is consumed (never
         // typeset), and the drawn bytes are everything between the braces.
         const span = ast.span(firstAtom(&ast));
@@ -5291,7 +5291,7 @@ test "parser: a nested text face is one run, and the outer cursor resumes after 
         const leaf = ast.node(firstAtom(&ast));
         try testing.expectEqual(.text, leaf.tag);
         try testing.expectEqual(@as(u16, 0), leaf.num_children);
-        try testing.expectEqual(@as(u32, @intFromEnum(c.style)), leaf.data);
+        try testing.expectEqual(@as(u32, @backingInt(c.style)), leaf.data);
         const span = ast.span(firstAtom(&ast));
         try testing.expectEqual(c.src.len, @as(usize, span.end));
         try testing.expectEqual(@as(u8, '{'), c.src[span.start]);
@@ -5305,7 +5305,7 @@ test "parser: a nested text face is one run, and the outer cursor resumes after 
     try testing.expectEqual(@as(u16, 2), root.num_children);
     const run = ast.node(ast.child(ast.root, 0));
     try testing.expectEqual(.text, run.tag);
-    try testing.expectEqual(@as(u32, @intFromEnum(atom.CharStyle.bold)), run.data);
+    try testing.expectEqual(@as(u32, @backingInt(atom.CharStyle.bold)), run.data);
     const tail = ast.node(ast.child(ast.root, 1));
     try testing.expectEqual(.char, tail.tag);
     const tail_span = ast.span(ast.child(ast.root, 1));
@@ -5317,11 +5317,11 @@ test "parser: a text run deeper than the face-scope bound is NestingTooDeep" {
     // stack of `atom.max_text_nesting`, so a deeper run has no representation.
     var info: parse_err.Info = undefined;
     const over = atom.max_text_nesting + 8;
-    const deep = "\\text{" ++ "{" ** over ++ "a" ++ "}" ** over ++ "}";
+    const deep = "\\text{" ++ @as([over]u8, @splat('{')) ++ "a" ++ @as([over]u8, @splat('}')) ++ "}";
     try expectSpanError(&info, error.NestingTooDeep, deep, .nesting_too_deep);
     // the run's own brace counts as one level, so the bound is inclusive
     const within = atom.max_text_nesting - 1;
-    const ok = "\\text{" ++ "{" ** within ++ "a" ++ "}" ** within ++ "}";
+    const ok = "\\text{" ++ @as([within]u8, @splat('{')) ++ "a" ++ @as([within]u8, @splat('}')) ++ "}";
     var ast = try parseSrc(testing.allocator, ok);
     defer ast.deinit();
     const span = ast.span(firstAtom(&ast));

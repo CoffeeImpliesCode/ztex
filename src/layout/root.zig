@@ -200,16 +200,16 @@ fn allDelimiterLeaves(ast: *const atom.Ast, n: atom.Node) bool {
 /// and are always in range.
 fn dataOk(ast: *const atom.Ast, n: atom.Node) bool {
     return switch (n.tag) {
-        .styled, .text => n.data < std.meta.fields(atom.CharStyle).len,
-        .mathstyle => n.data < std.meta.fields(atom.MathStyle).len,
-        .op => (n.data & atom.LimitsBits.value_mask) < std.meta.fields(atom.BigOp).len,
-        .env => (n.data & atom.EnvBits.kind_mask) < std.meta.fields(atom.EnvKind).len and
+        .styled, .text => n.data < @typeInfo(atom.CharStyle).@"enum".field_names.len,
+        .mathstyle => n.data < @typeInfo(atom.MathStyle).@"enum".field_names.len,
+        .op => (n.data & atom.LimitsBits.value_mask) < @typeInfo(atom.BigOp).@"enum".field_names.len,
+        .env => (n.data & atom.EnvBits.kind_mask) < @typeInfo(atom.EnvKind).@"enum".field_names.len and
             atom.envSpecCount(n.data) <= atom.EnvBits.max_spec_cols,
         .fraction => blk: {
             // 0 = no forced style, otherwise the field is a MathStyle + 1.
             const code = (n.data >> atom.FractionBits.forced_shift) &
                 atom.FractionBits.forced_mask;
-            break :blk code == 0 or code - 1 < std.meta.fields(atom.MathStyle).len;
+            break :blk code == 0 or code - 1 < @typeInfo(atom.MathStyle).@"enum".field_names.len;
         },
         // The codepoint `data` names, or 0 = "read it from the source span".
         .char => blk: {

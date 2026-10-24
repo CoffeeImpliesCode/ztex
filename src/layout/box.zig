@@ -229,7 +229,7 @@ pub const no_poly: u32 = std.math.maxInt(u32);
 /// is still exactly where the box says it is. Layout sets `extend` to the
 /// corner's miter reach, capped at half the shorter adjacent chord.
 pub const Poly = struct {
-    points: [max_poly_points]PolyPoint = .{PolyPoint{ .dx = 0, .dy = 0 }} ** max_poly_points,
+    points: [max_poly_points]PolyPoint = @splat(.{ .dx = 0, .dy = 0 }),
     count: u8 = 0,
     /// stroke width in points
     width: f32 = 0,

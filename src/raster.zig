@@ -862,7 +862,7 @@ test "rasterize: payload cap is checked before allocating and includes every row
         try testing.expectEqual(@as(u32, 2), accepted.height);
         try testing.expectEqualSlices(
             u8,
-            if (format == .rgba32) &([_]u8{0} ** 16) else &([_]u8{0} ** 4),
+            if (format == .rgba32) &@as([16]u8, @splat(0)) else &@as([4]u8, @splat(0)),
             accepted.pixels,
         );
     }
@@ -1757,7 +1757,7 @@ test "rasterize: a 0.8pt rule paints 2.133px of ink, not three whole rows" {
 // numbers is a byte a caller can see.
 test "fillRect: a box edge inside a pixel splits that pixel's coverage" {
     const ink: draw.Color = .{ .r = 10, .g = 20, .b = 30, .a = 255 };
-    var mask = [_]u8{0} ** 16;
+    var mask: [16]u8 = @splat(0);
     fillRect(&mask, 4, 4, 4, .alpha8, ink, 0.25, 3.25, 0.5, 2.5);
     // The middle row is the box's only whole row.
     try testing.expectEqualSlices(u8, &.{ 191, 255, 255, 64 }, mask[4..8]);
@@ -1774,7 +1774,7 @@ test "fillRect: a box edge inside a pixel splits that pixel's coverage" {
 // paints nothing.
 test "fillRect: a box clipped by the frame paints only what is inside it" {
     const ink: draw.Color = .{ .r = 0, .g = 0, .b = 0, .a = 255 };
-    var mask = [_]u8{0} ** 16;
+    var mask: [16]u8 = @splat(0);
     // [-1.5, 1.5) x [-0.5, 1.5) in a 4 x 4 frame: column 0 lies wholly
     // inside it, column 1 keeps its left half, row 0 wholly inside, row 1 its
     // top half. The corner pixel the two partials share is a quarter of the
@@ -1809,8 +1809,8 @@ test "fillRect: a box clipped by the frame paints only what is inside it" {
 // stored alpha stay the same number.
 test "fillRect: translucent ink scales the geometric coverage exactly once" {
     const ink: draw.Color = .{ .r = 12, .g = 34, .b = 56, .a = 128 };
-    var mask = [_]u8{0} ** 16;
-    var rgba = [_]u8{0} ** 64;
+    var mask: [16]u8 = @splat(0);
+    var rgba: [64]u8 = @splat(0);
     fillRect(&mask, 4, 4, 4, .alpha8, ink, 0.0, 4.0, 0.5, 2.5);
     fillRect(&rgba, 4, 4, 16, .rgba32, ink, 0.0, 4.0, 0.5, 2.5);
     for (0..3) |y| {

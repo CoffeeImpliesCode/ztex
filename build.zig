@@ -143,7 +143,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run ztex");
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     run_step.dependOn(&run_cmd.step);
 
     // ── unit tests (one step per module) ───────────────────────
@@ -218,10 +218,10 @@ pub fn build(b: *std.Build) void {
     // instead of the global Debug default. An explicit -Dbench-optimize wins;
     // an explicit -Doptimize (or --release) still steers the bench mode.
     const bench_optimize = b.option(
-        std.builtin.OptimizeMode,
+        std.lang.Optimize,
         "bench-optimize",
-        "Optimize mode for the benchmark artifact (default: ReleaseFast)",
-    ) orelse if (optimize != .Debug) optimize else .ReleaseFast;
+        "Optimize mode for the benchmark artifact (default: fast)",
+    ) orelse if (optimize != .debug) optimize else .fast;
     const bench_exe = b.addExecutable(.{
         .name = "ztex-bench",
         .root_module = b.createModule(.{
@@ -264,13 +264,15 @@ pub fn build(b: *std.Build) void {
     c_lib_step.dependOn(&install_c_header.step);
 
     // Header translation is test-only; native dependencies do not need C parsing.
-    const translated_header = b.addTranslateC(.{
-        .root_source_file = b.path("include/ztex.h"),
+    const Translator = @import("translate_c").Translator;
+    const translate_c = b.dependency("translate_c", .{});
+    const translated_header: Translator = .init(translate_c, .{
+        .c_source_file = b.path("include/ztex.h"),
         .target = target,
         .optimize = optimize,
     });
-    const translated_environment = b.addTranslateC(.{
-        .root_source_file = b.path("src/tests/c_environment.h"),
+    const translated_environment: Translator = .init(translate_c, .{
+        .c_source_file = b.path("src/tests/c_environment.h"),
         .target = target,
         .optimize = optimize,
     });
@@ -282,8 +284,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "header", .module = translated_header.createModule() },
-                .{ .name = "environment", .module = translated_environment.createModule() },
+                .{ .name = "header", .module = translated_header.mod },
+                .{ .name = "environment", .module = translated_environment.mod },
                 .{ .name = "ztex.c", .module = c_abi },
             },
         }),
@@ -326,7 +328,9 @@ pub fn build(b: *std.Build) void {
         if (std.mem.eql(u8, m.name, "tests")) continue;
         var doc_module = m.module;
         var copied_sources: ?[4]std.Build.LazyPath = null;
-        if (!std.mem.eql(u8, std.fs.path.basename(m.root.getPath(b)), "root.zig")) {
+        if (!std.mem.eql(u8, m.name, "parse") and !std.mem.eql(u8, m.name, "layout") and
+            !std.mem.eql(u8, m.name, "ztex"))
+        {
             // Autodoc chooses root.zig by convention, not the compiler's root filename.
             const sources = b.addWriteFiles();
             copied_sources = .{

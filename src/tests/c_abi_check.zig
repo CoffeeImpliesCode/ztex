@@ -126,7 +126,7 @@ fn sameAbiType(
             if (b != .pointer) return false;
             if (@sizeOf(zig_type) != @sizeOf(c_type)) return false;
             if (@alignOf(zig_type) != @alignOf(c_type)) return false;
-            if (a.pointer.is_const != b.pointer.is_const) return false;
+            if (a.pointer.attrs.@"const" != b.pointer.attrs.@"const") return false;
             const child = a.pointer.child;
             if (child == anyopaque) return CTypeChild(c_type) == anyopaque;
             return switch (@typeInfo(child)) {
@@ -177,12 +177,12 @@ fn sameFnType(
     if (@typeInfo(c_type) != .@"fn") return false;
     const a = @typeInfo(zig_type).@"fn";
     const b = @typeInfo(c_type).@"fn";
-    if (!std.meta.eql(a.calling_convention, b.calling_convention)) return false;
-    if (a.is_var_args != b.is_var_args) return false;
-    if (a.params.len != b.params.len) return false;
-    for (a.params, b.params) |zig_param, c_param| {
-        const zig_param_type = zig_param.type orelse return false;
-        const c_param_type = c_param.type orelse return false;
+    if (!std.meta.eql(a.attrs.@"callconv", b.attrs.@"callconv")) return false;
+    if (a.attrs.varargs != b.attrs.varargs) return false;
+    if (a.param_types.len != b.param_types.len) return false;
+    for (a.param_types, b.param_types) |zig_param, c_param| {
+        const zig_param_type = zig_param orelse return false;
+        const c_param_type = c_param orelse return false;
         if (!sameAbiType(zig_param_type, c_param_type, entries)) return false;
     }
     const zig_return = a.return_type orelse return b.return_type == null;
@@ -221,42 +221,43 @@ fn sameStruct(
         "{s} is aligned {d} in ztex.h and {d} in {s}",
         .{ c_name, @alignOf(c_type), @alignOf(zig_type), @typeName(zig_type) },
     ));
-    const zig_fields = @typeInfo(zig_type).@"struct".fields;
-    const c_fields = @typeInfo(c_type).@"struct".fields;
-    inline for (zig_fields) |zig_field| {
-        const at = fieldIndex(c_fields, zig_field.name) orelse @compileError(
-            "ztex.h's " ++ c_name ++ " has no field named " ++ zig_field.name ++
+    const zig_fields = @typeInfo(zig_type).@"struct";
+    const c_fields = @typeInfo(c_type).@"struct";
+    inline for (zig_fields.field_names, zig_fields.field_types) |zig_name, zig_field_type| {
+        const at = fieldIndex(c_fields.field_names, zig_name) orelse @compileError(
+            "ztex.h's " ++ c_name ++ " has no field named " ++ zig_name ++
                 ", which " ++ @typeName(zig_type) ++ " has",
         );
-        const c_field = c_fields[at];
-        if (@offsetOf(c_type, c_field.name) != @offsetOf(zig_type, zig_field.name))
+        const c_field_name = c_fields.field_names[at];
+        const c_field_type = c_fields.field_types[at];
+        if (@offsetOf(c_type, c_field_name) != @offsetOf(zig_type, zig_name))
             @compileError(std.fmt.comptimePrint(
                 "{s}.{s} sits at {d} in ztex.h and {d} in {s}",
                 .{
-                    c_name,                          zig_field.name,
-                    @offsetOf(c_type, c_field.name), @offsetOf(zig_type, zig_field.name),
+                    c_name,                          zig_name,
+                    @offsetOf(c_type, c_field_name), @offsetOf(zig_type, zig_name),
                     @typeName(zig_type),
                 },
             ));
-        if (!sameAbiType(zig_field.type, c_field.type, entries)) @compileError(std.fmt.comptimePrint(
+        if (!sameAbiType(zig_field_type, c_field_type, entries)) @compileError(std.fmt.comptimePrint(
             "{s}.{s} is '{s}' in ztex.h and '{s}' in {s}",
             .{
-                c_name,                    zig_field.name,      @typeName(c_field.type),
-                @typeName(zig_field.type), @typeName(zig_type),
+                c_name,                    zig_name,            @typeName(c_field_type),
+                @typeName(zig_field_type), @typeName(zig_type),
             },
         ));
     }
-    inline for (c_fields) |c_field| {
-        if (fieldIndex(zig_fields, c_field.name) == null) @compileError(
-            "ztex.h's " ++ c_name ++ " declares " ++ c_field.name ++
+    inline for (c_fields.field_names) |c_field_name| {
+        if (fieldIndex(zig_fields.field_names, c_field_name) == null) @compileError(
+            "ztex.h's " ++ c_name ++ " declares " ++ c_field_name ++
                 ", which " ++ @typeName(zig_type) ++ " does not have",
         );
     }
 }
 
 fn fieldIndex(comptime fields: anytype, comptime name: []const u8) ?usize {
-    for (fields, 0..) |field, i| {
-        if (std.mem.eql(u8, field.name, name)) return i;
+    for (fields, 0..) |field_name, i| {
+        if (std.mem.eql(u8, field_name, name)) return i;
     }
     return null;
 }
@@ -287,14 +288,15 @@ fn lowerName(comptime name: []const u8) [:0]const u8 {
 /// Compare every tag of an enum with the `#define` that carries its code, and
 /// name the macro a tag has none of.
 fn sameMacroCodes(comptime enum_type: type, comptime prefix: []const u8) void {
-    inline for (@typeInfo(enum_type).@"enum".fields) |field| {
-        const name = macroName(prefix, field.name);
+    const info = @typeInfo(enum_type).@"enum";
+    inline for (info.field_names, info.field_values) |field_name, value| {
+        const name = macroName(prefix, field_name);
         if (!@hasDecl(header, name)) @compileError(
             "ztex.h defines no " ++ name ++ ", which " ++ @typeName(enum_type) ++ " needs",
         );
-        if (@field(header, name) != field.value) @compileError(std.fmt.comptimePrint(
+        if (@field(header, name) != value) @compileError(std.fmt.comptimePrint(
             "{s} is {d} in {s} and {d} in ztex.h",
-            .{ name, field.value, @typeName(enum_type), @field(header, name) },
+            .{ name, value, @typeName(enum_type), @field(header, name) },
         ));
     }
 }
@@ -342,16 +344,16 @@ pub fn checkEntrypoints(comptime entries: anytype) void {
 
     // Entry points, both directions: everything exported must be declared,
     // and everything declared must be exported.
-    const exported = @typeInfo(@TypeOf(entries)).@"struct".fields;
-    inline for (exported) |field| {
-        if (!startsWith(field.name, "ztex_")) continue;
-        if (!inList(swept_functions, field.name) or !@hasDecl(header, field.name))
-            @compileError("unclassified exported C function " ++ field.name);
-        const actual = @field(entries, field.name);
-        if (!sameAbiType(actual, @TypeOf(@field(header, field.name)), entries))
+    const exported = @typeInfo(@TypeOf(entries)).@"struct".field_names;
+    inline for (exported) |name| {
+        if (!startsWith(name, "ztex_")) continue;
+        if (!inList(swept_functions, name) or !@hasDecl(header, name))
+            @compileError("unclassified exported C function " ++ name);
+        const actual = @field(entries, name);
+        if (!sameAbiType(actual, @TypeOf(@field(header, name)), entries))
             @compileError(std.fmt.comptimePrint(
                 "{s} is declared as '{s}' in ztex.h, not as the '{s}' src/ztex_c.zig exports",
-                .{ field.name, @typeName(@TypeOf(@field(header, field.name))), @typeName(actual) },
+                .{ name, @typeName(@TypeOf(@field(header, name))), @typeName(actual) },
             ));
     }
     inline for (swept_functions) |name| {
@@ -361,11 +363,11 @@ pub fn checkEntrypoints(comptime entries: anytype) void {
     }
 
     // And no macro is an orphan.
-    inline for (@typeInfo(header).@"struct".decls) |decl| {
-        if (!startsWith(decl.name, "ZTEX_")) continue;
-        if (!macroAccountedFor(decl.name, entries)) @compileError(std.fmt.comptimePrint(
+    inline for (@typeInfo(header).@"struct".decl_names) |name| {
+        if (!startsWith(name, "ZTEX_")) continue;
+        if (!macroAccountedFor(name, entries)) @compileError(std.fmt.comptimePrint(
             "ztex.h defines {s}, which no status, style or format code accounts for",
-            .{decl.name},
+            .{name},
         ));
     }
 }
@@ -376,22 +378,22 @@ pub fn checkEntrypoints(comptime entries: anytype) void {
 // macro allowlist. Every remaining declaration must belong to this header.
 comptime {
     @setEvalBranchQuota(10_000);
-    for (@typeInfo(header).@"struct".decls) |decl| {
-        if (@hasDecl(environment, decl.name)) continue;
-        if (inList(swept_structs, decl.name) or inList(swept_opaque, decl.name) or
-            inList(swept_typedefs, decl.name) or inList(swept_functions, decl.name) or
-            startsWith(decl.name, "ZTEX_")) continue;
-        if (startsWith(decl.name, "struct_")) {
-            const alias = decl.name["struct_".len..];
+    for (@typeInfo(header).@"struct".decl_names) |name| {
+        if (@hasDecl(environment, name)) continue;
+        if (inList(swept_structs, name) or inList(swept_opaque, name) or
+            inList(swept_typedefs, name) or inList(swept_functions, name) or
+            startsWith(name, "ZTEX_")) continue;
+        if (startsWith(name, "struct_")) {
+            const alias = name["struct_".len..];
             if (inList(swept_structs, alias) or inList(swept_opaque, alias)) {
-                if (@field(header, decl.name) != @field(header, alias))
-                    @compileError("translated C tag differs from its typedef: " ++ decl.name);
+                if (@field(header, name) != @field(header, alias))
+                    @compileError("translated C tag differs from its typedef: " ++ name);
                 continue;
             }
         }
         @compileError(std.fmt.comptimePrint(
             "ztex.h declares '{s}', which this parity sweep does not classify",
-            .{decl.name},
+            .{name},
         ));
     }
 }
