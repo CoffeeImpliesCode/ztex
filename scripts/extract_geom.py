@@ -42,6 +42,7 @@ Rendering recipes:
               (plus mutool draw -F stext for the newer SVG generation).
 
 Usage: python3 scripts/extract_geom.py
+The MicroTeX checkout must be a sibling of this ztex checkout.
 """
 import glob
 import html
@@ -54,8 +55,8 @@ import sys
 
 OUT = "/tmp/cmp"
 WORK = os.path.join(OUT, "work")
-ZIG = "~/projects/ztex"
-MICRO = "~/projects/MicroTeX"
+ZIG = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+MICRO = os.path.join(os.path.dirname(ZIG), "MicroTeX")
 
 CORPUS = [
     r"x^2",
