@@ -132,4 +132,4 @@ See `include/ztex.h` for option defaults, limits, and callback requirements.
 
 ## License
 
-No project LICENSE file is present. A project license has not been specified.
+ztex-authored code is MIT, see [LICENSE](LICENSE). Third-party components keep their own licenses: see THIRD_PARTY_NOTICES.md.
